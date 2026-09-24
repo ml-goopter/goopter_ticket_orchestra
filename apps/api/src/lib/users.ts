@@ -1,15 +1,9 @@
-import { users, type Db } from "@orchestra/db";
-import { eq } from "drizzle-orm";
+import { insertUser, DuplicateEmailError, type Db } from "@orchestra/db";
 import { hashPassword } from "./passwords.js";
 
 export const MIN_PASSWORD_LENGTH = 12;
 
-export class DuplicateEmailError extends Error {
-  constructor(email: string) {
-    super(`A user with email ${email} already exists.`);
-    this.name = "DuplicateEmailError";
-  }
-}
+export { DuplicateEmailError };
 
 export class WeakPasswordError extends Error {
   constructor() {
@@ -45,33 +39,11 @@ export async function createUser(
     throw new WeakPasswordError();
   }
 
-  const [existing] = await input.db
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.email, input.email))
-    .limit(1);
-  if (existing) {
-    throw new DuplicateEmailError(input.email);
-  }
-
   const passwordHash = await hashPassword(input.password);
 
-  const [row] = await input.db
-    .insert(users)
-    .values({
-      email: input.email,
-      passwordHash,
-      displayName: input.displayName,
-    })
-    .returning({
-      id: users.id,
-      email: users.email,
-      displayName: users.displayName,
-    });
-
-  if (!row) {
-    throw new Error("Failed to insert user.");
-  }
-
-  return row;
+  return insertUser(input.db, {
+    email: input.email,
+    passwordHash,
+    displayName: input.displayName,
+  });
 }

@@ -1,4 +1,4 @@
-import { agentWorkers, type Db } from "@orchestra/db";
+import { upsertWorker, type Db } from "@orchestra/db";
 import type { WorkerConfig } from "./config.js";
 
 /**
@@ -13,32 +13,12 @@ export async function registerWorker(
   config: WorkerConfig,
   now: Date = new Date(),
 ): Promise<string> {
-  const values = {
+  const { id } = await upsertWorker(db, {
     host: config.host,
     capabilities: config.capabilities,
     maxConcurrent: config.maxConcurrent,
     workspaceRoot: config.workspaceRoot,
-    startedAt: now,
-    lastHeartbeatAt: now,
-  };
-
-  const [row] = await db
-    .insert(agentWorkers)
-    .values(values)
-    .onConflictDoUpdate({
-      target: agentWorkers.host,
-      set: {
-        capabilities: values.capabilities,
-        maxConcurrent: values.maxConcurrent,
-        workspaceRoot: values.workspaceRoot,
-        startedAt: values.startedAt,
-        lastHeartbeatAt: values.lastHeartbeatAt,
-      },
-    })
-    .returning({ id: agentWorkers.id });
-
-  if (!row) {
-    throw new Error(`Failed to register worker for host ${config.host}`);
-  }
-  return row.id;
+    now,
+  });
+  return id;
 }

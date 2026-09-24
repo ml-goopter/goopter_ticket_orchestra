@@ -1,5 +1,4 @@
-import { sessions, users } from "@orchestra/db";
-import { eq } from "drizzle-orm";
+import { findSessionWithUser, touchSession } from "@orchestra/db";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { AUTH_REQUIRED } from "../lib/errors.js";
@@ -78,41 +77,35 @@ export default fp(
       }
       const sessionId = unsigned.value;
 
-      const [row] = await app.db
-        .select({
-          sessionId: sessions.id,
-          expiresAt: sessions.expiresAt,
-          lastSeenAt: sessions.lastSeenAt,
-          userId: users.id,
-          email: users.email,
-          displayName: users.displayName,
-          disabledAt: users.disabledAt,
-        })
-        .from(sessions)
-        .innerJoin(users, eq(sessions.userId, users.id))
-        .where(eq(sessions.id, sessionId))
-        .limit(1);
+      const result = await findSessionWithUser(app.db, sessionId);
 
       const now = app.now();
 
-      if (!row || row.expiresAt < now || row.disabledAt !== null) {
+      if (
+        !result ||
+        result.session.expiresAt < now ||
+        result.user.disabledAt !== null
+      ) {
         throw AUTH_REQUIRED;
       }
 
       request.user = {
-        id: row.userId,
-        email: row.email,
-        displayName: row.displayName,
+        id: result.user.id,
+        email: result.user.email,
+        displayName: result.user.displayName,
       };
 
       const newExpiresAt = new Date(now.getTime() + SESSION_TTL_MS);
-      request.session = { id: row.sessionId, expiresAt: newExpiresAt };
+      request.session = { id: result.session.id, expiresAt: newExpiresAt };
 
-      if (now.getTime() - row.lastSeenAt.getTime() > REFRESH_THROTTLE_MS) {
-        await app.db
-          .update(sessions)
-          .set({ expiresAt: newExpiresAt, lastSeenAt: now })
-          .where(eq(sessions.id, sessionId));
+      if (
+        now.getTime() - result.session.lastSeenAt.getTime() >
+        REFRESH_THROTTLE_MS
+      ) {
+        await touchSession(app.db, sessionId, {
+          expiresAt: newExpiresAt,
+          lastSeenAt: now,
+        });
       }
     });
   },

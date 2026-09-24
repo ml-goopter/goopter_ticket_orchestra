@@ -14,3 +14,7 @@ allowBuilds:
 
 minimumReleaseAgeExclude:
   - vite@8.3.1
+  # Claude Agent SDK ships platform binaries published the same day as the
+  # main package; the release-age policy would otherwise block fresh installs.
+  - "@anthropic-ai/claude-agent-sdk"
+  - "@anthropic-ai/claude-agent-sdk-*"

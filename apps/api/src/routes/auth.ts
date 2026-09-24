@@ -1,5 +1,4 @@
-import { sessions, users } from "@orchestra/db";
-import { eq } from "drizzle-orm";
+import { deleteSession, findUserByEmail, insertSession } from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { AppError, AUTH_INVALID_CREDENTIALS, AUTH_REQUIRED } from "../lib/errors.js";
@@ -41,11 +40,7 @@ export default async function authRoutes(
       }
       const { email, password } = parsed.data;
 
-      const [row] = await app.db
-        .select()
-        .from(users)
-        .where(eq(users.email, email))
-        .limit(1);
+      const row = await findUserByEmail(app.db, email);
 
       // Unknown email, disabled user, and wrong password all return the
       // exact same body so a caller cannot enumerate accounts.
@@ -60,19 +55,11 @@ export default async function authRoutes(
 
       const now = app.now();
       const expiresAt = new Date(now.getTime() + SESSION_TTL_MS);
-      const [session] = await app.db
-        .insert(sessions)
-        .values({
-          userId: row.id,
-          expiresAt,
-          createdAt: now,
-          lastSeenAt: now,
-        })
-        .returning({ id: sessions.id });
-
-      if (!session) {
-        throw new Error("Failed to create session.");
-      }
+      const session = await insertSession(app.db, {
+        userId: row.id,
+        expiresAt,
+        now,
+      });
 
       reply.setCookie(SESSION_COOKIE_NAME, session.id, {
         httpOnly: true,
@@ -94,7 +81,7 @@ export default async function authRoutes(
     if (!request.session) {
       throw AUTH_REQUIRED;
     }
-    await app.db.delete(sessions).where(eq(sessions.id, request.session.id));
+    await deleteSession(app.db, request.session.id);
     reply.clearCookie(SESSION_COOKIE_NAME, { path: "/" });
     return {};
   });
