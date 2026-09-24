@@ -1,5 +1,4 @@
-import { agentWorkers, type Db } from "@orchestra/db";
-import { eq } from "drizzle-orm";
+import { heartbeatWorker, type Db } from "@orchestra/db";
 import type { Logger } from "./logger.js";
 
 export interface HeartbeatOptions {
@@ -59,10 +58,7 @@ export function startHeartbeat(
   async function beat(): Promise<void> {
     const at = now();
     try {
-      await db
-        .update(agentWorkers)
-        .set({ lastHeartbeatAt: at })
-        .where(eq(agentWorkers.id, workerId));
+      await heartbeatWorker(db, workerId, at);
       logger?.debug({ workerId, at: at.toISOString() }, "heartbeat");
     } catch (err) {
       report(err, "heartbeat failed");

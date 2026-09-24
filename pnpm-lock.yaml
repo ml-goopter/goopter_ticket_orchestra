@@ -202,9 +202,6 @@ importers:
       argon2:
         specifier: ^0.45.1
         version: 0.45.1
-      drizzle-orm:
-        specifier: ^0.45.3
-        version: 0.45.3(postgres@3.4.9)
       fastify:
         specifier: ^5.12.5
         version: 5.12.5
@@ -273,9 +270,6 @@ importers:
       '@orchestra/prompts':
         specifier: workspace:*
         version: link:../../packages/prompts
-      drizzle-orm:
-        specifier: ^0.45.3
-        version: 0.45.3(postgres@3.4.9)
       pino:
         specifier: ^10.3.1
         version: 10.3.1
