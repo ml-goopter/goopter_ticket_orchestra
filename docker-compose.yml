@@ -1,0 +1,65 @@
+# design.md §15.1. Postgres, api, web in compose; worker runs on the host
+# (§15.2, D16). Copy .env.example to .env before `docker compose up`.
+#
+# Container services (migrate, api) always reach Postgres at db:5432, built
+# from POSTGRES_USER/PASSWORD/DB below. The DATABASE_URL in .env is for the
+# worker running on the host, which reaches the same database via the
+# 127.0.0.1-published port (see .env.example).
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-orchestra}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orchestra}
+      POSTGRES_DB: ${POSTGRES_DB:-orchestra}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orchestra} -d ${POSTGRES_DB:-orchestra}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["pnpm", "--filter", "@orchestra/db", "migrate"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-orchestra}:${POSTGRES_PASSWORD:-orchestra}@db:5432/${POSTGRES_DB:-orchestra}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Placeholder until GOT.18 adds a Fastify server that listens and blocks;
+  # today the built entrypoint exits immediately (see apps/api/Dockerfile).
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-orchestra}:${POSTGRES_PASSWORD:-orchestra}@db:5432/${POSTGRES_DB:-orchestra}
+      SESSION_SECRET: ${SESSION_SECRET}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+    expose:
+      - "3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
