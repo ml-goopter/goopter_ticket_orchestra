@@ -6,10 +6,22 @@
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc -b",
-    "test": "vitest run"
+    "test": "vitest run",
+    "users:add": "tsx src/cli/users-add.ts"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/rate-limit": "^11.2.0",
     "@orchestra/core": "workspace:*",
-    "@orchestra/db": "workspace:*"
+    "@orchestra/db": "workspace:*",
+    "argon2": "^0.45.1",
+    "drizzle-orm": "^0.45.3",
+    "fastify": "^5.12.5",
+    "fastify-plugin": "^6.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "^12.1.0",
+    "tsx": "^4.23.15"
   }
 }
