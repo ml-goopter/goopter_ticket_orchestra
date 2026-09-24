@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/db" },
+    { "path": "packages/adapters" },
+    { "path": "packages/prompts" },
+    { "path": "packages/review-wrapper" },
+    { "path": "apps/api" },
+    { "path": "apps/worker" }
+  ]
+}

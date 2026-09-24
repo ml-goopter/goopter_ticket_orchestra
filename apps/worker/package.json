@@ -1,0 +1,17 @@
+{
+  "name": "@orchestra/worker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@orchestra/core": "workspace:*",
+    "@orchestra/db": "workspace:*",
+    "@orchestra/adapters": "workspace:*",
+    "@orchestra/prompts": "workspace:*"
+  }
+}
