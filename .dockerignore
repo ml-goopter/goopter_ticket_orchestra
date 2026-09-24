@@ -1,0 +1,17 @@
+node_modules
+**/node_modules
+dist
+**/dist
+.git
+.treehouse
+**/.treehouse
+.env
+.env.*
+!.env.example
+coverage
+**/coverage
+*.tsbuildinfo
+**/*.tsbuildinfo
+*.log
+**/*.log
+.DS_Store
