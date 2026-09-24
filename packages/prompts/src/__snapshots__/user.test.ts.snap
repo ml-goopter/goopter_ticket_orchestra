@@ -1,0 +1,61 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildUserPrompt (design.md §9.2) > matches the full example snapshot 1`] = `
+"## Ticket
+GOOP-421: Add a receipt language toggle
+Users in the field report the wrong receipt language.
+
+Comments:
+- alice@example.com (2026-09-18): Repro'd on device 3.
+
+## Approved specification (revision 2)
+### Repository
+
+orchestra-app
+
+### Objective
+
+Turn tickets into reviewed PRs.
+
+### Scope
+
+- build the widget
+
+### Out of scope
+
+- the gadget
+
+### Requirements
+
+- must be blue
+
+### Acceptance criteria
+
+- widget renders
+
+### Validation
+
+- run vitest
+
+### Constraints
+
+- no new deps
+
+### Dependencies
+
+- JIRA-1
+
+
+## Decisions recorded on this task
+- issue_784: Receipt language is device-local. Clarification: Reinstall resets it. Chosen option: device-local (user@example.com on 2026-09-20)
+
+## Repository
+Name: goopter_odoo_modules
+Default branch: main
+Working branch: agent/GOOP-421-ab12cd
+Setup command: pnpm install
+Test command: pnpm test
+
+## Instructions
+Implement the approved specification above in this repository. Follow the review protocol in your system prompt before opening a pull request."
+`;

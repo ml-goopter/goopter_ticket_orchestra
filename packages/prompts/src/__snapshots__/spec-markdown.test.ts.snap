@@ -1,0 +1,88 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`renderSpecMarkdown (design.md §4.3) > matches the full-spec snapshot 1`] = `
+"### Repository
+
+orchestra-app
+
+### Objective
+
+Turn tickets into reviewed PRs.
+
+### Scope
+
+- build the widget
+- wire it to the API
+
+### Out of scope
+
+- the gadget
+
+### Requirements
+
+- must be blue
+
+### Acceptance criteria
+
+- widget renders
+
+### Validation
+
+- run vitest
+
+### Constraints
+
+- no new deps
+
+### Dependencies
+
+- JIRA-1
+
+### Risks
+
+- vendor API may rate-limit
+
+### Notes
+
+Coordinate with the design team before merging.
+"
+`;
+
+exports[`renderSpecMarkdown (design.md §4.3) > matches the minimal-spec snapshot 1`] = `
+"### Repository
+
+orchestra-app
+
+### Objective
+
+Turn tickets into reviewed PRs.
+
+### Scope
+
+- build the widget
+
+### Out of scope
+
+- the gadget
+
+### Requirements
+
+- must be blue
+
+### Acceptance criteria
+
+- widget renders
+
+### Validation
+
+- run vitest
+
+### Constraints
+
+- no new deps
+
+### Dependencies
+
+- JIRA-1
+"
+`;
