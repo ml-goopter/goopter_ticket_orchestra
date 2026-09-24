@@ -5,3 +5,5 @@ export * from "./attention.js";
 export * from "./board.js";
 export * from "./auth.js";
 export * from "./workers.js";
+export * from "./dependencies.js";
+export * from "./task-cost.js";

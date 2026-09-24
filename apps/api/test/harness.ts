@@ -1,5 +1,17 @@
 import { sign as signCookie } from "@fastify/cookie";
-import { createDb, runMigrations, sessions, users, type Db } from "@orchestra/db";
+import type { ExecutionState, TaskState } from "@orchestra/core";
+import {
+  createDb,
+  executions,
+  projects,
+  repositories,
+  runMigrations,
+  sessions,
+  taskDependencies,
+  tasks,
+  users,
+  type Db,
+} from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import {
   PostgreSqlContainer,
@@ -163,4 +175,126 @@ export function sessionCookieHeader(
   secret: string = TEST_SESSION_SECRET,
 ): string {
   return `${SESSION_COOKIE_NAME}=${encodeURIComponent(signSessionId(sessionId, secret))}`;
+}
+
+export interface Fixtures {
+  userId: string;
+  projectId: string;
+  repositoryId: string;
+}
+
+/**
+ * Inserts the one project / repository every task hangs off, mirroring
+ * `packages/db/test/harness.ts` (copied rather than imported across
+ * packages, per design.md §3).
+ */
+export async function seedFixtures(db: Db, key: string): Promise<Fixtures> {
+  const user = await seedUser(db, {
+    email: `${key.toLowerCase()}@example.com`,
+    password: "correct horse battery",
+  });
+
+  const [project] = await db
+    .insert(projects)
+    .values({ key, name: `${key} project`, jiraJql: `project = ${key}` })
+    .returning({ id: projects.id });
+
+  const [repository] = await db
+    .insert(repositories)
+    .values({
+      projectId: project!.id,
+      name: `${key.toLowerCase()}-repo`,
+      gitUrl: `git@example.com:goopter/${key.toLowerCase()}.git`,
+      defaultBranch: "main",
+      defaultRuntime: "claude",
+    })
+    .returning({ id: repositories.id });
+
+  return {
+    userId: user.id,
+    projectId: project!.id,
+    repositoryId: repository!.id,
+  };
+}
+
+export interface SeedTaskOptions {
+  jiraKey: string;
+  state: TaskState;
+  summary?: string;
+  priority?: number;
+  createdAt?: Date;
+  withRepository?: boolean;
+  runtimeOverride?: "claude" | "codex" | null;
+  needsHumanReason?: string | null;
+}
+
+/** Inserts one task and returns its id. */
+export async function seedTask(
+  db: Db,
+  fixtures: Fixtures,
+  options: SeedTaskOptions,
+): Promise<string> {
+  const when = options.createdAt ?? new Date("2026-01-01T00:00:00Z");
+  const [row] = await db
+    .insert(tasks)
+    .values({
+      projectId: fixtures.projectId,
+      repositoryId:
+        options.withRepository === false ? null : fixtures.repositoryId,
+      jiraKey: options.jiraKey,
+      jiraSummary: options.summary ?? `Summary for ${options.jiraKey}`,
+      jiraPriority: options.priority ?? 3,
+      jiraCreatedAt: when,
+      jiraSyncedAt: when,
+      state: options.state,
+      runtimeOverride: options.runtimeOverride ?? null,
+      needsHumanReason: options.needsHumanReason ?? null,
+    })
+    .returning({ id: tasks.id });
+  return row!.id;
+}
+
+export interface SeedExecutionOptions {
+  role?: "spec" | "implementation";
+  attempt?: number;
+  state: ExecutionState;
+  runtime?: "claude" | "codex";
+  model?: string;
+  costUsd?: string;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+}
+
+/** Inserts one execution on `taskId` and returns its id. */
+export async function seedExecution(
+  db: Db,
+  taskId: string,
+  options: SeedExecutionOptions,
+): Promise<string> {
+  const [row] = await db
+    .insert(executions)
+    .values({
+      taskId,
+      role: options.role ?? "implementation",
+      attempt: options.attempt ?? 1,
+      state: options.state,
+      runtime: options.runtime ?? "claude",
+      model: options.model ?? "claude-sonnet-5",
+      costUsd: options.costUsd ?? "0",
+      inputTokens: options.inputTokens ?? 0,
+      cachedInputTokens: options.cachedInputTokens ?? 0,
+      outputTokens: options.outputTokens ?? 0,
+    })
+    .returning({ id: executions.id });
+  return row!.id;
+}
+
+/** Inserts one `task_dependencies` row directly. */
+export async function seedDependency(
+  db: Db,
+  taskId: string,
+  dependsOnTaskId: string,
+): Promise<void> {
+  await db.insert(taskDependencies).values({ taskId, dependsOnTaskId });
 }
