@@ -1,5 +1,10 @@
 import os from "node:os";
 import { createDb, type Db } from "@orchestra/db";
+import {
+  DEFAULT_AGENT_TOOLS_HOST,
+  createAgentToolsServer,
+  createExecutionRegistry,
+} from "./agent-tools/index.js";
 import { ConfigError, loadConfig, redactConfig } from "./config.js";
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -62,6 +67,28 @@ async function main(): Promise<void> {
   const log = logger.child({ workerId });
   log.info({ config: redactConfig(config) }, "worker registered");
 
+  // design.md §8: one agent-tools MCP server per worker, on loopback. The
+  // registry is shared with the runner (GOT.31) once it exists.
+  const registry = createExecutionRegistry();
+  const toolsServer = createAgentToolsServer({
+    db,
+    registry,
+    logger: log.child({ component: "agent-tools" }),
+  });
+  try {
+    await toolsServer.start(config.toolsPort, DEFAULT_AGENT_TOOLS_HOST);
+  } catch (err) {
+    log.error(
+      {
+        port: config.toolsPort,
+        err: err instanceof Error ? err.message : String(err),
+      },
+      "agent-tools server failed to start",
+    );
+    await closeDb(db).catch(() => {});
+    process.exit(1);
+  }
+
   const stopHeartbeat = startHeartbeat(db, workerId, { logger: log });
   const loop = createTickLoop({
     db,
@@ -86,6 +113,7 @@ async function main(): Promise<void> {
     logger: log,
     stop: async () => {
       await loop.stop();
+      await toolsServer.stop();
       await stopHeartbeat();
       await closeDb(db);
     },

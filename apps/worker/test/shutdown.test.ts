@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createServer, type AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 import { agentWorkers } from "@orchestra/db";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -13,7 +14,19 @@ const workerDir = fileURLToPath(new URL("..", import.meta.url));
 let testDb: TestDb;
 const spawned: ChildProcess[] = [];
 
-function startWorker(host: string): ChildProcess {
+/** A loopback port that was free a moment ago, so the child's tools server can bind it. */
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address() as AddressInfo;
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+async function startWorker(host: string): Promise<ChildProcess> {
   const child = spawn(process.execPath, [tsxCli, entry], {
     cwd: workerDir,
     stdio: ["ignore", "pipe", "pipe"],
@@ -22,6 +35,7 @@ function startWorker(host: string): ChildProcess {
       DATABASE_URL: testDb.connectionString,
       WORKER_HOST: host,
       WORKER_CAPABILITIES: "node",
+      WORKER_TOOLS_PORT: String(await freePort()),
       LOG_LEVEL: "debug",
     },
   });
@@ -51,7 +65,7 @@ afterAll(async () => {
 describe("worker entry point (design.md §15.2)", () => {
   it("registers, then exits 0 on SIGTERM", async () => {
     const stderr: string[] = [];
-    const child = startWorker("signal-host-1");
+    const child = await startWorker("signal-host-1");
     child.stderr?.on("data", (c) => stderr.push(String(c)));
     child.stdout?.on("data", (c) => stderr.push(String(c)));
 

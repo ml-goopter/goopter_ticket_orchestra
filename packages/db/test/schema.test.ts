@@ -90,6 +90,8 @@ const EXPECTED_TABLES: Record<string, string[]> = {
     "worktree_path",
     "branch",
     "session_id",
+    // design.md §8 token hash; §4.2 lists no column for it (GOT.24).
+    "tools_token_hash",
     "end_reason",
     "end_detail",
     "review_rounds",

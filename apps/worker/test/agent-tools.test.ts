@@ -1,0 +1,1134 @@
+import { createHash } from "node:crypto";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  RAISE_ISSUE_BLOCKING_INSTRUCTION,
+  REVIEW_ROUND_LIMIT_INSTRUCTION,
+  type ExecutionState,
+  type TaskState,
+} from "@orchestra/core";
+import {
+  agentWorkers,
+  executions,
+  projects,
+  taskLeases,
+  tasks,
+  transition,
+  type Db,
+} from "@orchestra/db";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  ASSIGNED_TOOLS,
+  authenticate,
+  createAgentToolsServer,
+  createExecutionRegistry,
+  createLiveExecution,
+  issueToken,
+  LEASE_TTL_MS,
+  revokeToken,
+  type AgentToolsServer,
+  type ExecutionRegistry,
+} from "../src/agent-tools/index.js";
+import {
+  invokeTool,
+  type ErasedToolDefinition,
+} from "../src/agent-tools/invoke.js";
+import { TOOL_DEFINITIONS } from "../src/agent-tools/tools/index.js";
+import type { LogFields, Logger } from "../src/logger.js";
+import { startTestDb, type TestDb } from "./harness.js";
+
+/**
+ * design.md §8 agent-tools MCP server, exercised end to end: a real
+ * Postgres, the real HTTP server on an ephemeral port, and the SDK's own
+ * MCP client. Reads go through drizzle's relational query API on the `Db`
+ * handle, because `apps/**` may not import drizzle-orm (eslint boundary).
+ */
+
+const records: Array<{ level: string; fields: LogFields; msg: string }> = [];
+const logger: Logger = {
+  debug: (fields, msg) => void records.push({ level: "debug", fields, msg }),
+  info: (fields, msg) => void records.push({ level: "info", fields, msg }),
+  warn: (fields, msg) => void records.push({ level: "warn", fields, msg }),
+  error: (fields, msg) => void records.push({ level: "error", fields, msg }),
+  child: () => logger,
+};
+
+/** Every lease is seeded here, so any renewal moves it forward. */
+const STALE_LEASE = new Date("2026-01-01T00:00:00.000Z");
+
+let testDb: TestDb;
+let db: Db;
+let registry: ExecutionRegistry;
+let server: AgentToolsServer;
+let workerId: string;
+const issuedTokens: string[] = [];
+const clients: Client[] = [];
+
+beforeAll(async () => {
+  testDb = await startTestDb();
+  db = testDb.db;
+  const [worker] = await db
+    .insert(agentWorkers)
+    .values({
+      host: "agent-tools-host",
+      capabilities: ["node"],
+      maxConcurrent: 4,
+      workspaceRoot: "/tmp/orchestra",
+    })
+    .returning({ id: agentWorkers.id });
+  workerId = worker!.id;
+
+  registry = createExecutionRegistry();
+  server = createAgentToolsServer({
+    db,
+    registry,
+    logger,
+    now: () => new Date(),
+  });
+  await server.start(0, "127.0.0.1");
+});
+
+afterEach(async () => {
+  while (clients.length > 0) {
+    await clients.pop()!.close().catch(() => {});
+  }
+});
+
+afterAll(async () => {
+  await server?.stop();
+  await testDb?.stop();
+});
+
+// ---------------------------------------------------------------- seeding
+
+interface Seeded {
+  projectId: string;
+  taskId: string;
+  executionId: string;
+  token: string;
+}
+
+interface SeedOptions {
+  role?: "spec" | "implementation";
+  taskState: TaskState;
+  executionState?: ExecutionState;
+  maxReviewRounds?: number;
+}
+
+let seq = 0;
+
+async function seed(options: SeedOptions): Promise<Seeded> {
+  const n = ++seq;
+  const [project] = await db
+    .insert(projects)
+    .values({
+      key: `AT${n}`,
+      name: `agent tools ${n}`,
+      jiraJql: `project = AT${n}`,
+      ...(options.maxReviewRounds === undefined
+        ? {}
+        : { maxReviewRounds: options.maxReviewRounds }),
+    })
+    .returning({ id: projects.id });
+  const when = new Date("2026-01-01T00:00:00.000Z");
+  const [task] = await db
+    .insert(tasks)
+    .values({
+      projectId: project!.id,
+      jiraKey: `AT-${n}`,
+      jiraSummary: `task ${n}`,
+      jiraPriority: 3,
+      jiraCreatedAt: when,
+      jiraSyncedAt: when,
+      state: options.taskState,
+    })
+    .returning({ id: tasks.id });
+  const [execution] = await db
+    .insert(executions)
+    .values({
+      taskId: task!.id,
+      role: options.role ?? "implementation",
+      attempt: 1,
+      state: options.executionState ?? "RUNNING",
+      runtime: "codex",
+      model: "gpt-5-codex",
+    })
+    .returning({ id: executions.id });
+  await db.insert(taskLeases).values({
+    taskId: task!.id,
+    executionId: execution!.id,
+    workerId,
+    expiresAt: STALE_LEASE,
+  });
+  const token = await db.transaction((tx) => issueToken(tx, execution!.id));
+  issuedTokens.push(token);
+  return {
+    projectId: project!.id,
+    taskId: task!.id,
+    executionId: execution!.id,
+    token,
+  };
+}
+
+// ------------------------------------------------------------------ reads
+
+const getTask = (id: string) =>
+  db.query.tasks.findFirst({ where: (t, { eq }) => eq(t.id, id) });
+const getExecution = (id: string) =>
+  db.query.executions.findFirst({ where: (t, { eq }) => eq(t.id, id) });
+const getLease = (executionId: string) =>
+  db.query.taskLeases.findFirst({
+    where: (t, { eq }) => eq(t.executionId, executionId),
+  });
+const eventsFor = (taskId: string) =>
+  db.query.executionEvents.findMany({
+    where: (t, { eq }) => eq(t.taskId, taskId),
+    orderBy: (t, { asc }) => [asc(t.id)],
+  });
+
+/** Every row a tool could write for this task, for "writes nothing" checks. */
+async function snapshot(s: Seeded) {
+  const [events, issueRows, notificationRows, reviewRows, prRows, revisionRows] =
+    await Promise.all([
+      eventsFor(s.taskId),
+      db.query.issues.findMany({ where: (t, { eq }) => eq(t.taskId, s.taskId) }),
+      db.query.notifications.findMany({
+        where: (t, { eq }) => eq(t.taskId, s.taskId),
+      }),
+      db.query.reviewResults.findMany({
+        where: (t, { eq }) => eq(t.executionId, s.executionId),
+      }),
+      db.query.pullRequests.findMany({
+        where: (t, { eq }) => eq(t.taskId, s.taskId),
+      }),
+      db.query.specificationRevisions.findMany({
+        where: (t, { eq }) => eq(t.taskId, s.taskId),
+      }),
+    ]);
+  const task = await getTask(s.taskId);
+  const execution = await getExecution(s.executionId);
+  const lease = await getLease(s.executionId);
+  return {
+    events: events.length,
+    issues: issueRows.length,
+    notifications: notificationRows.length,
+    reviews: reviewRows.length,
+    pullRequests: prRows.length,
+    revisions: revisionRows.map((r) => JSON.stringify(r.content)),
+    taskState: task!.state,
+    needsHumanReason: task!.needsHumanReason,
+    executionState: execution!.state,
+    reviewRounds: execution!.reviewRounds,
+    tokenHash: execution!.toolsTokenHash,
+    leaseExpiresAt: lease!.expiresAt.getTime(),
+  };
+}
+
+// ------------------------------------------------------------- mcp client
+
+async function connect(token: string): Promise<Client> {
+  const client = new Client({ name: "agent-tools-test", version: "0.0.0" });
+  clients.push(client);
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(server.url), {
+      requestInit: { headers: { Authorization: `Bearer ${token}` } },
+    }),
+  );
+  return client;
+}
+
+type CallResult =
+  | { isError: false; data: Record<string, unknown> }
+  | { isError: true; code?: string; message: string };
+
+async function callOn(
+  client: Client,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<CallResult> {
+  const result = await client.callTool({ name, arguments: args });
+  const text =
+    (result.content as Array<{ type: string; text?: string }> | undefined)?.[0]
+      ?.text ?? "";
+  if (result.isError) {
+    try {
+      const parsed = JSON.parse(text) as {
+        error: { code: string; message: string };
+      };
+      return { isError: true, ...parsed.error };
+    } catch {
+      return { isError: true, message: text };
+    }
+  }
+  return {
+    isError: false,
+    data: result.structuredContent as Record<string, unknown>,
+  };
+}
+
+async function call(
+  token: string,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<CallResult> {
+  return callOn(await connect(token), name, args);
+}
+
+function expectOk(result: CallResult): Record<string, unknown> {
+  if (result.isError) {
+    throw new Error(`expected success, got ${JSON.stringify(result)}`);
+  }
+  return result.data;
+}
+
+/** AC8: one agent.tool_call row per successful call, lease moved forward. */
+async function expectRecorded(s: Seeded, tool: string, before: number) {
+  const events = (await eventsFor(s.taskId)).filter(
+    (e) => e.type === "agent.tool_call",
+  );
+  const calls = events.filter(
+    (e) => (e.payload as { tool: string }).tool === tool,
+  );
+  expect(calls).toHaveLength(1);
+  const payload = calls[0]!.payload as {
+    tool: string;
+    ok: boolean;
+    input: unknown;
+  };
+  expect(payload.ok).toBe(true);
+  expect(calls[0]!.executionId).toBe(s.executionId);
+  expect(JSON.stringify(payload)).not.toContain(s.token);
+
+  const lease = await getLease(s.executionId);
+  expect(lease!.expiresAt.getTime()).toBeGreaterThan(before);
+  expect(lease!.expiresAt.getTime()).toBeGreaterThan(Date.now() + LEASE_TTL_MS - 60_000);
+}
+
+// ------------------------------------------------------------- fixtures
+
+const RAISE_ARGS = {
+  type: "DECISION_REQUIRED",
+  severity: "blocking",
+  blocking: true,
+  title: "Which cache?",
+  description: "The spec does not say which cache to use.",
+  question: "Redis or in-process?",
+  options: [
+    { id: "redis", description: "Redis", tradeoff: "new dependency" },
+    { id: "memory", description: "In-process", tradeoff: "per-host only" },
+  ],
+  recommended_option: "memory",
+};
+
+const specContent = (objective: string) => ({
+  repository: "orchestra",
+  objective,
+  scope: ["api"],
+  out_of_scope: [],
+  requirements: ["r1"],
+  acceptance_criteria: ["a1"],
+  validation: ["v1"],
+  constraints: [],
+  dependencies: [],
+});
+
+/** One valid call per tool, used by the auth and role matrices. */
+const VALID_ARGS: Record<string, Record<string, unknown>> = {
+  raise_issue: { ...RAISE_ARGS, blocking: false, severity: "info" },
+  report_review_started: { round: 1 },
+  report_review_result: { round: 1, verdict: "clean", findings: [] },
+  report_pr_created: {
+    url: "https://github.com/goopter/x/pull/1",
+    number: 1,
+    head_sha: "abc",
+  },
+  report_complete: { summary: "done" },
+  report_failed: { reason: "stuck", detail: "cannot build" },
+  propose_spec: specContent("o"),
+  note: { text: "hello" },
+};
+
+// ================================================================== AC2
+
+describe("tokens (design.md §8)", () => {
+  it("issueToken returns a 43-char base64url token and stores its sha256 hex", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+
+    expect(s.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const execution = await getExecution(s.executionId);
+    expect(execution!.toolsTokenHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(execution!.toolsTokenHash).toBe(
+      createHash("sha256").update(s.token).digest("hex"),
+    );
+    expect(execution!.toolsTokenHash).not.toContain(s.token);
+  });
+
+  it("authenticate accepts the token while RUNNING and returns execution, task and project", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+
+    const ctx = await authenticate(db, s.token);
+
+    expect(ctx?.execution.id).toBe(s.executionId);
+    expect(ctx?.task.id).toBe(s.taskId);
+    expect(ctx?.project.id).toBe(s.projectId);
+  });
+
+  it("authenticate rejects after revokeToken", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    await db.transaction((tx) => revokeToken(tx, s.executionId));
+
+    expect(await authenticate(db, s.token)).toBeNull();
+    expect((await getExecution(s.executionId))!.toolsTokenHash).toBeNull();
+  });
+
+  it("authenticate rejects a wrong or empty token", async () => {
+    await seed({ taskState: "IMPLEMENTING" });
+
+    expect(await authenticate(db, "x".repeat(43))).toBeNull();
+    expect(await authenticate(db, "")).toBeNull();
+  });
+
+  it("authenticate rejects when the execution is COMPLETED", async () => {
+    const s = await seed({
+      taskState: "CI_RUNNING",
+      executionState: "COMPLETED",
+    });
+
+    expect(await authenticate(db, s.token)).toBeNull();
+    expect(await authenticate(db, s.token, "note")).toBeNull();
+  });
+
+  it("while ASSIGNED only raise_issue and note authenticate", async () => {
+    const s = await seed({
+      taskState: "IMPLEMENTING",
+      executionState: "ASSIGNED",
+    });
+
+    expect([...ASSIGNED_TOOLS].sort()).toEqual(["note", "raise_issue"]);
+    expect(await authenticate(db, s.token)).toBeNull();
+    expect(await authenticate(db, s.token, "note")).not.toBeNull();
+    expect(await authenticate(db, s.token, "raise_issue")).not.toBeNull();
+    expect(await authenticate(db, s.token, "report_failed")).toBeNull();
+    expect(await authenticate(db, s.token, "report_pr_created")).toBeNull();
+  });
+});
+
+// ================================================================== AC3
+
+describe("HTTP gate", () => {
+  it("rejects a request with no bearer token with 401 and never echoes a token", async () => {
+    const res = await fetch(server.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toMatch(/^Bearer/);
+  });
+
+  it("rejects an unknown bearer token with 401", async () => {
+    await expect(connect("not-a-real-token")).rejects.toThrow(/401|UNAUTHORIZED/);
+  });
+
+  it("lists exactly the eight tools with their core schemas", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+
+    const { tools } = await client.listTools();
+
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      "note",
+      "propose_spec",
+      "raise_issue",
+      "report_complete",
+      "report_failed",
+      "report_pr_created",
+      "report_review_result",
+      "report_review_started",
+    ]);
+    const raise = tools.find((t) => t.name === "raise_issue")!;
+    expect(raise.inputSchema.required).toEqual(
+      expect.arrayContaining(["type", "severity", "blocking", "title", "description"]),
+    );
+    expect(raise.outputSchema).toBeDefined();
+  });
+});
+
+describe("auth errors write nothing (AC3)", () => {
+  for (const tool of Object.keys(VALID_ARGS)) {
+    it(`${tool} with a revoked token returns an auth error and writes nothing`, async () => {
+      const role = tool === "report_complete" || tool === "propose_spec"
+        ? "spec"
+        : "implementation";
+      const s = await seed({
+        role,
+        taskState: role === "spec" ? "SPEC_IN_PROGRESS" : "REVIEWING",
+      });
+      const client = await connect(s.token);
+      await db.transaction((tx) => revokeToken(tx, s.executionId));
+      const before = await snapshot(s);
+
+      await expect(callOn(client, tool, VALID_ARGS[tool]!)).rejects.toThrow(
+        /401|UNAUTHORIZED/,
+      );
+
+      expect(await snapshot(s)).toEqual(before);
+    });
+  }
+
+  it("a token whose execution is no longer RUNNING gets UNAUTHORIZED as a tool error", async () => {
+    // The hash is normally nulled when the execution leaves RUNNING; this
+    // covers a runner that forgot to revoke.
+    const s = await seed({
+      taskState: "CI_RUNNING",
+      executionState: "COMPLETED",
+    });
+    const before = await snapshot(s);
+
+    const result = await call(s.token, "note", { text: "late" });
+
+    expect(result).toMatchObject({ isError: true, code: "UNAUTHORIZED" });
+    expect(await snapshot(s)).toEqual(before);
+  });
+});
+
+describe("re-authorisation inside the tool transaction", () => {
+  // The execution leaves RUNNING and the token is revoked after the
+  // pre-check passed but before the tool's transaction starts. The tool
+  // must re-check under a row lock and write nothing.
+  for (const tool of ["note", "raise_issue"] as const) {
+    it(`${tool} authenticated while RUNNING, revoked before its transaction: UNAUTHORIZED, writes nothing`, async () => {
+      const s = await seed({ taskState: "IMPLEMENTING" });
+      const def = TOOL_DEFINITIONS.find((d) => d.name === tool)!;
+      let afterRevoke: Awaited<ReturnType<typeof snapshot>> | undefined;
+
+      const result = await invokeTool(
+        def as unknown as ErasedToolDefinition,
+        VALID_ARGS[tool]!,
+        s.token,
+        {
+          db,
+          registry,
+          logger,
+          now: () => new Date(),
+          afterAuthenticate: async () => {
+            await db.transaction(async (tx) => {
+              await transition(tx, {
+                entity: "execution",
+                id: s.executionId,
+                trigger: "execution.completed",
+                actor: { kind: "system" },
+                set: { endedAt: new Date() },
+              });
+              await revokeToken(tx, s.executionId);
+            });
+            afterRevoke = await snapshot(s);
+          },
+        },
+      );
+
+      expect(afterRevoke).toBeDefined();
+      expect(afterRevoke!.executionState).toBe("COMPLETED");
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ text: string }>)[0]!.text;
+      expect(JSON.parse(text)).toMatchObject({ error: { code: "UNAUTHORIZED" } });
+      expect(await snapshot(s)).toEqual(afterRevoke);
+    });
+  }
+});
+
+describe("role checks write nothing (AC3)", () => {
+  const wrongRole: Array<[string, "spec" | "implementation", TaskState]> = [
+    ["report_review_started", "spec", "SPEC_IN_PROGRESS"],
+    ["report_review_result", "spec", "SPEC_IN_PROGRESS"],
+    ["report_pr_created", "spec", "SPEC_IN_PROGRESS"],
+    ["report_complete", "implementation", "IMPLEMENTING"],
+    ["propose_spec", "implementation", "IMPLEMENTING"],
+  ];
+
+  for (const [tool, role, taskState] of wrongRole) {
+    it(`${tool} from a ${role} execution returns FORBIDDEN and writes nothing`, async () => {
+      const s = await seed({ role, taskState });
+      const before = await snapshot(s);
+
+      const result = await call(s.token, tool, VALID_ARGS[tool]!);
+
+      expect(result).toMatchObject({ isError: true, code: "FORBIDDEN" });
+      expect(await snapshot(s)).toEqual(before);
+    });
+  }
+});
+
+// ============================================================= AC3 + AC4
+
+describe("raise_issue", () => {
+  it("blocking: inserts issue, event and notification, sets blockingPending, returns the stop instruction", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    registry.set(
+      createLiveExecution(
+        { executionId: s.executionId, taskId: s.taskId, role: "implementation" },
+        { db, now: () => new Date() },
+      ),
+    );
+    const before = await snapshot(s);
+
+    const data = expectOk(await call(s.token, "raise_issue", RAISE_ARGS));
+
+    expect(data.instruction).toBe(RAISE_ISSUE_BLOCKING_INSTRUCTION);
+    expect(data.instruction).toBe(
+      "Stop now. End your turn without further work. You will be resumed with the answer.",
+    );
+    expect(registry.get(s.executionId)!.blockingPending).toBe(true);
+
+    const issue = await db.query.issues.findFirst({
+      where: (t, { eq }) => eq(t.id, data.issue_id as string),
+    });
+    expect(issue).toMatchObject({
+      taskId: s.taskId,
+      executionId: s.executionId,
+      type: "DECISION_REQUIRED",
+      severity: "blocking",
+      blocking: true,
+      title: "Which cache?",
+      question: "Redis or in-process?",
+      suggestedOptions: RAISE_ARGS.options,
+      recommendedOption: "memory",
+      status: "OPEN",
+    });
+    const notifications = await db.query.notifications.findMany({
+      where: (t, { eq }) => eq(t.issueId, issue!.id),
+    });
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]).toMatchObject({
+      userId: null,
+      taskId: s.taskId,
+      kind: "issue_raised",
+      title: "Which cache?",
+    });
+    const created = (await eventsFor(s.taskId)).filter(
+      (e) => e.type === "issue.created",
+    );
+    expect(created).toHaveLength(1);
+    expect(created[0]!.payload).toMatchObject({ issue_id: issue!.id });
+    // A blocking issue does not change the task (design.md §5.3).
+    expect((await getTask(s.taskId))!.state).toBe("IMPLEMENTING");
+
+    await expectRecorded(s, "raise_issue", before.leaseExpiresAt);
+    registry.delete(s.executionId);
+  });
+
+  it("non-blocking: records the issue and does not set blockingPending", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    registry.set(
+      createLiveExecution(
+        { executionId: s.executionId, taskId: s.taskId, role: "implementation" },
+        { db, now: () => new Date() },
+      ),
+    );
+
+    const data = expectOk(
+      await call(s.token, "raise_issue", {
+        ...RAISE_ARGS,
+        blocking: false,
+        severity: "warning",
+      }),
+    );
+
+    expect(data.instruction).not.toBe(RAISE_ISSUE_BLOCKING_INSTRUCTION);
+    expect(registry.get(s.executionId)!.blockingPending).toBe(false);
+    const issue = await db.query.issues.findFirst({
+      where: (t, { eq }) => eq(t.id, data.issue_id as string),
+    });
+    expect(issue).toMatchObject({ blocking: false, status: "OPEN" });
+    registry.delete(s.executionId);
+  });
+
+  it("is allowed from a spec execution and while ASSIGNED", async () => {
+    const spec = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+    expectOk(await call(spec.token, "raise_issue", VALID_ARGS.raise_issue!));
+
+    const assigned = await seed({
+      taskState: "IMPLEMENTING",
+      executionState: "ASSIGNED",
+    });
+    expectOk(await call(assigned.token, "raise_issue", VALID_ARGS.raise_issue!));
+  });
+
+  it("an input that embeds the token is redacted before it is stored", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+
+    const data = expectOk(
+      await call(s.token, "raise_issue", {
+        ...VALID_ARGS.raise_issue,
+        description: `my token is ${s.token}`,
+      }),
+    );
+
+    const issue = await db.query.issues.findFirst({
+      where: (t, { eq }) => eq(t.id, data.issue_id as string),
+    });
+    expect(issue!.description).not.toContain(s.token);
+    for (const event of await eventsFor(s.taskId)) {
+      expect(JSON.stringify(event.payload)).not.toContain(s.token);
+    }
+  });
+});
+
+// ================================================================= AC3
+
+describe("report_review_started", () => {
+  it("moves the task IMPLEMENTING -> REVIEWING and writes review.started", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const before = await snapshot(s);
+
+    expectOk(await call(s.token, "report_review_started", { round: 1 }));
+
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+    const events = await eventsFor(s.taskId);
+    expect(events.find((e) => e.type === "review.started")!.payload).toMatchObject({
+      round: 1,
+    });
+    expect(
+      events.find((e) => e.type === "task.state_changed")!.payload,
+    ).toMatchObject({
+      from: "IMPLEMENTING",
+      to: "REVIEWING",
+      trigger: "review.started",
+      actor: { kind: "agent" },
+    });
+    await expectRecorded(s, "report_review_started", before.leaseExpiresAt);
+  });
+
+  it("returns ILLEGAL_TRANSITION from the wrong task state and rolls the event back", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+
+    const result = await call(s.token, "report_review_started", { round: 1 });
+
+    expect(result).toMatchObject({ isError: true, code: "ILLEGAL_TRANSITION" });
+    const events = await eventsFor(s.taskId);
+    expect(events.filter((e) => e.type === "review.started")).toHaveLength(0);
+    const recorded = events.filter((e) => e.type === "agent.tool_call");
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]!.payload).toMatchObject({
+      tool: "report_review_started",
+      ok: false,
+      error: "ILLEGAL_TRANSITION",
+    });
+  });
+});
+
+// ================================================================= AC5
+
+describe("report_review_result", () => {
+  it("findings: inserts review_results, moves REVIEWING -> IMPLEMENTING, increments review_rounds", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    const before = await snapshot(s);
+    const findings = [
+      { severity: "warning", file: "a.ts", line: 3, description: "d", action: "fix" },
+    ];
+
+    const data = expectOk(
+      await call(s.token, "report_review_result", {
+        round: 1,
+        verdict: "findings",
+        findings,
+      }),
+    );
+
+    expect(data.ok).toBe(true);
+    expect(data.instruction).toBeUndefined();
+    expect((await getTask(s.taskId))!.state).toBe("IMPLEMENTING");
+    expect((await getExecution(s.executionId))!.reviewRounds).toBe(1);
+    const reviews = await db.query.reviewResults.findMany({
+      where: (t, { eq }) => eq(t.executionId, s.executionId),
+    });
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]).toMatchObject({
+      round: 1,
+      verdict: "findings",
+      findings,
+      reviewerRuntime: "codex",
+    });
+    const result = (await eventsFor(s.taskId)).find(
+      (e) => e.type === "review.result",
+    );
+    expect(result!.payload).toMatchObject({
+      round: 1,
+      verdict: "findings",
+      review_result_id: reviews[0]!.id,
+    });
+    await expectRecorded(s, "report_review_result", before.leaseExpiresAt);
+  });
+
+  it("clean: records the result and leaves task and execution state alone", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+
+    const data = expectOk(
+      await call(s.token, "report_review_result", {
+        round: 2,
+        verdict: "clean",
+        findings: [],
+      }),
+    );
+
+    expect(data.instruction).toBeUndefined();
+    const task = await getTask(s.taskId);
+    const execution = await getExecution(s.executionId);
+    expect(task!.state).toBe("REVIEWING");
+    expect(execution!.state).toBe("RUNNING");
+    expect(execution!.reviewRounds).toBe(0);
+    expect(
+      await db.query.reviewResults.findMany({
+        where: (t, { eq }) => eq(t.executionId, s.executionId),
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("ask_user: no transition, instructs the agent to call raise_issue", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+
+    const data = expectOk(
+      await call(s.token, "report_review_result", {
+        round: 1,
+        verdict: "ask_user",
+        findings: [{ severity: "blocking", description: "?", action: "ask" }],
+      }),
+    );
+
+    expect(data.instruction).toMatch(/raise_issue/);
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+  });
+
+  it("round > max_review_rounds: returns the stop instruction and moves the task to NEEDS_HUMAN", async () => {
+    const s = await seed({ taskState: "REVIEWING", maxReviewRounds: 2 });
+    const before = await snapshot(s);
+
+    const data = expectOk(
+      await call(s.token, "report_review_result", {
+        round: 3,
+        verdict: "findings",
+        findings: [{ severity: "warning", description: "d", action: "a" }],
+      }),
+    );
+
+    expect(data.instruction).toBe(REVIEW_ROUND_LIMIT_INSTRUCTION);
+    const task = await getTask(s.taskId);
+    expect(task!.state).toBe("NEEDS_HUMAN");
+    expect(task!.needsHumanReason).toMatch(/review round limit/i);
+    // The limit, not the findings edge, decides: no review_rounds++.
+    expect((await getExecution(s.executionId))!.reviewRounds).toBe(0);
+    expect(
+      (await eventsFor(s.taskId)).find((e) => e.type === "task.state_changed")!
+        .payload,
+    ).toMatchObject({ to: "NEEDS_HUMAN", trigger: "task.escalated" });
+    await expectRecorded(s, "report_review_result", before.leaseExpiresAt);
+  });
+
+  it("round == max_review_rounds is still within the limit", async () => {
+    const s = await seed({ taskState: "REVIEWING", maxReviewRounds: 2 });
+
+    const data = expectOk(
+      await call(s.token, "report_review_result", {
+        round: 2,
+        verdict: "findings",
+        findings: [],
+      }),
+    );
+
+    expect(data.instruction).toBeUndefined();
+    expect((await getTask(s.taskId))!.state).toBe("IMPLEMENTING");
+  });
+});
+
+// ================================================================= AC6
+
+describe("report_pr_created", () => {
+  it("inserts the PR, moves task to CI_RUNNING and execution to COMPLETED, and revokes the token", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    const before = await snapshot(s);
+    const client = await connect(s.token);
+
+    expectOk(
+      await callOn(client, "report_pr_created", {
+        url: "https://github.com/goopter/orchestra/pull/42",
+        number: 42,
+        head_sha: "deadbeef",
+      }),
+    );
+
+    const prs = await db.query.pullRequests.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    expect(prs).toHaveLength(1);
+    expect(prs[0]).toMatchObject({
+      executionId: s.executionId,
+      number: 42,
+      url: "https://github.com/goopter/orchestra/pull/42",
+      headSha: "deadbeef",
+      state: "open",
+      ciState: "pending",
+    });
+    expect(prs[0]!.lastPolledAt).toBeInstanceOf(Date);
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+    const execution = await getExecution(s.executionId);
+    expect(execution!.state).toBe("COMPLETED");
+    expect(execution!.endedAt).toBeInstanceOf(Date);
+    expect(execution!.toolsTokenHash).toBeNull();
+    const types = (await eventsFor(s.taskId)).map((e) => e.type);
+    expect(types).toContain("pull_request.created");
+    expect(types).toContain("execution.completed");
+    await expectRecorded(s, "report_pr_created", before.leaseExpiresAt);
+
+    // A following call fails auth, on the same client and on a new one.
+    await expect(callOn(client, "note", { text: "after" })).rejects.toThrow(
+      /401|UNAUTHORIZED/,
+    );
+    await expect(connect(s.token)).rejects.toThrow(/401|UNAUTHORIZED/);
+  });
+});
+
+// ================================================================= AC3
+
+describe("report_complete", () => {
+  it("records an agent.note with the summary and changes no state", async () => {
+    const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+    const before = await snapshot(s);
+
+    expectOk(await call(s.token, "report_complete", { summary: "spec ready" }));
+
+    const note = (await eventsFor(s.taskId)).find((e) => e.type === "agent.note");
+    expect(note!.payload).toMatchObject({ text: "spec ready", tool: "report_complete" });
+    expect(note!.executionId).toBe(s.executionId);
+    expect((await getTask(s.taskId))!.state).toBe("SPEC_IN_PROGRESS");
+    expect((await getExecution(s.executionId))!.state).toBe("RUNNING");
+    await expectRecorded(s, "report_complete", before.leaseExpiresAt);
+  });
+});
+
+describe("report_failed", () => {
+  it("implementation: execution FAILED with agent_gave_up, task NEEDS_HUMAN, token revoked", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const before = await snapshot(s);
+
+    expectOk(
+      await call(s.token, "report_failed", {
+        reason: "blocked by flaky infra",
+        detail: "npm install times out",
+      }),
+    );
+
+    const execution = await getExecution(s.executionId);
+    expect(execution).toMatchObject({
+      state: "FAILED",
+      endReason: "agent_gave_up",
+      toolsTokenHash: null,
+    });
+    expect(execution!.endDetail).toContain("blocked by flaky infra");
+    expect(execution!.endDetail).toContain("npm install times out");
+    expect(execution!.endedAt).toBeInstanceOf(Date);
+    const task = await getTask(s.taskId);
+    expect(task!.state).toBe("NEEDS_HUMAN");
+    expect(task!.needsHumanReason).toContain("blocked by flaky infra");
+    await expectRecorded(s, "report_failed", before.leaseExpiresAt);
+  });
+
+  it("also escalates from REVIEWING", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    expectOk(await call(s.token, "report_failed", VALID_ARGS.report_failed!));
+    expect((await getTask(s.taskId))!.state).toBe("NEEDS_HUMAN");
+  });
+
+  it("after the review limit already escalated, fails the execution and leaves NEEDS_HUMAN", async () => {
+    const s = await seed({ taskState: "REVIEWING", maxReviewRounds: 1 });
+    expectOk(
+      await call(s.token, "report_review_result", {
+        round: 2,
+        verdict: "findings",
+        findings: [],
+      }),
+    );
+
+    expectOk(await call(s.token, "report_failed", VALID_ARGS.report_failed!));
+
+    expect((await getTask(s.taskId))!.state).toBe("NEEDS_HUMAN");
+    expect((await getExecution(s.executionId))!.state).toBe("FAILED");
+  });
+
+  it("spec: execution FAILED, task stays SPEC_IN_PROGRESS (no NEEDS_HUMAN edge in §5.1)", async () => {
+    const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+
+    expectOk(await call(s.token, "report_failed", VALID_ARGS.report_failed!));
+
+    expect((await getExecution(s.executionId))).toMatchObject({
+      state: "FAILED",
+      endReason: "agent_gave_up",
+      toolsTokenHash: null,
+    });
+    expect((await getTask(s.taskId))!.state).toBe("SPEC_IN_PROGRESS");
+  });
+
+  it("while ASSIGNED returns UNAUTHORIZED and writes nothing: core has no ASSIGNED -> FAILED edge", async () => {
+    const s = await seed({
+      taskState: "IMPLEMENTING",
+      executionState: "ASSIGNED",
+    });
+    const before = await snapshot(s);
+
+    const result = await call(s.token, "report_failed", VALID_ARGS.report_failed!);
+
+    expect(result).toMatchObject({ isError: true, code: "UNAUTHORIZED" });
+    // No agent.tool_call row, lease not renewed, no state change.
+    expect(await snapshot(s)).toEqual(before);
+  });
+});
+
+// ================================================================= AC7
+
+describe("propose_spec", () => {
+  it("twice upserts a single draft revision holding the second content", async () => {
+    const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+    const before = await snapshot(s);
+
+    expectOk(await call(s.token, "propose_spec", specContent("first")));
+    expectOk(await call(s.token, "propose_spec", specContent("second")));
+
+    const revisions = await db.query.specificationRevisions.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    expect(revisions).toHaveLength(1);
+    expect(revisions[0]).toMatchObject({
+      status: "draft",
+      version: 1,
+      createdBy: null,
+      content: specContent("second"),
+    });
+    const proposed = (await eventsFor(s.taskId)).filter(
+      (e) => e.type === "spec.proposed",
+    );
+    expect(proposed).toHaveLength(2);
+    expect(proposed[1]!.payload).toMatchObject({
+      revision_id: revisions[0]!.id,
+      version: 1,
+    });
+
+    const calls = (await eventsFor(s.taskId)).filter(
+      (e) => e.type === "agent.tool_call",
+    );
+    expect(calls).toHaveLength(2);
+    const lease = await getLease(s.executionId);
+    expect(lease!.expiresAt.getTime()).toBeGreaterThan(before.leaseExpiresAt);
+  });
+
+  it("an invalid spec returns a validation error and writes nothing", async () => {
+    const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+    const before = await snapshot(s);
+
+    const result = await call(s.token, "propose_spec", {
+      ...specContent("bad"),
+      scope: "not a list",
+      objective: undefined,
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result as { message: string }).message).toMatch(/validation/i);
+    expect((result as { message: string }).message).toMatch(/scope/);
+    expect((result as { message: string }).message).toMatch(/objective/);
+    expect(await snapshot(s)).toEqual(before);
+  });
+});
+
+// ================================================================= AC3
+
+describe("note", () => {
+  it("writes agent.note with the text from either role and while ASSIGNED", async () => {
+    for (const opts of [
+      { role: "implementation" as const, taskState: "IMPLEMENTING" as const },
+      { role: "spec" as const, taskState: "SPEC_IN_PROGRESS" as const },
+      {
+        role: "implementation" as const,
+        taskState: "IMPLEMENTING" as const,
+        executionState: "ASSIGNED" as const,
+      },
+    ]) {
+      const s = await seed(opts);
+      const before = await snapshot(s);
+
+      expectOk(await call(s.token, "note", { text: "tests are slow here" }));
+
+      const note = (await eventsFor(s.taskId)).find((e) => e.type === "agent.note");
+      expect(note!.payload).toMatchObject({ text: "tests are slow here" });
+      expect(note!.executionId).toBe(s.executionId);
+      await expectRecorded(s, "note", before.leaseExpiresAt);
+    }
+  });
+});
+
+// ================================================================= AC8
+
+describe("lease renewal and registry", () => {
+  it("uses the registered LiveExecution.renewLease when the execution is live", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    let renewed = 0;
+    registry.set({
+      ...createLiveExecution(
+        { executionId: s.executionId, taskId: s.taskId, role: "implementation" },
+        { db, now: () => new Date() },
+      ),
+      renewLease: async () => void (renewed += 1),
+    });
+
+    expectOk(await call(s.token, "note", { text: "x" }));
+
+    expect(renewed).toBe(1);
+    registry.delete(s.executionId);
+  });
+
+  it("the default LiveExecution.renewLease pushes expires_at to now + 5 min", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const fixed = new Date("2026-06-01T12:00:00.000Z");
+    const live = createLiveExecution(
+      { executionId: s.executionId, taskId: s.taskId, role: "implementation" },
+      { db, now: () => fixed },
+    );
+
+    await live.renewLease();
+
+    expect((await getLease(s.executionId))!.expiresAt.getTime()).toBe(
+      fixed.getTime() + 5 * 60 * 1000,
+    );
+    expect(live.blockingPending).toBe(false);
+  });
+
+  it("serves an execution missing from the registry, renews through the db and warns", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const before = await snapshot(s);
+    const warnsBefore = records.filter((r) => r.level === "warn").length;
+
+    expectOk(await call(s.token, "note", { text: "unregistered" }));
+
+    await expectRecorded(s, "note", before.leaseExpiresAt);
+    const warns = records.filter((r) => r.level === "warn").slice(warnsBefore);
+    expect(
+      warns.some((r) => r.fields.executionId === s.executionId),
+    ).toBe(true);
+  });
+});
+
+describe("token hygiene", () => {
+  it("no log record and no event payload ever contains an issued token", async () => {
+    const logged = JSON.stringify(records);
+    const events = await db.query.executionEvents.findMany();
+    const stored = JSON.stringify(
+      events.map((e) => e.payload),
+      (_k, v: unknown) => (typeof v === "bigint" ? v.toString() : v),
+    );
+    expect(issuedTokens.length).toBeGreaterThan(10);
+    for (const token of issuedTokens) {
+      expect(logged).not.toContain(token);
+      expect(stored).not.toContain(token);
+    }
+  });
+});
