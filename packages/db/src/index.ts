@@ -3,6 +3,9 @@ import { placeholder as corePlaceholder } from "@orchestra/core";
 export * from "./schema/index.js";
 export * from "./client.js";
 export { runMigrations } from "./migrate.js";
+export * from "./transition.js";
+export * from "./events.js";
+export * from "./queries/index.js";
 
 export const PACKAGE_NAME = "@orchestra/db";
 
