@@ -1,13 +1,32 @@
-import { placeholder as corePlaceholder } from "@orchestra/core";
-import { placeholder as dbPlaceholder } from "@orchestra/db";
+import { createDb } from "@orchestra/db";
+import { buildApp } from "./app.js";
+import { loadConfig } from "./config.js";
 
-export const PACKAGE_NAME = "@orchestra/api";
+async function main(): Promise<void> {
+  const config = loadConfig();
+  const db = createDb(config.DATABASE_URL);
+  const app = await buildApp({ db, config });
 
-/**
- * Scaffold placeholder. Replaced by the Fastify server: auth, projects,
- * repositories, tasks read routes (design.md §3, §12; build order step 3).
- * `api` and `worker` are the only entry points (design.md §3).
- */
-export function placeholder(): string {
-  return `${PACKAGE_NAME}+${corePlaceholder()}+${dbPlaceholder()}`;
+  await app.listen({ port: config.PORT, host: config.HOST });
+
+  let shuttingDown = false;
+  const shutdown = (signal: NodeJS.Signals): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    app.log.info({ signal }, "shutting down");
+    app
+      .close()
+      .then(() => process.exit(0))
+      .catch((err: unknown) => {
+        app.log.error(err, "error during shutdown");
+        process.exit(1);
+      });
+  };
+
+  process.on("SIGTERM", shutdown);
 }
+
+main().catch((err: unknown) => {
+  console.error(err);
+  process.exit(1);
+});
