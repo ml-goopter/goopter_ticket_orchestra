@@ -7,6 +7,7 @@ import { registerErrorHandler } from "./lib/errors.js";
 import authPlugin from "./plugins/auth.js";
 import authRoutes from "./routes/auth.js";
 import healthRoutes from "./routes/health.js";
+import tasksRoutes from "./routes/tasks.js";
 import "./types.js";
 
 export interface AppDeps {
@@ -42,6 +43,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   await app.register(healthRoutes, { prefix: "/api" });
   await app.register(authRoutes, { prefix: "/api/auth" });
+  await app.register(tasksRoutes, { prefix: "/api" });
 
   return app;
 }
