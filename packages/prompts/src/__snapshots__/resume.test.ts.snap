@@ -1,0 +1,53 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildResumePrompt (design.md §9.2, §9.5) > ci_failure: header names the sha, lists failing checks, and states the round count 1`] = `
+"## CI failed on abc1234
+
+Round 2 of 3.
+
+Failing checks: test
+
+### test
+\`\`\`
+1 failing
+Expected true, got false
+\`\`\`"
+`;
+
+exports[`buildResumePrompt (design.md §9.2, §9.5) > decision: header names the issue and states decision, clarification, and chosen option 1`] = `
+"## Answer to issue issue_784
+Decision: Receipt language is device-local.
+Clarification: Reinstall resets it.
+Chosen option: device-local"
+`;
+
+exports[`buildResumePrompt (design.md §9.2, §9.5) > protocol_nudge: names the missing terminal tool call 1`] = `
+"## Protocol reminder
+Your last turn ended without calling report_pr_created. Call it now, or raise_issue if you are blocked. Do not stop without calling one of them."
+`;
+
+exports[`buildResumePrompt (design.md §9.2, §9.5) > spec_revision: header names the version and includes a unified diff plus reconcile instruction 1`] = `
+"## Specification revised to version 3
+
+===================================================================
+--- previous specification
++++ revised specification
+@@ -17,6 +17,7 @@
+ ### Requirements
+ 
+ - must be blue
++- must be round
+ 
+ ### Acceptance criteria
+ 
+
+
+Reconcile this revision with any work you have already completed in this worktree before continuing."
+`;
+
+exports[`buildResumePrompt (design.md §9.2, §9.5) > user_message: header lists conversation turns on the open issue 1`] = `
+"## Message from user
+Issue issue_900:
+- user@example.com: Can you use the v2 endpoint instead?
+- agent: Switching to the v2 endpoint."
+`;
