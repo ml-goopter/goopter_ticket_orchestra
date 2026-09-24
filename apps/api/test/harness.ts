@@ -24,6 +24,13 @@ import { hashPassword } from "../src/lib/passwords.js";
 
 export interface TestDb {
   db: Db;
+  /**
+   * Raw postgres.js client `createDb` opened internally (`db.$client`),
+   * for tagged-template reads that would otherwise need an `eq`-style
+   * query operator (forbidden in `apps/api`, design.md §3). Mirrors
+   * `packages/db/test/harness.ts`'s `sql`.
+   */
+  sql: Db["$client"];
   connectionString: string;
   stop(): Promise<void>;
 }
@@ -45,6 +52,7 @@ export async function startTestDb(): Promise<TestDb> {
   const db = createDb(connectionString);
   return {
     db,
+    sql: db.$client,
     connectionString,
     async stop() {
       await db.$client.end({ timeout: 5 });
@@ -297,4 +305,39 @@ export async function seedDependency(
   dependsOnTaskId: string,
 ): Promise<void> {
   await db.insert(taskDependencies).values({ taskId, dependsOnTaskId });
+}
+
+/**
+ * `audit_events` rows for one entity, read via the raw `sql` client since
+ * `apps/api` cannot import an `eq`-style query operator (design.md §3).
+ * Columns are aliased to match `auditEvents`'s camelCase field names.
+ */
+export async function listAuditEventsForEntity(
+  sql: Db["$client"],
+  entityId: string,
+): Promise<Array<{ toState: string }>> {
+  return sql<{ toState: string }[]>`
+    select to_state as "toState" from audit_events where entity_id = ${entityId}
+  `;
+}
+
+/** `execution_events` rows for one task, read via the raw `sql` client. */
+export async function listExecutionEventsForTask(
+  sql: Db["$client"],
+  taskId: string,
+): Promise<Array<{ type: string }>> {
+  return sql<{ type: string }[]>`
+    select type from execution_events where task_id = ${taskId}
+  `;
+}
+
+/** One `executions` row by id, read via the raw `sql` client. */
+export async function findExecutionById(
+  sql: Db["$client"],
+  executionId: string,
+): Promise<{ state: string } | null> {
+  const rows = await sql<{ state: string }[]>`
+    select state from executions where id = ${executionId}
+  `;
+  return rows[0] ?? null;
 }

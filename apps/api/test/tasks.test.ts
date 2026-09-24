@@ -1,8 +1,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { appendEvent, auditEvents, executionEvents, executions, tasks } from "@orchestra/db";
-import { eq } from "drizzle-orm";
+import { appendEvent, getTaskAggregate } from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -11,6 +10,9 @@ import {
   type TestDb,
   buildTestApp,
   createClock,
+  findExecutionById,
+  listAuditEventsForEntity,
+  listExecutionEventsForTask,
   seedDependency,
   seedExecution,
   seedFixtures,
@@ -576,22 +578,13 @@ describe("POST /api/tasks/:id/cancel (AC5)", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ from: "NEEDS_SPEC", to: "CANCELLED" });
 
-    const audits = await h.db
-      .select()
-      .from(auditEvents)
-      .where(eq(auditEvents.entityId, taskId));
+    const audits = await listAuditEventsForEntity(h.sql, taskId);
     expect(audits.some((a) => a.toState === "CANCELLED")).toBe(true);
 
-    const events = await h.db
-      .select()
-      .from(executionEvents)
-      .where(eq(executionEvents.taskId, taskId));
+    const events = await listExecutionEventsForTask(h.sql, taskId);
     expect(events.some((e) => e.type === "task.state_changed")).toBe(true);
 
-    const [execRow] = await h.db
-      .select()
-      .from(executions)
-      .where(eq(executions.id, execId));
+    const execRow = await findExecutionById(h.sql, execId);
     expect(execRow!.state).toBe("CANCELLED");
   });
 
@@ -627,19 +620,13 @@ describe("POST /api/tasks/:id/retry (AC6)", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ from: "NEEDS_HUMAN", to: "READY" });
 
-    const [row] = await h.db.select().from(tasks).where(eq(tasks.id, taskId));
-    expect(row!.needsHumanReason).toBeNull();
+    const aggregate = await getTaskAggregate(h.db, taskId);
+    expect(aggregate!.task.needsHumanReason).toBeNull();
 
-    const audits = await h.db
-      .select()
-      .from(auditEvents)
-      .where(eq(auditEvents.entityId, taskId));
+    const audits = await listAuditEventsForEntity(h.sql, taskId);
     expect(audits.some((a) => a.toState === "READY")).toBe(true);
 
-    const events = await h.db
-      .select()
-      .from(executionEvents)
-      .where(eq(executionEvents.taskId, taskId));
+    const events = await listExecutionEventsForTask(h.sql, taskId);
     expect(events.some((e) => e.type === "task.state_changed")).toBe(true);
   });
 

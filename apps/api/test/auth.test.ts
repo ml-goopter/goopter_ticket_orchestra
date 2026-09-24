@@ -1,5 +1,10 @@
-import { sessions, users } from "@orchestra/db";
-import { eq } from "drizzle-orm";
+import {
+  findSessionWithUser,
+  listSessionsForUser,
+  sessions,
+  setUserDisabledAt,
+  users,
+} from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -96,10 +101,10 @@ describe("auth", () => {
         displayName: user.displayName,
       });
 
-      const sessionRowsBefore = await testDb.db
-        .select()
-        .from(sessions)
-        .where(eq(sessions.userId, user.id));
+      const sessionRowsBefore = await listSessionsForUser(
+        testDb.db,
+        user.id,
+      );
       expect(sessionRowsBefore).toHaveLength(1);
 
       const logoutRes = await app.inject({
@@ -116,10 +121,7 @@ describe("auth", () => {
       });
       expect(meAfterLogout.statusCode).toBe(401);
 
-      const sessionRowsAfter = await testDb.db
-        .select()
-        .from(sessions)
-        .where(eq(sessions.userId, user.id));
+      const sessionRowsAfter = await listSessionsForUser(testDb.db, user.id);
       expect(sessionRowsAfter).toHaveLength(0);
     });
   });
@@ -184,10 +186,7 @@ describe("auth", () => {
       });
       const cookie = extractCookie(loginRes.headers["set-cookie"]);
 
-      await testDb.db
-        .update(users)
-        .set({ disabledAt: clock.now() })
-        .where(eq(users.id, user.id));
+      await setUserDisabledAt(testDb.db, user.id, clock.now());
 
       const meRes = await app.inject({
         method: "GET",
@@ -242,10 +241,11 @@ describe("auth", () => {
       });
       expect(res.statusCode).toBe(200);
 
-      const [row] = await testDb.db
-        .select()
-        .from(sessions)
-        .where(eq(sessions.id, sessionId));
+      const sessionWithUser = await findSessionWithUser(
+        testDb.db,
+        sessionId,
+      );
+      const row = sessionWithUser?.session;
       expect(row!.expiresAt.getTime()).toBeGreaterThan(
         originalExpiresAt.getTime(),
       );
