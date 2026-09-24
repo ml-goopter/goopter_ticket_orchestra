@@ -8,6 +8,13 @@
       "when": 1790282142212,
       "tag": "0000_late_raider",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790291926889,
+      "tag": "0001_sturdy_leader",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,1 @@
+ALTER TABLE "executions" ADD COLUMN "tools_token_hash" text;

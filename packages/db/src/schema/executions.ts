@@ -45,6 +45,15 @@ export const executions = pgTable(
     worktreePath: text("worktree_path"),
     branch: text("branch"),
     sessionId: text("session_id"),
+    /**
+     * SHA-256 (hex) of the agent-tools bearer token for this execution
+     * (design.md §8: "The token is a random 32-byte value stored on the
+     * execution row as a hash, issued at start or resume, and revoked when
+     * the execution leaves `RUNNING`"). §4.2 lists no column for it; this
+     * is that column. Null means no live token, which is what makes
+     * revocation a single `set null`.
+     */
+    toolsTokenHash: text("tools_token_hash"),
     endReason: endReasonEnum("end_reason"),
     endDetail: text("end_detail"),
     reviewRounds: integer("review_rounds").notNull().default(0),
