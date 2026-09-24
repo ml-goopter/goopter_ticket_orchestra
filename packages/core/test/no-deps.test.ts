@@ -6,14 +6,17 @@ const packageJsonPath = fileURLToPath(
   new URL("../package.json", import.meta.url),
 );
 
-describe("@orchestra/core package.json (design.md §3: core has no I/O, no deps)", () => {
-  it("declares no dependencies field at all", () => {
+describe("@orchestra/core package.json (design.md §3: core has no I/O, only zod as a runtime dep)", () => {
+  it("declares exactly zod as its runtime dependency", () => {
     const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8")) as Record<
       string,
       unknown
     >;
 
-    expect(pkg["dependencies"]).toBeUndefined();
+    const deps = pkg["dependencies"] as Record<string, string> | undefined;
+
+    expect(deps).toBeDefined();
+    expect(Object.keys(deps!)).toEqual(["zod"]);
   });
 
   it("declares no workspace:* dependency anywhere in the manifest", () => {
