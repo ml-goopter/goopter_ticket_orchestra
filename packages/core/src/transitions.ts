@@ -29,7 +29,7 @@ import { TaskState, ExecutionState } from "./enums.js";
  *  - `execution.waiting`     RUNNING -> WAITING_FOR_USER
  *  - `execution.resumed`     WAITING_FOR_USER -> RUNNING
  *  - `execution.completed`   RUNNING -> COMPLETED
- *  - `execution.failed`      RUNNING -> FAILED
+ *  - `execution.failed`      ASSIGNED/RUNNING -> FAILED
  *  - `execution.cancelled`   QUEUED/ASSIGNED/RUNNING/WAITING_FOR_USER -> CANCELLED
  *
  * Note: `spec.approved` appears twice with different `from` states
@@ -110,6 +110,9 @@ export const EXECUTION_TRANSITIONS = [
   { entity: "execution", from: ExecutionState.WAITING_FOR_USER, trigger: "execution.resumed", to: ExecutionState.RUNNING },
   { entity: "execution", from: ExecutionState.RUNNING, trigger: "execution.completed", to: ExecutionState.COMPLETED },
   { entity: "execution", from: ExecutionState.RUNNING, trigger: "execution.failed", to: ExecutionState.FAILED },
+  // A failure before the session starts: setup_failed, an adapter error or
+  // agent_hung before the `session` event (§9.3-§9.5), lease_expired (§6.5).
+  { entity: "execution", from: ExecutionState.ASSIGNED, trigger: "execution.failed", to: ExecutionState.FAILED },
   { entity: "execution", from: ExecutionState.QUEUED, trigger: "execution.cancelled", to: ExecutionState.CANCELLED },
   { entity: "execution", from: ExecutionState.ASSIGNED, trigger: "execution.cancelled", to: ExecutionState.CANCELLED },
   { entity: "execution", from: ExecutionState.RUNNING, trigger: "execution.cancelled", to: ExecutionState.CANCELLED },

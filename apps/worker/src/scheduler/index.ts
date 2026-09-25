@@ -1,4 +1,5 @@
 import type { Runtime } from "@orchestra/core";
+import type { CommandHandlers } from "../runner/commands.js";
 import type { Phase } from "../tick.js";
 import {
   claimNextTask,
@@ -29,10 +30,15 @@ export interface SchedulerDeps {
   /** Runtimes detected on PATH at startup (§7.3). Default none. */
   runtimes?: readonly Runtime[];
   /**
-   * Receives each claimed execution after commit (G1). Absent until the
-   * runner exists; without it the claim phase does nothing.
+   * Receives each claimed execution after commit (G1): the runner's
+   * `onClaimed`. Without it the claim phase does nothing.
    */
   onClaimed?: OnClaimed;
+  /**
+   * §6.1 command handlers. Absent or empty, the consume phase claims
+   * nothing.
+   */
+  commands?: CommandHandlers;
 }
 
 /** design.md §6.2 as a tick phase. */
