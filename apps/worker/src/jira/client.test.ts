@@ -261,6 +261,128 @@ describe("parseJiraPriority (design.md §11.1, Q2)", () => {
     expect(parseJiraPriority("none")).toBe(MISSING_JIRA_PRIORITY);
     expect(MISSING_JIRA_PRIORITY).toBeGreaterThan(parseJiraPriority("999999"));
   });
+
+  it("fits jira_priority (int4), unlike Number.MAX_SAFE_INTEGER (F1 regression)", () => {
+    expect(Number.isInteger(MISSING_JIRA_PRIORITY)).toBe(true);
+    expect(MISSING_JIRA_PRIORITY).toBeLessThanOrEqual(2_147_483_647);
+  });
+
+  it("rejects an empty string instead of returning 0 (F4 regression)", () => {
+    expect(parseJiraPriority("")).toBe(MISSING_JIRA_PRIORITY);
+  });
+
+  it("rejects a non-integer id instead of returning it unrounded (F4 regression)", () => {
+    expect(parseJiraPriority("3.5")).toBe(MISSING_JIRA_PRIORITY);
+    expect(parseJiraPriority(3.5)).toBe(MISSING_JIRA_PRIORITY);
+  });
+
+  it("rejects a negative id (F4 regression)", () => {
+    expect(parseJiraPriority("-1")).toBe(MISSING_JIRA_PRIORITY);
+    expect(parseJiraPriority(-1)).toBe(MISSING_JIRA_PRIORITY);
+  });
+
+  it("rejects an id outside int4 range (F4 regression)", () => {
+    expect(parseJiraPriority("2147483648")).toBe(MISSING_JIRA_PRIORITY);
+  });
+});
+
+describe("createJiraClient.search: repeated nextPageToken (design.md §11.1, F5 regression)", () => {
+  it("throws JiraApiError instead of looping forever when Jira repeats a token", async () => {
+    const { baseUrl } = await setUp(() => ({
+      status: 200,
+      body: {
+        issues: [
+          { key: "GOOP-1", fields: { summary: "s", priority: { id: "1" }, created: "2026-01-01T00:00:00.000+0000" } },
+        ],
+        nextPageToken: "page-2",
+      },
+    }));
+
+    const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
+
+    await expect(client.search("project = GOOP")).rejects.toThrow(JiraApiError);
+  }, 5_000);
+});
+
+describe("renderAdfToPlainText: headings, nested lists, mentions and inline cards (design.md §9.2, Q3, F3 regression)", () => {
+  it("renders a heading's inline text", () => {
+    const doc = {
+      type: "doc",
+      content: [
+        {
+          type: "heading",
+          attrs: { level: 1 },
+          content: [{ type: "text", text: "Title" }],
+        },
+      ],
+    };
+    expect(renderAdfToPlainText(doc)).toBe("Title");
+  });
+
+  it("renders a nested list inside a listItem", () => {
+    const doc = {
+      type: "doc",
+      content: [
+        {
+          type: "bulletList",
+          content: [
+            {
+              type: "listItem",
+              content: [
+                { type: "paragraph", content: [{ type: "text", text: "parent" }] },
+                {
+                  type: "bulletList",
+                  content: [
+                    {
+                      type: "listItem",
+                      content: [
+                        { type: "paragraph", content: [{ type: "text", text: "child" }] },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const text = renderAdfToPlainText(doc);
+    expect(text).toContain("parent");
+    expect(text).toContain("child");
+  });
+
+  it("renders a mention as its display text", () => {
+    const doc = {
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: [
+            { type: "text", text: "Assigned to " },
+            { type: "mention", attrs: { id: "abc", text: "@Alice" } },
+          ],
+        },
+      ],
+    };
+    expect(renderAdfToPlainText(doc)).toBe("Assigned to @Alice");
+  });
+
+  it("renders an inlineCard as its url", () => {
+    const doc = {
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: [
+            { type: "text", text: "See " },
+            { type: "inlineCard", attrs: { url: "https://example.com/GOOP-1" } },
+          ],
+        },
+      ],
+    };
+    expect(renderAdfToPlainText(doc)).toBe("See https://example.com/GOOP-1");
+  });
 });
 
 describe("renderAdfToPlainText (design.md §9.2, Q3, C8)", () => {

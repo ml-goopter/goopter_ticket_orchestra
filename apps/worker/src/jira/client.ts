@@ -26,20 +26,38 @@ export interface JiraSearchIssue {
   createdAt: Date;
 }
 
-/**
- * Sentinel `jira_priority` for a ticket with no priority or a non-numeric
- * `id` (design.md §11.1, Q2): larger than any real Jira priority id, so it
- * always sorts after a real one.
- */
-export const MISSING_JIRA_PRIORITY = Number.MAX_SAFE_INTEGER;
+/** `tasks.jira_priority` is Postgres `int4`; nothing stored may exceed this. */
+const INT4_MAX = 2_147_483_647;
 
-/** Parses a Jira priority `id` (design.md §11.1, Q2). Missing or non-numeric sorts last. */
+/**
+ * Sentinel `jira_priority` for a ticket with no priority or an id that is
+ * not a valid Jira priority id (design.md §11.1, Q2): larger than any real
+ * Jira priority id, so it always sorts after a real one, but still within
+ * `int4` range so the insert never fails.
+ */
+export const MISSING_JIRA_PRIORITY = INT4_MAX;
+
+/**
+ * Parses a Jira priority `id` (design.md §11.1, Q2). Only a non-negative
+ * integer that fits `int4` is a real priority; anything else — missing,
+ * non-numeric, negative, fractional or out of range — sorts last.
+ */
 export function parseJiraPriority(id: unknown): number {
   if (typeof id !== "string" && typeof id !== "number") {
     return MISSING_JIRA_PRIORITY;
   }
+  if (typeof id === "string" && id.trim() === "") {
+    return MISSING_JIRA_PRIORITY;
+  }
   const parsed = Number(id);
-  return Number.isFinite(parsed) ? parsed : MISSING_JIRA_PRIORITY;
+  if (
+    !Number.isInteger(parsed) ||
+    parsed < 0 ||
+    parsed > INT4_MAX
+  ) {
+    return MISSING_JIRA_PRIORITY;
+  }
+  return parsed;
 }
 
 export interface JiraClientConfig {
@@ -121,6 +139,7 @@ export function createJiraClient(config: JiraClientConfig): JiraClient {
     async search(jql) {
       const issues: JiraSearchIssue[] = [];
       let nextPageToken: string | undefined;
+      const seenPageTokens = new Set<string>();
 
       do {
         const params: Record<string, string> = {
@@ -148,7 +167,17 @@ export function createJiraClient(config: JiraClientConfig): JiraClient {
           });
         }
 
-        nextPageToken = body.nextPageToken ?? undefined;
+        const next = body.nextPageToken ?? undefined;
+        if (next) {
+          if (seenPageTokens.has(next)) {
+            throw new JiraApiError(
+              0,
+              `Jira search returned a repeated nextPageToken (${next}); aborting to avoid an infinite loop`,
+            );
+          }
+          seenPageTokens.add(next);
+        }
+        nextPageToken = next;
       } while (nextPageToken);
 
       return issues;
@@ -211,31 +240,65 @@ interface AdfNode {
   type: string;
   text?: string;
   content?: AdfNode[];
+  attrs?: { text?: string; url?: string; [key: string]: unknown };
 }
 
-/** Renders inline content (text, hard breaks, marks) to a single line-preserving string. */
+/**
+ * Renders inline content (text, hard breaks, marks, `mention`, `inlineCard`)
+ * to a single line-preserving string. `mention` and `inlineCard` are leaf
+ * nodes with no `content`, so without an explicit case they render as
+ * nothing.
+ */
 function renderInline(nodes: AdfNode[]): string {
   return nodes
     .map((node) => {
       if (node.type === "text") return node.text ?? "";
       if (node.type === "hardBreak") return "\n";
+      if (node.type === "mention") return node.attrs?.text ?? "";
+      if (node.type === "inlineCard") return node.attrs?.url ?? "";
       if (node.content) return renderInline(node.content);
       return "";
     })
     .join("");
 }
 
-/** Renders `bulletList`/`orderedList` content, one line per `listItem`. */
-function renderList(items: AdfNode[], marker: (index: number) => string): string {
+/**
+ * Renders `bulletList`/`orderedList` content, one line per `listItem`. A
+ * `listItem` can hold, alongside its paragraph text, a nested
+ * `bulletList`/`orderedList`; those render as their own indented lines
+ * beneath the parent item.
+ */
+function renderList(
+  items: AdfNode[],
+  marker: (index: number) => string,
+  indent = "",
+): string {
   return items
     .map((item, index) => {
       const text = (item.content ?? [])
-        .map((child) =>
-          child.type === "paragraph" ? renderInline(child.content ?? []) : "",
-        )
+        .filter((child) => child.type === "paragraph")
+        .map((child) => renderInline(child.content ?? []))
         .filter((line) => line.length > 0)
         .join(" ");
-      return `${marker(index)}${text}`;
+      const lines = [`${indent}${marker(index)}${text}`];
+
+      for (const child of item.content ?? []) {
+        if (child.type === "bulletList") {
+          lines.push(
+            renderList(child.content ?? [], () => "- ", `${indent}  `),
+          );
+        } else if (child.type === "orderedList") {
+          lines.push(
+            renderList(
+              child.content ?? [],
+              (childIndex) => `${childIndex + 1}. `,
+              `${indent}  `,
+            ),
+          );
+        }
+      }
+
+      return lines.join("\n");
     })
     .join("\n");
 }
@@ -247,6 +310,9 @@ function renderBlocks(nodes: AdfNode[]): string[] {
   for (const node of nodes) {
     switch (node.type) {
       case "paragraph":
+        blocks.push(renderInline(node.content ?? []));
+        break;
+      case "heading":
         blocks.push(renderInline(node.content ?? []));
         break;
       case "codeBlock":

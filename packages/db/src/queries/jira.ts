@@ -4,6 +4,7 @@ import { appendEvent } from "../events.js";
 import { projects } from "../schema/projects.js";
 import { tasks } from "../schema/tasks.js";
 import { transition, type Actor, type DbOrTx, type Tx } from "../transition.js";
+import { listActiveExecutionIds } from "./task-cost.js";
 
 /** One row of `projects`, trimmed to what the Jira poller needs (design.md §11.1). */
 export interface JiraProjectRow {
@@ -135,9 +136,13 @@ export interface FailJiraTaskNotFoundInput {
 
 /**
  * Moves a task to `FAILED` because its Jira ticket returned 404 (design.md
- * §11.1, Q1). The `agent.note` reason event is written in the same
- * transaction as the `transition()` call, so a reader can never observe the
- * state change without the reason or the reason without the state change.
+ * §11.1, Q1), then cancels every one of its still-active
+ * (`QUEUED`/`ASSIGNED`/`RUNNING`/`WAITING_FOR_USER`) executions, mirroring
+ * `POST /tasks/:id/cancel`: a task can never leave a live execution and its
+ * lease behind. The task transition runs first, then the execution
+ * transitions, then the `agent.note` reason — all in the same transaction,
+ * so a reader can never observe the task's new state without every active
+ * execution already cancelled, or the state change without the reason.
  */
 export async function failJiraTaskNotFound(
   tx: Tx,
@@ -149,6 +154,16 @@ export async function failJiraTaskNotFound(
     trigger: "task.failed",
     actor: input.actor,
   });
+
+  const activeExecutionIds = await listActiveExecutionIds(tx, input.taskId);
+  for (const executionId of activeExecutionIds) {
+    await transition(tx, {
+      entity: "execution",
+      id: executionId,
+      trigger: "execution.cancelled",
+      actor: input.actor,
+    });
+  }
 
   await appendEvent(tx, {
     taskId: input.taskId,

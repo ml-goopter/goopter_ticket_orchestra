@@ -1,11 +1,13 @@
 import { TaskState } from "@orchestra/core";
 import {
   executionEvents,
+  executions,
   projects,
   tasks,
   type Db,
 } from "@orchestra/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { MISSING_JIRA_PRIORITY } from "../src/jira/client.js";
 import type { JiraClient } from "../src/jira/client.js";
 import { pollProject } from "../src/jira/poller.js";
 import type { Logger } from "../src/logger.js";
@@ -61,6 +63,25 @@ async function insertTask(
       jiraCreatedAt: new Date("2025-01-01T00:00:00.000Z"),
       jiraSyncedAt: new Date("2025-01-01T00:00:00.000Z"),
       state: TaskState.NEEDS_SPEC,
+      ...overrides,
+    })
+    .returning();
+  return row!;
+}
+
+async function insertExecution(
+  taskId: string,
+  overrides: Partial<typeof executions.$inferInsert> = {},
+) {
+  const [row] = await db
+    .insert(executions)
+    .values({
+      taskId,
+      role: "implementation",
+      attempt: 1,
+      state: "RUNNING",
+      runtime: "codex",
+      model: "gpt-5-codex",
       ...overrides,
     })
     .returning();
@@ -130,6 +151,28 @@ describe("pollProject: new keys (design.md §11.1, C2)", () => {
       to: "NEEDS_SPEC",
       trigger: "jira.imported",
     });
+  });
+});
+
+describe("pollProject: missing priority (design.md §11.1, F1 regression)", () => {
+  it("inserts a ticket with no priority using a sentinel that fits jira_priority (int4)", async () => {
+    const project = await insertProject();
+    const client = fakeClient({
+      search: vi.fn(async () => [
+        {
+          key: "GOOP-109",
+          summary: "no priority",
+          priority: MISSING_JIRA_PRIORITY,
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      ]),
+    });
+
+    await pollProject({ db, project, client, actor, logger });
+
+    const [task] = await taskByKey("GOOP-109");
+    expect(task).toBeDefined();
+    expect(task!.jiraPriority).toBe(MISSING_JIRA_PRIORITY);
   });
 });
 
@@ -280,6 +323,27 @@ describe("pollProject: missing keys (design.md §11.1, E3, Q1, C5)", () => {
       pollProject({ db, project, client, actor, logger }),
     ).resolves.toBeUndefined();
     expect(client.issueExists).not.toHaveBeenCalled();
+  });
+});
+
+describe("pollProject: missing keys cancel active executions (design.md §11.1, F2 regression)", () => {
+  it("cancels a RUNNING execution in the same transaction the task fails in", async () => {
+    const project = await insertProject();
+    const task = await insertTask(project.id, { jiraKey: "GOOP-110" });
+    const execution = await insertExecution(task.id, { state: "RUNNING" });
+    const client = fakeClient({
+      search: vi.fn(async () => []),
+      issueExists: vi.fn(async () => false),
+    });
+
+    await pollProject({ db, project, client, actor, logger });
+
+    const [after] = await taskByKey("GOOP-110");
+    expect(after!.state).toBe(TaskState.FAILED);
+
+    const executionRows = await db.select().from(executions);
+    const executionAfter = executionRows.find((row) => row.id === execution.id);
+    expect(executionAfter!.state).toBe("CANCELLED");
   });
 });
 
