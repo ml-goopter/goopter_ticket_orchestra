@@ -4,18 +4,22 @@ import fp from "fastify-plugin";
 import {
   RealtimeHub,
   defaultListBacklog,
+  defaultLoadAnchor,
   defaultLoadEvent,
   type ListBacklog,
+  type LoadAnchor,
   type LoadEvent,
 } from "./hub.js";
-import { DEFAULT_KEEPALIVE_MS } from "./sse.js";
+import { DEFAULT_KEEPALIVE_MS, DEFAULT_MAX_BUFFERED_BYTES } from "./sse.js";
 
 export {
   GLOBAL_STREAM_TYPES,
   RealtimeHub,
   defaultListBacklog,
+  defaultLoadAnchor,
   defaultLoadEvent,
   type ListBacklog,
+  type LoadAnchor,
   type LoadEvent,
 } from "./hub.js";
 
@@ -23,8 +27,11 @@ export {
 export interface RealtimeOptions {
   /** H7: keepalive comment interval. Defaults to 25 seconds. */
   keepaliveMs?: number;
+  /** Unsent output per connection before it is dropped. Defaults to 8 MiB. */
+  maxBufferedBytes?: number;
   loadEvent?: LoadEvent;
   listBacklog?: ListBacklog;
+  loadAnchor?: LoadAnchor;
 }
 
 declare module "fastify" {
@@ -47,8 +54,10 @@ export default fp(
       db: app.db,
       log: app.log,
       keepaliveMs: options.keepaliveMs ?? DEFAULT_KEEPALIVE_MS,
+      maxBufferedBytes: options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES,
       loadEvent: options.loadEvent ?? defaultLoadEvent,
       listBacklog: options.listBacklog ?? defaultListBacklog,
+      loadAnchor: options.loadAnchor ?? defaultLoadAnchor,
     });
     app.decorate("realtime", hub);
 

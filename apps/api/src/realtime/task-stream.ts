@@ -16,12 +16,15 @@ export interface TaskStreamOptions {
    */
   cursor: number | undefined;
   /**
-   * Dedup floor for a stream opened without a cursor: the highest event id
-   * the hub had seen when this stream subscribed. It sends no backlog, but
-   * a LISTEN reconnect re-queries from here (H4), so events committed while
+   * For a stream opened without a cursor: reads the task's own highest
+   * committed event id (0 if none). The stream sends no backlog and starts
+   * after this id. It is read after the stream is registered for live
+   * delivery, and one task's events commit in id order, so every event
+   * committed after the read has a higher id and is delivered live. A
+   * LISTEN reconnect re-queries from here (H4), so events committed while
    * the connection was down are not lost before the first live send.
    */
-  anchor: number | undefined;
+  anchor(): Promise<number>;
   backlog: BacklogPage;
   onError(err: unknown): void;
 }
@@ -29,13 +32,16 @@ export interface TaskStreamOptions {
 /**
  * Per-subscriber delivery for `GET /tasks/:id/stream` (design.md §12.6).
  *
- * H3: the stream is registered for live delivery before its backlog query
- * runs. While a backlog query is in flight, live events are buffered; once
- * the backlog is sent the buffer is flushed in id order. Every send drops
- * an event whose id is at or below the last id sent, so the seam between
- * backlog and live delivery has neither gaps nor duplicates.
+ * H3: the stream is registered for live delivery before its backlog (or
+ * anchor) query runs. While that query is in flight, live events are
+ * buffered; once it is done the buffer is flushed in id order. Every send
+ * drops an event whose id is at or below the last id sent, so the seam
+ * between backlog and live delivery has neither gaps nor duplicates.
  *
  * H4: `resync()` re-runs the backlog query after the last sent id.
+ *
+ * Backlog rows wait for the client to drain before the next is written,
+ * so a large backlog is never buffered in memory ahead of a slow client.
  */
 export class TaskStream {
   private lastSentId: number | undefined;
@@ -44,14 +50,12 @@ export class TaskStream {
   private buffer: StreamEvent[] = [];
 
   constructor(private readonly options: TaskStreamOptions) {
-    this.lastSentId = options.cursor ?? options.anchor;
+    this.lastSentId = options.cursor;
   }
 
   /** Call after the stream is registered with the hub. */
   start(): void {
-    if (this.options.cursor !== undefined) {
-      void this.sync();
-    }
+    void this.sync();
   }
 
   push(event: StreamEvent): void {
@@ -64,7 +68,7 @@ export class TaskStream {
   }
 
   resync(): void {
-    if (this.options.sse.isClosed || this.lastSentId === undefined) return;
+    if (this.options.sse.isClosed) return;
     if (this.syncing) {
       this.resyncRequested = true;
       return;
@@ -72,24 +76,35 @@ export class TaskStream {
     void this.sync();
   }
 
-  private send(event: StreamEvent): void {
-    if (this.lastSentId !== undefined && event.id <= this.lastSentId) return;
-    this.options.sse.write(event.frame);
+  /** Returns false when the client has not drained what was written. */
+  private send(event: StreamEvent): boolean {
+    if (this.lastSentId !== undefined && event.id <= this.lastSentId) return true;
     this.lastSentId = event.id;
+    return this.options.sse.write(event.frame);
   }
 
   private async sync(): Promise<void> {
+    const { sse } = this.options;
     this.syncing = true;
     try {
-      do {
+      let runBacklog = true;
+      if (this.lastSentId === undefined) {
+        this.lastSentId = await this.options.anchor();
+        runBacklog = this.resyncRequested;
+      }
+      while (runBacklog && !sse.isClosed) {
         this.resyncRequested = false;
         let full = true;
-        while (full && !this.options.sse.isClosed) {
-          const page = await this.options.backlog(this.lastSentId ?? 0);
-          for (const event of page.events) this.send(event);
+        while (full && !sse.isClosed) {
+          const page = await this.options.backlog(this.lastSentId);
+          for (const event of page.events) {
+            if (sse.isClosed) break;
+            if (!this.send(event)) await sse.waitForDrain();
+          }
           full = page.full;
         }
-      } while (this.resyncRequested && !this.options.sse.isClosed);
+        runBacklog = this.resyncRequested;
+      }
 
       const buffered = this.buffer.sort((a, b) => a.id - b.id);
       this.buffer = [];
@@ -97,7 +112,7 @@ export class TaskStream {
     } catch (err) {
       // The client reconnects with Last-Event-ID and resumes from there.
       this.options.onError(err);
-      this.options.sse.end();
+      sse.end();
     } finally {
       this.syncing = false;
     }

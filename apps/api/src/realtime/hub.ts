@@ -3,12 +3,18 @@ import type { ExecutionEventType } from "@orchestra/core";
 import {
   TIMELINE_LIMIT_MAX,
   listTimeline,
+  maxTaskEventId,
   type Db,
   type ExecutionEventRow,
   type NotifyPayload,
 } from "@orchestra/db";
 import type { FastifyBaseLogger } from "fastify";
-import { SseConnection, toStreamEvent, type StreamEvent } from "./sse.js";
+import {
+  SseConnection,
+  endStreamImmediately,
+  toStreamEvent,
+  type StreamEvent,
+} from "./sse.js";
 import { TaskStream } from "./task-stream.js";
 
 /** Q7: the only event types `GET /stream` forwards. */
@@ -32,6 +38,12 @@ export type ListBacklog = (
   after: number,
 ) => Promise<ExecutionEventRow[]>;
 
+/** A cursor-less task stream's starting point: the task's highest committed event id, 0 if none. */
+export type LoadAnchor = (db: Db, taskId: string) => Promise<number>;
+
+export const defaultLoadAnchor: LoadAnchor = async (db, taskId) =>
+  Number((await maxTaskEventId(db, taskId)) ?? 0n);
+
 export const defaultLoadEvent: LoadEvent = async (db, taskId, eventId) => {
   const [row] = await listTimeline(db, taskId, {
     after: BigInt(eventId - 1),
@@ -47,8 +59,10 @@ export interface RealtimeHubOptions {
   db: Db;
   log: FastifyBaseLogger;
   keepaliveMs: number;
+  maxBufferedBytes: number;
   loadEvent: LoadEvent;
   listBacklog: ListBacklog;
+  loadAnchor: LoadAnchor;
 }
 
 /**
@@ -64,13 +78,12 @@ export class RealtimeHub {
   private readonly globalStreams = new Set<SseConnection>();
   private readonly connections = new Set<SseConnection>();
   private delivery: Promise<void> = Promise.resolve();
-  /** Highest event id seen on the channel; anchors cursor-less task streams. */
-  private highWater = 0;
+  /** Set by `closeAll()`; a stream opened afterwards ends at once (H8). */
+  private closing = false;
 
   constructor(private readonly options: RealtimeHubOptions) {}
 
   handleNotify(payload: NotifyPayload): void {
-    if (payload.event_id > this.highWater) this.highWater = payload.event_id;
     if (!this.taskStreams.has(payload.task_id) && this.globalStreams.size === 0) {
       return;
     }
@@ -99,10 +112,11 @@ export class RealtimeHub {
 
   openTaskStream(res: ServerResponse, taskId: string, cursor: number | undefined): void {
     const sse = this.track(res);
+    if (!sse) return;
     const stream = new TaskStream({
       sse,
       cursor,
-      anchor: this.highWater > 0 ? this.highWater : undefined,
+      anchor: () => this.options.loadAnchor(this.options.db, taskId),
       backlog: async (after) => {
         const rows = await this.options.listBacklog(this.options.db, taskId, after);
         return {
@@ -111,7 +125,7 @@ export class RealtimeHub {
         };
       },
       onError: (err) =>
-        this.options.log.error({ err, taskId }, "realtime: backlog query failed"),
+        this.options.log.error({ err, taskId }, "realtime: backlog or anchor query failed"),
     });
 
     let streams = this.taskStreams.get(taskId);
@@ -132,12 +146,14 @@ export class RealtimeHub {
   /** Q8: no replay; only live `GLOBAL_STREAM_TYPES` events. */
   openGlobalStream(res: ServerResponse): void {
     const sse = this.track(res);
+    if (!sse) return;
     this.globalStreams.add(sse);
     sse.onClose(() => this.globalStreams.delete(sse));
   }
 
-  /** H8: ends every open stream. */
+  /** H8: ends every open stream, and every stream opened from now on. */
   closeAll(): void {
+    this.closing = true;
     for (const sse of [...this.connections]) sse.end();
   }
 
@@ -147,8 +163,22 @@ export class RealtimeHub {
     return { task, global: this.globalStreams.size };
   }
 
-  private track(res: ServerResponse): SseConnection {
-    const sse = new SseConnection(res, this.options.keepaliveMs);
+  /**
+   * Opens and tracks the SSE connection, or returns null when there is
+   * nothing to register: the api is closing (the response is ended at
+   * once) or the client already disconnected while the route awaited.
+   */
+  private track(res: ServerResponse): SseConnection | null {
+    if (this.closing) {
+      endStreamImmediately(res);
+      return null;
+    }
+    const sse = new SseConnection(
+      res,
+      this.options.keepaliveMs,
+      this.options.maxBufferedBytes,
+    );
+    if (sse.isClosed) return null;
     this.connections.add(sse);
     sse.onClose(() => this.connections.delete(sse));
     return sse;

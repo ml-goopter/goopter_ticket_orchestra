@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import http from "node:http";
+import { EventEmitter } from "node:events";
+import http, { type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { ExecutionEventType } from "@orchestra/core";
 import { LISTEN_APPLICATION_NAME, appendEvent } from "@orchestra/db";
@@ -8,9 +9,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import {
   defaultListBacklog,
+  defaultLoadAnchor,
   defaultLoadEvent,
+  type RealtimeOptions,
 } from "../src/realtime/index.js";
+import { SseConnection } from "../src/realtime/sse.js";
 import {
+  type Clock,
   type Fixtures,
   type TestDb,
   createClock,
@@ -28,6 +33,7 @@ let h: TestDb;
 let app: FastifyInstance;
 let appClosed = false;
 let fx: Fixtures;
+let clock: Clock;
 let cookie: string;
 let baseUrl: string;
 
@@ -40,10 +46,24 @@ const backlogHooks = new Map<
   string,
   { before?: () => Promise<void>; after?: () => Promise<void> }
 >();
+/** Per-task hooks run after a cursor-less stream's anchor query resolves. */
+const anchorHooks = new Map<string, () => Promise<void> | void>();
+
+/** Wraps `defaultLoadAnchor` so a test can act right after the anchor is read. */
+const loadAnchorWithHooks: NonNullable<RealtimeOptions["loadAnchor"]> = async (
+  db,
+  taskId,
+) => {
+  const anchor = await defaultLoadAnchor(db, taskId);
+  const hook = anchorHooks.get(taskId);
+  anchorHooks.delete(taskId);
+  await hook?.();
+  return anchor;
+};
 
 beforeAll(async () => {
   h = await startTestDb();
-  const clock = createClock(new Date("2026-01-01T00:00:00Z"));
+  clock = createClock(new Date("2026-01-01T00:00:00Z"));
   fx = await seedFixtures(h.db, "STR");
   const sessionId = await seedSession(h.db, {
     userId: fx.userId,
@@ -70,6 +90,7 @@ beforeAll(async () => {
         await hook?.after?.();
         return rows;
       },
+      loadAnchor: loadAnchorWithHooks,
     },
   });
   await app.listen({ port: 0, host: "127.0.0.1" });
@@ -109,8 +130,17 @@ interface StreamClient {
   comments: string[];
   ended: boolean;
   /** Waits until at least `n` event frames have arrived. */
-  waitForFrames(n: number): Promise<Frame[]>;
+  waitForFrames(n: number, timeoutMs?: number): Promise<Frame[]>;
+  /** Starts reading a stream opened with `paused: true`. */
+  resume(): void;
   close(): void;
+}
+
+interface OpenStreamOptions {
+  /** Server to connect to; defaults to the shared app. */
+  baseUrl?: string;
+  /** Do not read the body until `resume()`, simulating a stalled client. */
+  paused?: boolean;
 }
 
 /**
@@ -120,10 +150,11 @@ interface StreamClient {
 function openStream(
   path: string,
   headers: Record<string, string> = {},
+  options: OpenStreamOptions = {},
 ): Promise<StreamClient> {
   return new Promise((resolve, reject) => {
     const req = http.get(
-      `${baseUrl}${path}`,
+      `${options.baseUrl ?? baseUrl}${path}`,
       { headers: { cookie, ...headers } },
       (res) => {
         const client: StreamClient = {
@@ -132,15 +163,19 @@ function openStream(
           frames: [],
           comments: [],
           ended: false,
-          async waitForFrames(n) {
-            await waitFor(() => client.frames.length >= n);
+          async waitForFrames(n, timeoutMs) {
+            await waitFor(() => client.frames.length >= n, timeoutMs);
             return client.frames;
+          },
+          resume() {
+            res.resume();
           },
           close() {
             req.destroy();
           },
         };
         let buffer = "";
+        if (options.paused) res.pause();
         res.setEncoding("utf8");
         res.on("data", (chunk: string) => {
           buffer += chunk;
@@ -213,6 +248,52 @@ async function terminateListenConnection(): Promise<void> {
     where application_name = ${LISTEN_APPLICATION_NAME}
   `;
   expect(rows).toHaveLength(1);
+}
+
+async function listenPids(): Promise<number[]> {
+  const rows = await h.sql<{ pid: number }[]>`
+    select pid from pg_stat_activity
+    where application_name = ${LISTEN_APPLICATION_NAME}
+  `;
+  return rows.map((row) => row.pid);
+}
+
+interface FreshApp {
+  app: FastifyInstance;
+  baseUrl: string;
+  /** Backend pid of this app's own LISTEN connection. */
+  listenPid: number;
+}
+
+/**
+ * A second app on the shared database with a hub that has seen no
+ * notification yet, so no earlier test's traffic shapes its state.
+ */
+async function startFreshApp(): Promise<FreshApp> {
+  const before = new Set(await listenPids());
+  const fresh = await buildApp({
+    db: h.db,
+    config: testConfig({ DATABASE_URL: h.connectionString }),
+    now: clock.now,
+    realtime: { keepaliveMs: KEEPALIVE_MS, loadAnchor: loadAnchorWithHooks },
+  });
+  await fresh.listen({ port: 0, host: "127.0.0.1" });
+  const { port } = fresh.server.address() as AddressInfo;
+  const added = (await listenPids()).filter((pid) => !before.has(pid));
+  expect(added).toHaveLength(1);
+  return { app: fresh, baseUrl: `http://127.0.0.1:${port}`, listenPid: added[0]! };
+}
+
+/**
+ * Resolves once a cursor-less stream on `taskId` has read its anchor, or
+ * after `fallbackMs` if no anchor query ever runs, so a missing anchor
+ * shows up as a wrong result rather than a hang.
+ */
+function anchored(taskId: string, fallbackMs = 1000): Promise<void> {
+  return new Promise((resolve) => {
+    anchorHooks.set(taskId, () => resolve());
+    setTimeout(resolve, fallbackMs);
+  });
 }
 
 describe("GET /api/tasks/:id/stream", () => {
@@ -426,6 +507,127 @@ describe("GET /api/tasks/:id/stream", () => {
     }
   });
 
+  it("F1: a cursor-less stream keeps its task's event that commits after a higher id from another task", async () => {
+    const taskA = await newTask();
+    const taskB = await newTask();
+    const clientB = await openStream(`/api/tasks/${taskB}/stream`);
+    let clientA: StreamClient | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    try {
+      let inserted!: (id: number) => void;
+      const insertedId = new Promise<number>((resolve) => (inserted = resolve));
+      const pendingA = h.db.transaction(async (tx) => {
+        const { id } = await appendEvent(tx, {
+          taskId: taskA,
+          type: "agent.message",
+          payload: { n: 1 },
+        });
+        inserted(Number(id));
+        await gate;
+      });
+      const a1 = await insertedId;
+
+      // b1 gets a higher id than a1 but commits first, and the hub sees it.
+      const b1 = await append(taskB, "agent.message");
+      expect(b1).toBeGreaterThan(a1);
+      await clientB.waitForFrames(1);
+
+      const anchorRead = anchored(taskA);
+      clientA = await openStream(`/api/tasks/${taskA}/stream`);
+      await anchorRead;
+
+      release();
+      await pendingA;
+      const a2 = await append(taskA, "agent.message", { n: 2 });
+      await waitFor(() => ids(clientA!.frames).includes(a2));
+      await sleep(200);
+      expect(ids(clientA.frames)).toEqual([a1, a2]);
+    } finally {
+      release();
+      clientA?.close();
+      clientB.close();
+    }
+  });
+
+  it("F1: a cursor-less stream delivers an event committed right after its anchor is read", async () => {
+    const task = await newTask();
+    await append(task, "agent.message", { n: 0 });
+    let afterAnchor = 0;
+    anchorHooks.set(task, async () => {
+      afterAnchor = await append(task, "agent.message", { n: 1 });
+    });
+    const client = await openStream(`/api/tasks/${task}/stream`);
+    try {
+      await client.waitForFrames(1);
+      await sleep(200);
+      expect(afterAnchor).toBeGreaterThan(0);
+      expect(ids(client.frames)).toEqual([afterAnchor]);
+    } finally {
+      client.close();
+    }
+  });
+
+  it("F2/T6: on a freshly built app, a cursor-less stream that has sent nothing recovers events committed while LISTEN is down", async () => {
+    const fresh = await startFreshApp();
+    let client: StreamClient | undefined;
+    try {
+      const task = await newTask();
+      const anchorRead = anchored(task);
+      client = await openStream(`/api/tasks/${task}/stream`, {}, { baseUrl: fresh.baseUrl });
+      expect(client.status).toBe(200);
+      await anchorRead;
+
+      const { id } = await h.db.transaction(async (tx) => {
+        const row = await appendEvent(tx, {
+          taskId: task,
+          type: "agent.message",
+          payload: {},
+        });
+        await h.sql`select pg_terminate_backend(${fresh.listenPid})`;
+        return row;
+      });
+
+      await client.waitForFrames(1);
+      await sleep(200);
+      expect(ids(client.frames)).toEqual([Number(id)]);
+    } finally {
+      client?.close();
+      await fresh.app.close();
+    }
+  });
+
+  it("F5: a backlog waits for the client to drain before writing more", async () => {
+    const task = await newTask();
+    // Two backlog pages of ~10 KB rows: far more than socket buffers hold.
+    await h.sql`
+      insert into execution_events (task_id, type, payload)
+      select ${task}, 'agent.message',
+             jsonb_build_object('n', g, 'text', repeat('x', 10000))
+      from generate_series(1, 1001) as g
+    `;
+    const client = await openStream(
+      `/api/tasks/${task}/stream`,
+      { "last-event-id": "0" },
+      { paused: true },
+    );
+    try {
+      const calls = () => backlogCalls.filter((c) => c.taskId === task);
+      await waitFor(() => calls().length >= 1);
+      await sleep(500);
+      expect(calls()).toHaveLength(1);
+
+      client.resume();
+      await client.waitForFrames(1001, 60000);
+      expect(calls()).toHaveLength(2);
+      const got = ids(client.frames);
+      expect(new Set(got).size).toBe(1001);
+      expect([...got].sort((a, b) => a - b)).toEqual(got);
+    } finally {
+      client.close();
+    }
+  });
+
   it("H7: sends a keepalive comment on the configured interval", async () => {
     const task = await newTask();
     const client = await openStream(`/api/tasks/${task}/stream`);
@@ -517,9 +719,155 @@ describe("auth, validation and cleanup (T7)", () => {
       return counts.task === 0 && counts.global === 0;
     });
   });
+
+  it("F3: a client that disconnected before the stream opened leaves no subscriber", async () => {
+    await waitFor(() => {
+      const counts = app.realtime.subscriberCount();
+      return counts.task === 0 && counts.global === 0;
+    });
+    const task = await newTask();
+    // Stand-in for a route that is still awaiting auth or the task lookup
+    // when the client goes away: the stream opens after `close` fired.
+    const counts: Array<{ task: number; global: number }> = [];
+    let received = (): void => {};
+    let opened = (): void => {};
+    const server = http.createServer((req, res) => {
+      res.on("close", () => {
+        if (req.url === "/task") app.realtime.openTaskStream(res, task, undefined);
+        else app.realtime.openGlobalStream(res);
+        counts.push(app.realtime.subscriberCount());
+        opened();
+      });
+      received();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      for (const path of ["/task", "/global"]) {
+        const gotRequest = new Promise<void>((resolve) => (received = resolve));
+        const done = new Promise<void>((resolve) => (opened = resolve));
+        const req = http.get(`http://127.0.0.1:${port}${path}`);
+        req.on("error", () => {});
+        await gotRequest;
+        req.destroy();
+        await done;
+      }
+      expect(counts).toEqual([
+        { task: 0, global: 0 },
+        { task: 0, global: 0 },
+      ]);
+      await sleep(KEEPALIVE_MS * 2);
+      expect(app.realtime.subscriberCount()).toEqual({ task: 0, global: 0 });
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("F5: ends a connection whose unsent output exceeds the cap", () => {
+    const res = new FakeResponse();
+    let closes = 0;
+    const sse = new SseConnection(res.asServerResponse(), 60_000, 100);
+    sse.onClose(() => {
+      closes += 1;
+    });
+    try {
+      sse.write("x".repeat(60));
+      expect(sse.isClosed).toBe(false);
+      sse.write("x".repeat(60));
+      expect(sse.isClosed).toBe(true);
+      expect(res.destroyed).toBe(true);
+      expect(closes).toBe(1);
+      sse.write("x".repeat(60));
+      expect(res.written).toBe(120);
+    } finally {
+      sse.end();
+    }
+  });
 });
 
+/**
+ * A `ServerResponse` whose client never reads: every write stays buffered
+ * in `writableLength`.
+ */
+class FakeResponse extends EventEmitter {
+  writableLength = 0;
+  written = 0;
+  destroyed = false;
+  writableEnded = false;
+  writeHead(): this {
+    return this;
+  }
+  flushHeaders(): void {}
+  write(chunk: string): boolean {
+    this.writableLength += chunk.length;
+    this.written += chunk.length;
+    return this.writableLength < 16;
+  }
+  end(): this {
+    this.writableEnded = true;
+    return this;
+  }
+  destroy(): this {
+    this.destroyed = true;
+    this.emit("close");
+    return this;
+  }
+  asServerResponse(): ServerResponse {
+    return this as unknown as ServerResponse;
+  }
+}
+
 describe("shutdown (T8/H8)", () => {
+  it("F4: a stream request still awaiting when close() starts ends at once and close() resolves", async () => {
+    const fresh = await startFreshApp();
+    const task = await newTask();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let locked!: () => void;
+    const tableLocked = new Promise<void>((resolve) => (locked = resolve));
+    // Holds the route in its task lookup until close() has begun.
+    const lockTx = h.sql.begin(async (sql) => {
+      await sql`lock table tasks in access exclusive mode`;
+      locked();
+      await gate;
+    });
+    let client: StreamClient | undefined;
+    let closing: Promise<void> | undefined;
+    try {
+      await tableLocked;
+      const pending = openStream(`/api/tasks/${task}/stream`, {}, {
+        baseUrl: fresh.baseUrl,
+      });
+      await waitFor(async () => {
+        const rows = await h.sql`
+          select 1 from pg_stat_activity where wait_event_type = 'Lock'
+        `;
+        return rows.length > 0;
+      });
+
+      closing = fresh.app.close();
+      await waitFor(() => !fresh.app.server.listening);
+      release();
+      await lockTx;
+
+      client = await pending;
+      expect(client.status).toBe(200);
+      await Promise.race([
+        closing,
+        sleep(5000).then(() => {
+          throw new Error("app.close() did not resolve");
+        }),
+      ]);
+      await waitFor(() => client!.ended);
+      expect(fresh.app.realtime.subscriberCount()).toEqual({ task: 0, global: 0 });
+    } finally {
+      release();
+      client?.close();
+      await closing;
+    }
+  });
+
   it("app.close() resolves with streams open, ends them, and releases LISTEN", async () => {
     const task = await newTask();
     const taskClient = await openStream(`/api/tasks/${task}/stream`);
