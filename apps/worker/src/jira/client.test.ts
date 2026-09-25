@@ -250,6 +250,77 @@ describe("createJiraClient.getIssue (design.md §9.2, Q3, C8)", () => {
   });
 });
 
+describe("createJiraClient.getIssue: non-paragraph listItem children and taskList (F1 regression)", () => {
+  it("renders a codeBlock inside a listItem and a taskItem's text instead of dropping them", async () => {
+    const { baseUrl } = await setUp(() => ({
+      status: 200,
+      body: {
+        fields: {
+          summary: "Migrate",
+          description: {
+            type: "doc",
+            content: [
+              {
+                type: "orderedList",
+                content: [
+                  {
+                    type: "listItem",
+                    content: [
+                      { type: "paragraph", content: [{ type: "text", text: "Run" }] },
+                      { type: "codeBlock", content: [{ type: "text", text: "pnpm test" }] },
+                    ],
+                  },
+                ],
+              },
+              {
+                type: "taskList",
+                content: [
+                  {
+                    type: "taskItem",
+                    attrs: { state: "TODO" },
+                    content: [{ type: "text", text: "Write migration" }],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    }));
+
+    const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
+    const ticket = await client.getIssue("GOOP-1");
+
+    expect(ticket.description).toContain("Run");
+    expect(ticket.description).toContain("pnpm test");
+    expect(ticket.description).toContain("Write migration");
+  });
+});
+
+describe("createJiraClient request timeout (F2 regression)", () => {
+  it("fails within the configured timeout when the server never responds", async () => {
+    const server = http.createServer(() => {
+      // Never call res.end/writeHead: the request hangs forever.
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    cleanup = () =>
+      new Promise((resolve) => {
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      });
+
+    const client = createJiraClient({
+      baseUrl: `http://127.0.0.1:${port}`,
+      email: "e",
+      apiToken: "t",
+      timeoutMs: 50,
+    });
+
+    await expect(client.search("project = GOOP")).rejects.toThrow();
+  }, 5_000);
+});
+
 describe("parseJiraPriority (design.md §11.1, Q2)", () => {
   it("parses a numeric string id", () => {
     expect(parseJiraPriority("3")).toBe(3);

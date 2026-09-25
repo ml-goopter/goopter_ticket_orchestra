@@ -159,4 +159,46 @@ describe("startJiraPoller loop (design.md §11.1, E5)", () => {
 
     await stop();
   });
+
+  it("stop() called mid-cycle skips the remaining projects (F2 regression)", async () => {
+    const searchCalls: string[] = [];
+    let resolveFirstSearch: (() => void) | undefined;
+    const client = {
+      search: vi.fn(async (jql: string) => {
+        searchCalls.push(jql);
+        if (searchCalls.length === 1) {
+          // Pause the first project's search so the test can call stop()
+          // while the cycle is still in progress.
+          await new Promise<void>((resolve) => {
+            resolveFirstSearch = resolve;
+          });
+        }
+        return [];
+      }),
+      issueExists: vi.fn(),
+      getIssue: vi.fn(),
+    } satisfies JiraClient;
+
+    const dbStub = fakeProjectsDb([
+      { id: "p1", key: "GOOP", jiraJql: "project = GOOP" },
+      { id: "p2", key: "OTHER", jiraJql: "project = OTHER" },
+    ]);
+
+    const stop = startJiraPoller({
+      db: dbStub as never,
+      config: configWith(),
+      workerId: "worker-1",
+      logger,
+      client,
+    });
+
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(searchCalls).toHaveLength(1);
+
+    const stopPromise = stop();
+    resolveFirstSearch?.();
+    await stopPromise;
+
+    expect(searchCalls).toHaveLength(1);
+  });
 });

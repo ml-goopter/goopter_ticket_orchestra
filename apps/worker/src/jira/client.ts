@@ -68,7 +68,12 @@ export interface JiraClientConfig {
   fetchImpl?: typeof fetch;
   /** Issues requested per search page. */
   pageSize?: number;
+  /** Bound on every request; a slow Jira must not hang the poller forever. */
+  timeoutMs?: number;
 }
+
+/** Default request timeout (design.md §11.1, F2 regression); injectable for tests. */
+export const DEFAULT_JIRA_REQUEST_TIMEOUT_MS = 30_000;
 
 export interface JiraClient {
   /** Pages through every result of `jql`, in order (design.md §11.1, E1). */
@@ -120,6 +125,7 @@ function toDateOnly(iso: string): string {
 export function createJiraClient(config: JiraClientConfig): JiraClient {
   const fetchImpl = config.fetchImpl ?? fetch;
   const pageSize = config.pageSize ?? DEFAULT_PAGE_SIZE;
+  const timeoutMs = config.timeoutMs ?? DEFAULT_JIRA_REQUEST_TIMEOUT_MS;
   const authHeader = `Basic ${Buffer.from(`${config.email}:${config.apiToken}`).toString("base64")}`;
 
   async function request(
@@ -132,6 +138,7 @@ export function createJiraClient(config: JiraClientConfig): JiraClient {
     }
     return fetchImpl(url, {
       headers: { Authorization: authHeader, Accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
     });
   }
 
@@ -262,11 +269,37 @@ function renderInline(nodes: AdfNode[]): string {
     .join("");
 }
 
+/** Prefixes every line of `text` with `indent`. */
+function indentLines(text: string, indent: string): string {
+  return text
+    .split("\n")
+    .map((line) => `${indent}${line}`)
+    .join("\n");
+}
+
+/**
+ * Renders a `taskList`'s `taskItem` children as `- [ ] text` / `- [x] text`
+ * (design.md §9.2, Q3, F1 regression). `taskItem.content` is inline content
+ * directly, unlike `listItem`, which wraps its text in a `paragraph`.
+ */
+function renderTaskList(items: AdfNode[], indent = ""): string {
+  return items
+    .map((item) => {
+      const checked = item.attrs?.state === "DONE" ? "x" : " ";
+      const text = renderInline(item.content ?? []);
+      return `${indent}- [${checked}] ${text}`;
+    })
+    .join("\n");
+}
+
 /**
  * Renders `bulletList`/`orderedList` content, one line per `listItem`. A
  * `listItem` can hold, alongside its paragraph text, a nested
- * `bulletList`/`orderedList`; those render as their own indented lines
- * beneath the parent item.
+ * `bulletList`/`orderedList`/`taskList` (rendered as indented lines beneath
+ * the parent item) and any other block child — a `codeBlock`, `blockquote`,
+ * etc. — whose text must still reach the output (design.md §9.2, Q3, F1
+ * regression), so it is rendered the same way a top-level block would be and
+ * indented under the item.
  */
 function renderList(
   items: AdfNode[],
@@ -275,14 +308,16 @@ function renderList(
 ): string {
   return items
     .map((item, index) => {
-      const text = (item.content ?? [])
+      const children = item.content ?? [];
+      const text = children
         .filter((child) => child.type === "paragraph")
         .map((child) => renderInline(child.content ?? []))
         .filter((line) => line.length > 0)
         .join(" ");
       const lines = [`${indent}${marker(index)}${text}`];
 
-      for (const child of item.content ?? []) {
+      for (const child of children) {
+        if (child.type === "paragraph") continue;
         if (child.type === "bulletList") {
           lines.push(
             renderList(child.content ?? [], () => "- ", `${indent}  `),
@@ -295,6 +330,12 @@ function renderList(
               `${indent}  `,
             ),
           );
+        } else if (child.type === "taskList") {
+          lines.push(renderTaskList(child.content ?? [], `${indent}  `));
+        } else {
+          for (const block of renderBlocks([child])) {
+            lines.push(indentLines(block, `${indent}  `));
+          }
         }
       }
 
@@ -326,8 +367,24 @@ function renderBlocks(nodes: AdfNode[]): string[] {
           renderList(node.content ?? [], (index) => `${index + 1}. `),
         );
         break;
-      default:
-        if (node.content) blocks.push(...renderBlocks(node.content));
+      case "taskList":
+        blocks.push(renderTaskList(node.content ?? []));
+        break;
+      default: {
+        // Unknown node (design.md §9.2, Q3, F1 regression): try its content
+        // as nested blocks first (a blockquote's content is paragraphs);
+        // if that yields nothing, the content is inline (e.g. leaf text
+        // nodes with no wrapping paragraph), so render it as a single line
+        // instead of silently dropping it.
+        const content = node.content ?? [];
+        const nested = renderBlocks(content);
+        if (nested.length > 0) {
+          blocks.push(...nested);
+        } else {
+          const inline = renderInline(content);
+          if (inline.length > 0) blocks.push(inline);
+        }
+      }
     }
   }
 

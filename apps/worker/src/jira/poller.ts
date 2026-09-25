@@ -22,6 +22,8 @@ export interface PollProjectOptions {
   actor: Actor;
   logger: Logger;
   now?: () => Date;
+  /** Checked before each 404 check; lets `stop()` cut a cycle short (F2 regression). */
+  shouldStop?: () => boolean;
 }
 
 /**
@@ -36,7 +38,15 @@ export interface PollProjectOptions {
  * and never stops the caller from moving on to the next project (E5, C6).
  */
 export async function pollProject(options: PollProjectOptions): Promise<void> {
-  const { db, project, client, actor, logger, now = () => new Date() } = options;
+  const {
+    db,
+    project,
+    client,
+    actor,
+    logger,
+    now = () => new Date(),
+    shouldStop = () => false,
+  } = options;
   const jql = `${project.jiraJql} ORDER BY created ASC`;
 
   let issues;
@@ -87,6 +97,7 @@ export async function pollProject(options: PollProjectOptions): Promise<void> {
 
   const nonTerminal = await listNonTerminalJiraTasks(db, project.id);
   for (const task of nonTerminal) {
+    if (shouldStop()) return;
     if (seenKeys.has(task.jiraKey)) continue;
 
     let exists: boolean;
@@ -205,8 +216,17 @@ export function startJiraPoller(options: StartJiraPollerOptions): StopJiraPoller
       }
 
       for (const project of projects) {
+        if (stopped) break;
         try {
-          await pollProject({ db, project, client, actor, logger, now });
+          await pollProject({
+            db,
+            project,
+            client,
+            actor,
+            logger,
+            now,
+            shouldStop: () => stopped,
+          });
         } catch (err) {
           logger.error(
             {
