@@ -4,6 +4,7 @@ import type { TaskCard as TaskCardData } from "../api/types.js";
 import { BOARD_COLUMN_ORDER, groupByColumn, HIGHLIGHTED_COLUMNS } from "../board/columns.js";
 import { TaskCard } from "../board/TaskCard.js";
 import { useRefetchOnReconnect } from "../board/useEventReconnect.js";
+import { useLatestRequest } from "../board/useLatestRequest.js";
 import { useEventStream, type EventSourceFactory } from "../sse/useEventStream.js";
 
 export interface BoardViewProps {
@@ -27,16 +28,20 @@ export function BoardView({ client, createEventSource, now = () => new Date() }:
   const apiClient = useMemo(() => client ?? createApiClient(), [client]);
   const [cards, setCards] = useState<TaskCardData[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { begin, isCurrent } = useLatestRequest();
 
   const fetchCards = useCallback(async () => {
+    const generation = begin();
     try {
       const result = await apiClient.listTasks();
+      if (!isCurrent(generation)) return;
       setCards(result);
       setError(null);
     } catch (err) {
+      if (!isCurrent(generation)) return;
       setError(err instanceof Error ? err.message : "Failed to load the board.");
     }
-  }, [apiClient]);
+  }, [apiClient, begin, isCurrent]);
 
   useEffect(() => {
     void fetchCards();

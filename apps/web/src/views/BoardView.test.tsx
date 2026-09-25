@@ -204,6 +204,40 @@ describe("BoardView", () => {
     await waitFor(() => expect(client.listTasks).toHaveBeenCalledTimes(2));
   }, 10000);
 
+  it("keeps the latest response when a slower earlier fetch resolves after a faster later one (F1)", async () => {
+    let resolveFirst: ((cards: TaskCard[]) => void) | undefined;
+    let callCount = 0;
+    const client = makeClient(() => {
+      callCount += 1;
+      if (callCount === 1) {
+        return new Promise<TaskCard[]>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return Promise.resolve([makeCard({ id: "1", column: "Done" })]);
+    });
+    renderBoard(client);
+
+    await waitFor(() => expect(client.listTasks).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      currentSource().emit("task.state_changed", { taskId: "1" });
+    });
+    await waitFor(() => expect(client.listTasks).toHaveBeenCalledTimes(2));
+
+    await waitFor(() =>
+      expect(within(screen.getByRole("region", { name: "Done" })).getByTestId("board-card")).toBeTruthy(),
+    );
+
+    // The slower, first (mount) fetch resolves last, with data that is now stale.
+    await act(async () => {
+      resolveFirst?.([makeCard({ id: "1", column: "Ready" })]);
+    });
+
+    expect(within(screen.getByRole("region", { name: "Done" })).getByTestId("board-card")).toBeTruthy();
+    expect(within(screen.getByRole("region", { name: "Ready" })).queryByTestId("board-card")).toBeNull();
+  });
+
   it("renders empty states for an empty board (AC7)", async () => {
     const client = makeClient(() => Promise.resolve([]));
     renderBoard(client);

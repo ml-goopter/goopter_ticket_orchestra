@@ -3,6 +3,7 @@ import { Link } from "react-router";
 import { createApiClient, type BoardApiClient } from "../api/client.js";
 import type { Issue, Notification, TaskCard } from "../api/types.js";
 import { useRefetchOnReconnect } from "../board/useEventReconnect.js";
+import { useLatestRequest } from "../board/useLatestRequest.js";
 import { useEventStream, type EventSourceFactory } from "../sse/useEventStream.js";
 
 export interface AttentionDrawerProps {
@@ -30,32 +31,39 @@ export function AttentionDrawer({ client, createEventSource }: AttentionDrawerPr
   const [tasks, setTasks] = useState<TaskCard[] | null>(null);
   const [notifications, setNotifications] = useState<Notification[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { begin, isCurrent } = useLatestRequest();
 
   const fetchAll = useCallback(async () => {
+    const generation = begin();
     try {
       const [issueRows, taskRows, notificationRows] = await Promise.all([
         apiClient.listIssues({ status: "OPEN", blocking: true }),
         apiClient.listTasks({ attention: true }),
         apiClient.listNotifications(),
       ]);
+      if (!isCurrent(generation)) return;
       setIssues(issueRows);
       setTasks(taskRows);
       setNotifications(notificationRows);
       setError(null);
     } catch (err) {
+      if (!isCurrent(generation)) return;
       setError(err instanceof Error ? err.message : "Failed to load attention items.");
     }
-  }, [apiClient]);
+  }, [apiClient, begin, isCurrent]);
 
   const fetchNotifications = useCallback(async () => {
+    const generation = begin();
     try {
       const notificationRows = await apiClient.listNotifications();
+      if (!isCurrent(generation)) return;
       setNotifications(notificationRows);
       setError(null);
     } catch (err) {
+      if (!isCurrent(generation)) return;
       setError(err instanceof Error ? err.message : "Failed to load notifications.");
     }
-  }, [apiClient]);
+  }, [apiClient, begin, isCurrent]);
 
   useEffect(() => {
     void fetchAll();
@@ -74,8 +82,12 @@ export function AttentionDrawer({ client, createEventSource }: AttentionDrawerPr
 
   const handleMarkRead = useCallback(
     async (id: string) => {
-      await apiClient.markNotificationRead(id);
-      await fetchNotifications();
+      try {
+        await apiClient.markNotificationRead(id);
+        await fetchNotifications();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to mark the notification as read.");
+      }
     },
     [apiClient, fetchNotifications],
   );

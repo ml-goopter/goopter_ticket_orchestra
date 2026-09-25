@@ -290,4 +290,108 @@ describe("AttentionDrawer", () => {
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("network down"));
   });
+
+  it("keeps the latest fetchAll response when a slower earlier fetchAll resolves after a faster later one (F2)", async () => {
+    let resolveFirstIssues: ((issues: Issue[]) => void) | undefined;
+    let issuesCallCount = 0;
+    const fixtures: Fixtures = { issues: [], tasks: [], notifications: [] };
+    const client = makeClient(fixtures);
+    client.listIssues = vi.fn(() => {
+      issuesCallCount += 1;
+      if (issuesCallCount === 1) {
+        return new Promise<Issue[]>((resolve) => {
+          resolveFirstIssues = resolve;
+        });
+      }
+      return Promise.resolve([makeIssue({ id: "i2", title: "Second" })]);
+    });
+
+    renderDrawer(client);
+    await waitFor(() => expect(client.listIssues).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      currentSource().emit("issue.created", { issueId: "i2" });
+    });
+    await waitFor(() => expect(client.listIssues).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("1"));
+
+    // The slower, first (mount) fetchAll resolves last, with data that is now stale.
+    await act(async () => {
+      resolveFirstIssues?.([]);
+    });
+
+    expect(screen.getByTestId("attention-count").textContent).toBe("1");
+  });
+
+  it("does not let a slower, still-pending fetchAll overwrite a faster mark-read refetch (F2 shared generation)", async () => {
+    let resolveSecondIssues: ((issues: Issue[]) => void) | undefined;
+    let issuesCallCount = 0;
+    const fixtures: Fixtures = {
+      issues: [],
+      tasks: [],
+      notifications: [makeNotification({ id: "n1", readAt: null, title: "Unread one" })],
+    };
+    const client = makeClient(fixtures);
+    client.listIssues = vi.fn(() => {
+      issuesCallCount += 1;
+      if (issuesCallCount === 2) {
+        return new Promise<Issue[]>((resolve) => {
+          resolveSecondIssues = resolve;
+        });
+      }
+      return Promise.resolve(fixtures.issues);
+    });
+    client.markNotificationRead = vi.fn((id: string) => {
+      fixtures.notifications = [{ ...fixtures.notifications[0]!, readAt: "2026-01-02T00:00:00.000Z" }];
+      return Promise.resolve(fixtures.notifications[0]!);
+    });
+
+    renderDrawer(client);
+    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("1"));
+    await openDrawer();
+
+    // Trigger the second, slower fetchAll; it hangs on listIssues.
+    await act(async () => {
+      currentSource().emit("issue.created", { issueId: "i2" });
+    });
+    await waitFor(() => expect(client.listIssues).toHaveBeenCalledTimes(2));
+
+    // Mark read while that fetchAll is still pending: fetchNotifications is a later generation.
+    const markReadButton = screen.getByRole("button", { name: "Mark read" });
+    await act(async () => {
+      markReadButton.click();
+    });
+    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+
+    // The stale, still-pending fetchAll finally resolves with pre-mark-read data.
+    await act(async () => {
+      resolveSecondIssues?.([]);
+    });
+
+    expect(screen.getByTestId("attention-count").textContent).toBe("0");
+  });
+
+  it("shows a visible error and leaves the count unchanged when markNotificationRead fails (F3)", async () => {
+    const fixtures: Fixtures = {
+      issues: [],
+      tasks: [],
+      notifications: [makeNotification({ id: "n1", readAt: null, title: "Unread one" })],
+    };
+    const client = makeClient(fixtures);
+    client.markNotificationRead = vi.fn(() => Promise.reject(new Error("mark read failed")));
+
+    renderDrawer(client);
+    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("1"));
+    await openDrawer();
+
+    const markReadButton = screen.getByRole("button", { name: "Mark read" });
+    await act(async () => {
+      markReadButton.click();
+    });
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("mark read failed"));
+    expect(screen.getByTestId("attention-count").textContent).toBe("1");
+    // Only the failed markNotificationRead call; no refetch follows a rejection.
+    expect(client.listNotifications).toHaveBeenCalledTimes(1);
+  });
 });
