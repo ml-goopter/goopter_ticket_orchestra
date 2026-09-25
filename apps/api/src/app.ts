@@ -8,6 +8,8 @@ import authPlugin from "./plugins/auth.js";
 import realtimePlugin, { type RealtimeOptions } from "./realtime/index.js";
 import authRoutes from "./routes/auth.js";
 import healthRoutes from "./routes/health.js";
+import issuesRoutes from "./routes/issues.js";
+import notificationsRoutes from "./routes/notifications.js";
 import tasksRoutes from "./routes/tasks.js";
 import specRoutes from "./routes/spec.js";
 import projectsRoutes from "./routes/projects.js";
@@ -56,6 +58,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   await app.register(tasksRoutes, { prefix: "/api" });
   await app.register(streamRoutes, { prefix: "/api" });
   await app.register(specRoutes, { prefix: "/api" });
+  await app.register(issuesRoutes, { prefix: "/api/issues" });
+  await app.register(notificationsRoutes, { prefix: "/api/notifications" });
   await app.register(projectsRoutes, { prefix: "/api/projects" });
   await app.register(repositoriesRoutes, { prefix: "/api/repositories" });
   await app.register(usersRoutes, { prefix: "/api/users" });
