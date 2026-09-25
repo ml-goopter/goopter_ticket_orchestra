@@ -18,6 +18,8 @@ import { TaskState, ExecutionState } from "./enums.js";
  *    paused execution)
  *  - `dependency.failed`     SPEC_APPROVED -> BLOCKED (dependency check)
  *  - `dependency.resolved`   BLOCKED -> READY
+ *  - `spec.revise`           SPEC_APPROVED/READY -> SPEC_IN_PROGRESS
+ *    (§12.3 POST /spec/revise)
  *  - `task.escalated`        IMPLEMENTING/REVIEWING/CI_RUNNING -> NEEDS_HUMAN
  *  - `human.retry`           NEEDS_HUMAN -> READY
  *  - `task.cancelled`        any state except DONE/CANCELLED -> CANCELLED
@@ -62,6 +64,9 @@ export const TASK_TRANSITIONS = [
   { entity: "task", from: TaskState.NEEDS_HUMAN, trigger: "human.retry", to: TaskState.READY },
   { entity: "task", from: TaskState.READY_FOR_MERGE, trigger: "pull_request.closed", to: TaskState.NEEDS_HUMAN },
   { entity: "task", from: TaskState.BLOCKED, trigger: "dependency.resolved", to: TaskState.READY },
+  // design.md §12.3 POST /spec/revise: "from SPEC_APPROVED or READY only".
+  { entity: "task", from: TaskState.SPEC_APPROVED, trigger: "spec.revise", to: TaskState.SPEC_IN_PROGRESS },
+  { entity: "task", from: TaskState.READY, trigger: "spec.revise", to: TaskState.SPEC_IN_PROGRESS },
 
   // Any state except DONE and CANCELLED itself may cancel (design.md §5.1
   // prose). Expanded into one explicit row per source state.
