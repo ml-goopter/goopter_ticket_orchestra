@@ -215,11 +215,15 @@ describe("consume_commands phase (design.md §6.1)", () => {
     expect((await command(id)).claimedAt).toBeNull();
   });
 
-  it("cancel handler aborts payload.execution_id, else the command's execution, and is a no-op when not live", async () => {
+  it("cancel handler aborts the command's execution_id only, is a no-op when not live, and ignores payload.execution_id", async () => {
     const mine = await seedExecution(HOST);
     const other = await seedExecution(HOST);
+    const viaColumn = await seedCommand("cancel", mine);
+    const notLive = await seedCommand("cancel", other);
+    // No execution_id: completed as a no-op with a warning, payload ignored.
     const viaPayload = await seedCommand("cancel", null, { execution_id: mine });
-    const viaColumn = await seedCommand("cancel", other);
+    // The column wins over a payload naming another execution.
+    const mixed = await seedCommand("cancel", other, { execution_id: mine });
 
     const aborted: string[] = [];
     const handlers = createCommandHandlers();
@@ -233,9 +237,15 @@ describe("consume_commands phase (design.md §6.1)", () => {
       .find((p) => p.name === "consume_commands")!
       .run(ctx());
 
-    expect(aborted).toEqual([mine, other]);
-    expect((await command(viaPayload)).completedAt).not.toBeNull();
-    expect((await command(viaColumn)).completedAt).not.toBeNull();
+    expect(aborted).toEqual([mine, other, other]);
+    for (const id of [viaColumn, notLive, viaPayload, mixed]) {
+      expect((await command(id)).completedAt).not.toBeNull();
+    }
+    expect(
+      records.filter(
+        (r) => r.level === "warn" && r.msg === "cancel command names no execution",
+      ).map((r) => r.fields.commandId),
+    ).toEqual([viaPayload]);
   });
 
   it("refuses a second handler for the same type", () => {

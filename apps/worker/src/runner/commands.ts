@@ -113,26 +113,17 @@ export interface CancelTarget {
   abort(executionId: string): boolean;
 }
 
-/** `payload.execution_id`, else the command's own `execution_id`. */
-export function commandExecutionId(command: ExecutionCommandRow): string | null {
-  const payload = command.payload;
-  if (payload !== null && typeof payload === "object") {
-    const value = (payload as Record<string, unknown>).execution_id;
-    if (typeof value === "string" && value !== "") return value;
-  }
-  return command.executionId;
-}
-
 /**
- * GOT.31 Q8: `cancel` aborts the live session of the target execution if
- * this worker runs it, and is a no-op otherwise. State is the api's to set.
+ * GOT.31 Q8: `cancel` aborts the live session of the command's
+ * `execution_id` if this worker runs it, and is a no-op otherwise. The
+ * payload is not read. State is the api's to set.
  */
 export function registerCancelHandler(
   handlers: CommandHandlers,
   runner: CancelTarget,
 ): void {
   handlers.registerCommandHandler("cancel", async (command, ctx) => {
-    const executionId = commandExecutionId(command);
+    const executionId = command.executionId;
     if (executionId === null) {
       ctx.logger.warn({ commandId: command.id }, "cancel command names no execution");
       return;

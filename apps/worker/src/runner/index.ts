@@ -1,5 +1,4 @@
 export {
-  commandExecutionId,
   createCommandHandlers,
   createConsumeCommandsPhase,
   registerCancelHandler,

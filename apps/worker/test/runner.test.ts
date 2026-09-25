@@ -233,6 +233,26 @@ const eventsFor = (executionId: string) =>
   });
 const eventTypes = async (executionId: string) =>
   (await eventsFor(executionId)).map((e) => e.type);
+const leaseExpiry = async (executionId: string): Promise<Date | null> => {
+  const [row] = await db.$client.unsafe<{ expires_at: Date }[]>(
+    "select expires_at from task_leases where execution_id = $1",
+    [executionId],
+  );
+  return row ? new Date(row.expires_at) : null;
+};
+/** Everything a refused resume must leave untouched. */
+const writeSnapshot = async (executionId: string) => {
+  const [audit] = await db.$client.unsafe<{ n: string }[]>(
+    "select count(*)::text as n from audit_events where entity_id = $1",
+    [executionId],
+  );
+  return {
+    execution: await execution(executionId),
+    lease: await leaseExpiry(executionId),
+    events: (await eventsFor(executionId)).length,
+    audit: audit!.n,
+  };
+};
 
 // ------------------------------------------------------------ fake agent
 
@@ -322,6 +342,8 @@ function makeRunner(
     quietTimeoutMs?: number;
     leaseRenewMs?: number;
     adapters?: RunnerDeps["adapters"];
+    /** Runs inside `prepareImplementation`, before it returns. */
+    onPrepare?: (input: PrepareImplementationInput) => Promise<void>;
     workerId: string;
   },
 ): Harness {
@@ -338,6 +360,7 @@ function makeRunner(
       async prepareImplementation(input) {
         prepared.push(input);
         if (options.prepareError) throw options.prepareError;
+        await options.onPrepare?.(input);
         const worktreePath = path.join(workRoot, "work", input.executionId);
         await fs.mkdir(worktreePath, { recursive: true });
         if (options.noMistakes) {
@@ -426,6 +449,33 @@ describe("runner start (design.md §9.1, §9.3)", () => {
     await expectCleanedUp(h, s.executionId);
   });
 
+  it("renews the lease while the worktree is being prepared (§6.4)", async () => {
+    const s = await seedClaimed();
+    let during: { before: Date | null; after: Date | null } | undefined;
+    const h = makeRunner({
+      workerId: s.workerId,
+      leaseRenewMs: 100,
+      // A slow fetch or setup_command: several renewal periods long.
+      onPrepare: async () => {
+        const before = await leaseExpiry(s.executionId);
+        await sleep(450);
+        during = { before, after: await leaseExpiry(s.executionId) };
+      },
+    });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-lp" };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "done" };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    expect(during!.before).not.toBeNull();
+    expect(during!.after!.getTime()).toBeGreaterThan(during!.before!.getTime());
+    expect((await execution(s.executionId)).state).toBe("COMPLETED");
+    await expectCleanedUp(h, s.executionId);
+  });
+
   it("a runtime with no adapter ends FAILED adapter_error before any worktree work", async () => {
     const s = await seedClaimed({ runtime: "codex" });
     const h = makeRunner({ workerId: s.workerId });
@@ -486,6 +536,97 @@ describe("event loop (design.md §9.3)", () => {
     const recorded = events.filter((e) => e.type === "usage.recorded");
     expect(recorded).toHaveLength(2);
     expect(recorded[0]!.payload).toMatchObject({ kind: "main", model: "claude-opus-test", input_tokens: 100 });
+    await expectCleanedUp(h, s.executionId);
+  });
+
+  it("writes buffered text before the next non-text event, so rows keep the adapter's order", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    h.adapter.script = async function* () {
+      yield { type: "session", sessionId: "sess-o" };
+      yield { type: "text", delta: "Hello " };
+      yield { type: "tool_call", name: "Bash", input: { command: "ls" } };
+      yield { type: "text", delta: "world" };
+      yield { type: "turn_done", finalText: "Hello world" };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    const agentRows = (await eventsFor(s.executionId))
+      .filter((e) => ["agent.message.delta", "agent.tool_call", "agent.message"].includes(e.type))
+      .map((e) => [e.type, e.payload]);
+    expect(agentRows).toEqual([
+      ["agent.message.delta", { text: "Hello " }],
+      ["agent.tool_call", { name: "Bash", input: { command: "ls" } }],
+      ["agent.message.delta", { text: "world" }],
+      ["agent.message", { text: "Hello world" }],
+    ]);
+  });
+
+  it("writes buffered text before an orchestra tool call, so it lands before what the tool writes", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-o2" };
+      yield { type: "text", delta: "Opening the PR" };
+      yield { type: "tool_call", name: "mcp__orchestra__report_pr_created", input: {} };
+      // The tool runs after the call event and writes execution.completed.
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "Opening the PR" };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    const types = await eventTypes(s.executionId);
+    expect(types.indexOf("agent.message.delta")).toBeGreaterThan(-1);
+    expect(types.indexOf("agent.message.delta")).toBeLessThan(types.indexOf("execution.completed"));
+    expect(types).not.toContain("agent.tool_call");
+  });
+
+  it("resets the quiet timer on every event (§9.4)", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId, quietTimeoutMs: 300 });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-qt" };
+      // 8 x 100 ms: every gap is under the timeout, the span is well over it.
+      for (let i = 0; i < 8; i++) {
+        await sleep(100);
+        yield { type: "text", delta: "." };
+      }
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "........" };
+    };
+
+    const started = Date.now();
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    expect(Date.now() - started).toBeGreaterThanOrEqual(800);
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("COMPLETED");
+    expect(row.endReason).toBeNull();
+    expect(h.adapter.signals[0]!.aborted).toBe(false);
+    expect(await eventTypes(s.executionId)).not.toContain("execution.failed");
+  });
+
+  it("an iterator that throws ends FAILED process_crash with the token redacted from end_detail and logs", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    let seenToken = "";
+    h.adapter.script = async function* ({ token }) {
+      seenToken = token;
+      yield { type: "session", sessionId: "sess-th" };
+      throw new Error(`spawn failed with ORCHESTRA_TOKEN=${token}`);
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    expect(seenToken).not.toBe("");
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("FAILED");
+    expect(row.endReason).toBe("process_crash");
+    expect(row.endDetail).toContain("spawn failed with ORCHESTRA_TOKEN=");
+    expect(row.endDetail).not.toContain(seenToken);
+    expect(JSON.stringify(records)).not.toContain(seenToken);
     await expectCleanedUp(h, s.executionId);
   });
 
@@ -704,9 +845,11 @@ describe("cancellation (Q8, §6.4)", () => {
 });
 
 describe("resume primitive (§9.3, §9.7)", () => {
-  async function waitingExecution(): Promise<{ s: Seeded; h: Harness; firstToken: string }> {
+  async function waitingExecution(
+    options: { leaseRenewMs?: number } = {},
+  ): Promise<{ s: Seeded; h: Harness; firstToken: string }> {
     const s = await seedClaimed();
-    const h = makeRunner({ workerId: s.workerId });
+    const h = makeRunner({ workerId: s.workerId, ...options });
     let firstToken = "";
     h.adapter.script = async function* ({ executionId, token }) {
       firstToken = token;
@@ -785,6 +928,144 @@ describe("resume primitive (§9.3, §9.7)", () => {
     expect(usage.filter((u) => u.kind === "resume").map((u) => u.inputTokens)).toEqual([30]);
     expect((await execution(s.executionId)).state).toBe("COMPLETED");
     await expectCleanedUp(h, s.executionId);
+  });
+
+  it("renews a stale lease in the same transaction that moves the execution to RUNNING (§6.4)", async () => {
+    // Renewal far out, so only the resume transaction can touch the lease.
+    const { s, h } = await waitingExecution({ leaseRenewMs: 60_000 });
+    await db.$client.unsafe(
+      "update task_leases set expires_at = now() - interval '1 minute' where execution_id = $1",
+      [s.executionId],
+    );
+    let release!: () => void;
+    const hold = new Promise<void>((r) => (release = r));
+    h.adapter.script = async function* ({ executionId }) {
+      await hold;
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "done" };
+    };
+
+    const { done } = await h.runner.resume({ executionId: s.executionId, prompt: "answer" });
+    const [row] = await db.$client.unsafe<{ expires_at: Date; lease_xmin: string; resumed_xmin: string }[]>(
+      `select l.expires_at, l.xmin::text as lease_xmin,
+              (select e.xmin::text from execution_events e
+                where e.execution_id = l.execution_id and e.type = 'execution.resumed') as resumed_xmin
+         from task_leases l where l.execution_id = $1`,
+      [s.executionId],
+    );
+    release();
+    await done;
+
+    expect(new Date(row!.expires_at).getTime()).toBeGreaterThan(Date.now());
+    // Written by the transaction that wrote execution.resumed, not a later renewal.
+    expect(row!.lease_xmin).toBe(row!.resumed_xmin);
+    expect((await execution(s.executionId)).state).toBe("COMPLETED");
+  });
+
+  it("resumes a COMPLETED execution on the CI back edge, clearing ended_at", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-ci" };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "PR opened" };
+    };
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+    const completed = await execution(s.executionId);
+    expect(completed.state).toBe("COMPLETED");
+    expect(completed.endedAt).not.toBeNull();
+
+    let during: { state: string; endedAt: Date | null } | undefined;
+    h.adapter.script = async function* ({ executionId }) {
+      const row = await execution(executionId);
+      during = { state: row.state, endedAt: row.endedAt };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "CI fixed" };
+    };
+    const { done } = await h.runner.resume({ executionId: s.executionId, prompt: "## CI failed\nfix it" });
+    await done;
+
+    expect(during).toEqual({ state: "RUNNING", endedAt: null });
+    expect(h.adapter.resumes[0]!.sessionId).toBe("sess-ci");
+    const audit = await db.$client.unsafe<{ trigger: string }[]>(
+      "select trigger from audit_events where entity_id = $1 and from_state = 'COMPLETED' and to_state = 'RUNNING'",
+      [s.executionId],
+    );
+    expect(audit.map((a) => a.trigger)).toEqual(["resume_with_ci_failure"]);
+    expect(await eventTypes(s.executionId)).toContain("execution.resumed");
+    expect((await execution(s.executionId)).state).toBe("COMPLETED");
+    await expectCleanedUp(h, s.executionId);
+  });
+
+  it("refuses a resume while a run is already live for the execution, writing nothing", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId, leaseRenewMs: 60_000 });
+    let sessionUp!: () => void;
+    const up = new Promise<void>((r) => (sessionUp = r));
+    h.adapter.script = async function* ({ signal }) {
+      yield { type: "session", sessionId: "sess-al" };
+      sessionUp();
+      await aborted(signal);
+    };
+    const run = h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+    await up;
+    await waitFor(async () =>
+      (await execution(s.executionId)).state === "RUNNING" ? true : undefined,
+    );
+    const before = await writeSnapshot(s.executionId);
+
+    const err = await h.runner
+      .resume({ executionId: s.executionId, prompt: "answer" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResumeError);
+    expect((err as ResumeError).code).toBe("ALREADY_LIVE");
+    expect(await writeSnapshot(s.executionId)).toEqual(before);
+    expect(h.adapter.resumes).toHaveLength(0);
+    // The live run is untouched by the refusal.
+    expect(h.runner.isLive(s.executionId)).toBe(true);
+    expect(h.adapter.signals[0]!.aborted).toBe(false);
+
+    h.runner.abort(s.executionId);
+    await run;
+  });
+
+  it("refuses a resume of an execution pinned to another host, writing nothing", async () => {
+    const { s, h } = await waitingExecution();
+    await db.$client.unsafe("update executions set host = 'other-host' where id = $1", [s.executionId]);
+    const before = await writeSnapshot(s.executionId);
+
+    const err = await h.runner
+      .resume({ executionId: s.executionId, prompt: "answer" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResumeError);
+    expect((err as ResumeError).code).toBe("OTHER_HOST");
+    expect(await writeSnapshot(s.executionId)).toEqual(before);
+    expect(h.adapter.resumes).toHaveLength(0);
+    expect(h.runner.isLive(s.executionId)).toBe(false);
+  });
+
+  it("refuses a resume of an execution in a non-resumable state, writing nothing", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    h.adapter.script = async function* () {
+      yield { type: "session", sessionId: "sess-nr" };
+      yield { type: "turn_done", finalText: "no terminal call" };
+    };
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+    expect((await execution(s.executionId)).state).toBe("FAILED");
+    const before = await writeSnapshot(s.executionId);
+
+    const err = await h.runner
+      .resume({ executionId: s.executionId, prompt: "answer" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResumeError);
+    expect((err as ResumeError).code).toBe("NOT_RESUMABLE_STATE");
+    expect(await writeSnapshot(s.executionId)).toEqual(before);
+    expect(h.adapter.resumes).toHaveLength(0);
+    expect(h.runner.isLive(s.executionId)).toBe(false);
   });
 });
 

@@ -362,6 +362,44 @@ export function createRunner(deps: RunnerDeps): Runner {
       ? undefined
       : ctx.execution.model;
 
+  /**
+   * §6.4: renews the lease every `leaseRenewMs` while `body` runs. Spec
+   * sessions hold no lease, so only implementation renews. `renewNow` also
+   * renews once before `body`. The state-gated helper (carry-forward, PR #17)
+   * never renews an execution that is no longer ASSIGNED or RUNNING; that
+   * result aborts the run.
+   */
+  async function withLease(
+    state: RunState,
+    ctx: RunnerContext,
+    log: Logger,
+    renewNow: boolean,
+    body: () => Promise<void>,
+  ): Promise<void> {
+    if (ctx.execution.role !== "implementation") return body();
+    const renew = async (): Promise<void> => {
+      try {
+        const expiresAt = await renewExecutionLease(db, ctx.execution.id, now());
+        if (expiresAt === null) {
+          log.info({}, "lease not renewable: execution no longer live, aborting");
+          state.stop("gone");
+        }
+      } catch (err) {
+        log.error({ err: errMessage(err) }, "lease renewal failed");
+      }
+    };
+    const interval = setInterval(() => void renew(), timings.leaseRenewMs);
+    try {
+      if (renewNow) {
+        await renew();
+        if (state.stopReason !== null) return;
+      }
+      await body();
+    } finally {
+      clearInterval(interval);
+    }
+  }
+
   // ---------------------------------------------------------- the session
 
   /**
@@ -401,40 +439,12 @@ export function createRunner(deps: RunnerDeps): Runner {
       const token = await issueToken(db, executionId);
       const redact = <T>(value: T): T => redactToken(value, token);
 
-      let lastRenewal: Date | null | undefined;
+      // Agent-tools calls renew through the default, state-gated helper.
       const entry: LiveExecution = createLiveExecution(
-        {
-          executionId,
-          taskId: ctx.task.id,
-          role: ctx.execution.role,
-          // The state-gated helper (carry-forward, PR #17): never renews an
-          // execution that is no longer ASSIGNED or RUNNING.
-          renewLease: async () => {
-            lastRenewal = await renewExecutionLease(db, executionId, now());
-          },
-        },
+        { executionId, taskId: ctx.task.id, role: ctx.execution.role },
         { db, now },
       );
       registry.set(entry);
-
-      // Spec sessions hold no lease, so only implementation renews (§6.4).
-      const holdsLease = ctx.execution.role === "implementation";
-      const renew = async (): Promise<void> => {
-        try {
-          await entry.renewLease();
-          if (lastRenewal === null) {
-            log.info({}, "lease not renewable: execution no longer live, aborting");
-            state.stop("gone");
-          }
-        } catch (err) {
-          log.error({ err: errMessage(err) }, "lease renewal failed");
-        }
-      };
-      if (holdsLease) {
-        await renew();
-        if (state.stopReason !== null) return;
-        intervals.add(setInterval(() => void renew(), timings.leaseRenewMs));
-      }
 
       const checkBlocking = (): void => {
         if (entry.blockingPending && !blockingTimer) {
@@ -455,13 +465,13 @@ export function createRunner(deps: RunnerDeps): Runner {
       // ---- text batching (§9.3)
       let buffer = "";
       let turnText = "";
-      const flush = (): void => {
+      const flush = (): Promise<void> => {
         cancel(flushTimer);
         flushTimer = undefined;
-        if (buffer === "") return;
+        if (buffer === "") return Promise.resolve();
         const text = redact(buffer);
         buffer = "";
-        void writes.push("agent.message.delta", () =>
+        return writes.push("agent.message.delta", () =>
           appendRunEvent(ctx, "agent.message.delta", { text }),
         );
       };
@@ -489,7 +499,7 @@ export function createRunner(deps: RunnerDeps): Runner {
             end =
               state.stopReason !== null
                 ? { kind: "stopped", reason: state.stopReason }
-                : { kind: "thrown", message: errMessage(next.error) };
+                : { kind: "thrown", message: redact(errMessage(next.error)) };
             break;
           }
           if (next.result.done) {
@@ -502,6 +512,11 @@ export function createRunner(deps: RunnerDeps): Runner {
           resetQuiet();
           checkBlocking();
 
+          // Buffered text is written before anything the adapter sent after
+          // it, including what an agent-tools call writes once its tool_call
+          // event is out, so execution_events keep the adapter's order.
+          if (event.type !== "text") await flush();
+
           if (event.type === "session") {
             await writes.push("session", () =>
               onSession(state, ctx, event.sessionId, log),
@@ -509,7 +524,7 @@ export function createRunner(deps: RunnerDeps): Runner {
           } else if (event.type === "text") {
             buffer += event.delta;
             turnText += event.delta;
-            if (!flushTimer) flushTimer = after(timings.flushMs, flush);
+            if (!flushTimer) flushTimer = after(timings.flushMs, () => void flush());
           } else if (event.type === "tool_call") {
             if (!event.name.startsWith(ORCHESTRA_TOOL_PREFIX)) {
               const payload = redact({ name: event.name, input: event.input });
@@ -538,7 +553,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         }
       }
 
-      flush();
+      void flush();
       const message =
         turnText !== ""
           ? turnText
@@ -739,6 +754,16 @@ export function createRunner(deps: RunnerDeps): Runner {
       );
       return;
     }
+    // Renewal covers worktree preparation too: a slow fetch or setup_command
+    // must not let the lease expire (§6.4, §6.5).
+    await withLease(state, ctx, log, true, () => prepareAndRun(state, ctx, log));
+  }
+
+  async function prepareAndRun(
+    state: RunState,
+    ctx: RunnerContext,
+    log: Logger,
+  ): Promise<void> {
     await setExecutionPlacement(db, ctx.execution.id, { workerId, host });
 
     const adapter = deps.adapters[ctx.execution.runtime];
@@ -929,6 +954,11 @@ export function createRunner(deps: RunnerDeps): Runner {
           actor: worker,
           set: { endedAt: null },
         });
+        // A paused execution's lease was not renewed. Renew it with the move
+        // to RUNNING, so the sweeper never sees the resumed run stale.
+        if (execution.role === "implementation") {
+          await renewExecutionLease(tx, executionId, now());
+        }
       });
     } catch (err) {
       if (live.get(executionId) === state) live.delete(executionId);
@@ -938,20 +968,23 @@ export function createRunner(deps: RunnerDeps): Runner {
     const role = ctx.execution.role as ToolPolicy;
     const testCommand = testCommandFor(ctx);
     const done = track(state, log, () =>
-      runSession(state, ctx, input.usageKind ?? "resume", log, (token, signal) =>
-        adapter.resume(
-          {
-            cwd: worktreePath,
-            prompt: input.prompt,
-            model: modelFor(ctx),
-            allowedTools: role,
-            mcp: { url: deps.toolsUrl(), token },
-            env: agentEnv(token),
-            sessionId,
-            usageBaseline: baseline,
-            ...(testCommand ? { testCommand } : {}),
-          },
-          signal,
+      // The resume transaction already renewed the lease.
+      withLease(state, ctx, log, false, () =>
+        runSession(state, ctx, input.usageKind ?? "resume", log, (token, signal) =>
+          adapter.resume(
+            {
+              cwd: worktreePath,
+              prompt: input.prompt,
+              model: modelFor(ctx),
+              allowedTools: role,
+              mcp: { url: deps.toolsUrl(), token },
+              env: agentEnv(token),
+              sessionId,
+              usageBaseline: baseline,
+              ...(testCommand ? { testCommand } : {}),
+            },
+            signal,
+          ),
         ),
       ),
     );
