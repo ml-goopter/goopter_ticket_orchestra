@@ -4,9 +4,11 @@ import {
   createDb,
   executions,
   projects,
+  replaceTaskLease,
   repositories,
   specificationRevisions,
   taskDependencies,
+  taskLeases,
   tasks,
   type Db,
 } from "@orchestra/db";
@@ -195,6 +197,20 @@ async function seedExecution(options: {
     })
     .returning({ id: executions.id });
   return row!.id;
+}
+
+async function seedLease(
+  taskId: string,
+  executionId: string,
+  workerId: string,
+): Promise<void> {
+  await db.insert(taskLeases).values({
+    taskId,
+    executionId,
+    workerId,
+    acquiredAt: NOW,
+    expiresAt: new Date(NOW.getTime() + LEASE_TTL_MS),
+  });
 }
 
 async function dependOn(taskId: string, ...dependsOn: string[]): Promise<void> {
@@ -754,6 +770,133 @@ describe("claim (design.md §6.3, §7.3)", () => {
       expect(await writeSnapshot()).toEqual(before);
       expect(await leasesFor(task)).toEqual(leaseBefore);
       expect(await taskState(task)).toBe("READY");
+    });
+  });
+
+  describe("a READY task whose earlier execution is still live (S13)", () => {
+    /**
+     * A task can be READY while an earlier execution is live: the review
+     * round limit moves the task to NEEDS_HUMAN and leaves the execution
+     * RUNNING, and a human retry moves the task to READY before the agent
+     * reports failure.
+     */
+    async function seedLiveReadyTask(
+      state: ExecutionState,
+      holder: { id: string; host: string },
+      repo: string,
+    ) {
+      const task = await seedTask({ state: "READY", repositoryId: repo, priority: 1 });
+      const executionId = await seedExecution({ taskId: task, state, host: holder.host });
+      await seedLease(task, executionId, holder.id);
+      return { task, executionId };
+    }
+
+    it.each<ExecutionState>(["RUNNING", "WAITING_FOR_USER", "ASSIGNED", "QUEUED"])(
+      "does not claim it while the execution is %s and claims the next task on the same tick",
+      async (state) => {
+        const worker = await seedWorker({ host: `live-${state}`, maxConcurrent: 5 });
+        const repo = await seedRepo({ maxWorktrees: 5 });
+        const { task, executionId } = await seedLiveReadyTask(state, worker, repo);
+        const lower = await seedTask({ state: "READY", repositoryId: repo, priority: 2 });
+        const executionsBefore = await executionsFor(task);
+        const leaseBefore = await leasesFor(task);
+        const { calls, onClaimed } = recorder();
+
+        await createClaimPhase({ runtimes: ["claude"], onClaimed }).run(
+          ctx(worker.id),
+        );
+
+        expect(calls.map((c) => c.taskId)).toEqual([lower]);
+        expect(await taskState(lower)).toBe("IMPLEMENTING");
+        expect(await taskState(task)).toBe("READY");
+        expect(await executionsFor(task)).toEqual(executionsBefore);
+        expect(executionsBefore.map((e) => [e.id, e.state])).toEqual([
+          [executionId, state],
+        ]);
+        expect(await leasesFor(task)).toEqual(leaseBefore);
+        expect(await auditFor(task)).toEqual([]);
+      },
+    );
+
+    it("claims nothing when that task is the only READY one", async () => {
+      const worker = await seedWorker({ maxConcurrent: 5 });
+      const repo = await seedRepo({ maxWorktrees: 5 });
+      await seedLiveReadyTask("RUNNING", worker, repo);
+      const before = await writeSnapshot();
+
+      expect(await runClaim(worker.id)).toBeNull();
+      expect(await writeSnapshot()).toEqual(before);
+    });
+  });
+
+  describe("the lease replacement never takes over a live execution's lease", () => {
+    it.each<ExecutionState>(["ASSIGNED", "RUNNING"])(
+      "replaceTaskLease rejects when the lease's execution is %s and leaves it unchanged",
+      async (state) => {
+        const worker = await seedWorker();
+        const task = await seedTask({ state: "READY" });
+        const live = await seedExecution({ taskId: task, state });
+        const other = await seedExecution({ taskId: task, state: "QUEUED", attempt: 2 });
+        await seedLease(task, live, worker.id);
+        const leaseBefore = await leasesFor(task);
+
+        await expect(
+          db.transaction((tx) =>
+            replaceTaskLease(tx, {
+              taskId: task,
+              executionId: other,
+              workerId: worker.id,
+              acquiredAt: NOW,
+              expiresAt: new Date(NOW.getTime() + LEASE_TTL_MS),
+            }),
+          ),
+        ).rejects.toThrow(/live execution/);
+
+        expect(await leasesFor(task)).toEqual(leaseBefore);
+      },
+    );
+
+    it.each<ExecutionState>(["FAILED", "COMPLETED", "CANCELLED", "WAITING_FOR_USER"])(
+      "replaceTaskLease replaces a lease whose execution is %s",
+      async (state) => {
+        const worker = await seedWorker();
+        const task = await seedTask({ state: "READY" });
+        const old = await seedExecution({ taskId: task, state });
+        const next = await seedExecution({ taskId: task, state: "QUEUED", attempt: 2 });
+        await seedLease(task, old, worker.id);
+
+        await db.transaction((tx) =>
+          replaceTaskLease(tx, {
+            taskId: task,
+            executionId: next,
+            workerId: worker.id,
+            acquiredAt: NOW,
+            expiresAt: new Date(NOW.getTime() + LEASE_TTL_MS),
+          }),
+        );
+
+        expect(await leasesFor(task)).toMatchObject([{ executionId: next }]);
+      },
+    );
+
+    it("rolls the whole claim back when the task's lease is held by a live execution", async () => {
+      // Unreachable through the candidate filter unless the lease points at
+      // another task's execution, which is how this state is built.
+      const worker = await seedWorker({ host: "lease-guard", maxConcurrent: 5 });
+      const repo = await seedRepo({ maxWorktrees: 5 });
+      const busyTask = await seedTask({ state: "IMPLEMENTING", repositoryId: repo });
+      const live = await seedExecution({ taskId: busyTask, state: "RUNNING", host: "lease-guard" });
+      const task = await seedTask({ state: "READY", repositoryId: repo });
+      await seedLease(task, live, worker.id);
+      const leaseBefore = await leasesFor(task);
+      const before = await writeSnapshot();
+
+      await expect(runClaim(worker.id)).rejects.toThrow(/live execution/);
+
+      expect(await writeSnapshot()).toEqual(before);
+      expect(await leasesFor(task)).toEqual(leaseBefore);
+      expect(await taskState(task)).toBe("READY");
+      expect(await executionsFor(task)).toEqual([]);
     });
   });
 

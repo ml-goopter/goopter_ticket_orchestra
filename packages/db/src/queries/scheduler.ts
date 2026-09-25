@@ -37,6 +37,31 @@ const PAUSED_STATE = "WAITING_FOR_USER";
 /** `repositories.default_model` fallback when the repository sets none. */
 export const DEFAULT_EXECUTION_MODEL = "default";
 
+/**
+ * Execution states that are not ended (§5.2). A `READY` task with one of
+ * these is not claimable: the review round limit can leave an execution
+ * `RUNNING` while a human retry moves its task back to `READY`.
+ */
+const LIVE_STATES = [
+  "QUEUED",
+  "ASSIGNED",
+  "RUNNING",
+  "WAITING_FOR_USER",
+] as const;
+
+const noLiveExecution = (db: DbOrTx): SQL =>
+  notExists(
+    db
+      .select({ one: sql`1` })
+      .from(executions)
+      .where(
+        and(
+          eq(executions.taskId, tasks.id),
+          inArray(executions.state, [...LIVE_STATES]),
+        ),
+      ),
+  );
+
 const noPausedExecution = (db: DbOrTx): SQL =>
   notExists(
     db
@@ -171,8 +196,8 @@ export interface ClaimCandidate {
 
 /**
  * design.md §6.3 candidate query. Picks the most urgent (`jira_priority`,
- * then oldest `jira_created_at`) `READY` task whose repository this worker
- * is capable of, whose repository is below `max_concurrent_worktrees` on
+ * then oldest `jira_created_at`) `READY` task with no live execution, whose
+ * repository this worker is capable of, whose repository is below `max_concurrent_worktrees` on
  * this host, and whose effective runtime is detected. Locks the task row
  * `FOR UPDATE OF tasks SKIP LOCKED`, so a concurrent claimer skips it and
  * takes the next one. The task lock is the first row lock of the claim
@@ -216,6 +241,7 @@ export async function selectClaimCandidate(
     .where(
       and(
         eq(tasks.state, "READY"),
+        noLiveExecution(tx),
         capabilityMatches(tx, input.workerId),
         sql`coalesce(${busy.n}, 0) < ${repositories.maxConcurrentWorktrees}`,
         inArray(effectiveRuntime, [...input.runtimes]),
@@ -278,11 +304,14 @@ export interface ReplaceTaskLeaseInput {
 
 /**
  * Writes the task's lease (§4.2 `task_leases`, one per task), overwriting
- * any row the task already has. Leases are not deleted when an execution
- * ends, so a task that returns to `READY` still carries its ended
- * execution's lease; a `READY` task has no live execution, so that row is
- * stale. Call only with the task row already locked, so the lease row is
- * locked after it (task-then-execution lock order).
+ * a row the task already has only when that row's execution is not
+ * `ASSIGNED` or `RUNNING`. Leases are not deleted when an execution ends,
+ * so a task that returns to `READY` can still carry its ended execution's
+ * lease, and that row is replaced. A lease held by a live execution is
+ * never taken over: the call throws, so the caller's transaction rolls
+ * back. Call only with the task row already locked, so the lease row is
+ * locked after it (task-then-execution lock order); the execution state is
+ * read, not locked.
  */
 export async function replaceTaskLease(
   tx: Tx,
@@ -299,9 +328,24 @@ export async function replaceTaskLease(
         acquiredAt: input.acquiredAt,
         expiresAt: input.expiresAt,
       },
+      setWhere: notExists(
+        tx
+          .select({ one: sql`1` })
+          .from(executions)
+          .where(
+            and(
+              eq(executions.id, taskLeases.executionId),
+              inArray(executions.state, [...SLOT_HOLDING_STATES]),
+            ),
+          ),
+      ),
     })
     .returning({ id: taskLeases.id });
-  if (!row) throw new Error("replaceTaskLease: upsert returned no row");
+  if (!row) {
+    throw new Error(
+      `replaceTaskLease: task ${input.taskId} lease is held by a live execution`,
+    );
+  }
   return row;
 }
 

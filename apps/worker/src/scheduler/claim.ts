@@ -37,7 +37,8 @@ export interface ClaimOptions {
 
 /**
  * design.md §6.3: in one transaction, check this worker has a free slot,
- * lock the most urgent eligible `READY` task, insert its implementation
+ * lock the most urgent eligible `READY` task with no live execution, insert
+ * its implementation
  * execution (`QUEUED`, then `ASSIGNED` through `transition()`), write the
  * lease (replacing an ended execution's leftover row), and move the task
  * `READY -> IMPLEMENTING` (`task.claimed`). Any failure rolls every one of
@@ -92,8 +93,9 @@ export async function claimNextTask(
       actor,
     });
 
-    // Replaces a leftover lease from the task's ended execution, if any: a
-    // READY task has no live execution, and the task row is locked above.
+    // Replaces a leftover lease from the task's ended execution, if any. The
+    // candidate has no live execution; a lease still held by an ASSIGNED or
+    // RUNNING execution throws here and rolls the whole claim back.
     await replaceTaskLease(tx, {
       taskId: candidate.taskId,
       executionId,
