@@ -307,7 +307,16 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
       return await app.db.transaction(async (tx) => {
         // J5 lock order: graph advisory lock, task row, execution rows.
         await lockDependencyGraph(tx);
-        const task = await lockTask(tx, id, "spec.approved");
+        const task = await lockTask(tx, id);
+        // Core also allows spec.approved from SPEC_APPROVED (the paused-execution
+        // edge), so the route admits only SPEC_REVIEW, before any other read or write.
+        if (task.state !== "SPEC_REVIEW") {
+          throw new AppError(
+            409,
+            "ILLEGAL_TRANSITION",
+            `Specification can only be approved in SPEC_REVIEW, task is ${task.state}.`,
+          );
+        }
         const draft = requireDraft(await getRevisionByStatus(tx, id, "draft"));
 
         // Validation first: every 422 below is thrown before any write.

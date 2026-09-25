@@ -569,15 +569,42 @@ describe("POST /api/tasks/:id/spec/approve (P5, P7)", () => {
     });
   });
 
-  it("returns 409 outside SPEC_REVIEW and writes nothing", async () => {
-    const dep = await newTask("DONE");
-    const { id } = await newTask("SPEC_IN_PROGRESS");
-    await seedRevision(id, 1, "draft", content({ dependencies: [dep.key] }));
-    const before = await snapshot(id);
+  it.each(["SPEC_IN_PROGRESS", "SPEC_APPROVED", "READY", "IMPLEMENTING"] as const)(
+    "returns 409 from %s with a valid draft and writes nothing",
+    async (state) => {
+      // An unfinished dependency: with a DONE one, a SPEC_APPROVED approve
+      // would roll back on the later dependency.satisfied move and mask F1.
+      const dep = await newTask("IMPLEMENTING");
+      const { id } = await newTask(state);
+      await seedRevision(id, 1, "draft", content({ dependencies: [dep.key] }));
+      const before = await snapshot(id);
+      const res = await post(`/api/tasks/${id}/spec/approve`);
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error.code).toBe("ILLEGAL_TRANSITION");
+      const after = await snapshot(id);
+      expect(after).toEqual(before);
+      expect(after.task.state).toBe(state);
+      expect(after.approvals).toEqual([]);
+      expect(after.revisions.map((r) => r.status)).toEqual(["draft"]);
+      expect(after.commands).toEqual([]);
+      expect(after.dependencies).toEqual([]);
+    },
+  );
+
+  it("an empty dependencies list with no paused execution ends READY with no dependency rows", async () => {
+    const { id } = await newTask("SPEC_REVIEW");
+    const draft = await seedRevision(id, 1, "draft", content({ dependencies: [] }));
     const res = await post(`/api/tasks/${id}/spec/approve`);
-    expect(res.statusCode).toBe(409);
-    expect(res.json().error.code).toBe("ILLEGAL_TRANSITION");
-    expect(await snapshot(id)).toEqual(before);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      from: "SPEC_REVIEW",
+      to: "READY",
+      revisionId: draft,
+    });
+    expect((await taskRow(id)).state).toBe("READY");
+    expect(await dependencyIds(id)).toEqual([]);
+    expect(await auditTriggers(id)).toEqual(["spec.approved", "dependency.satisfied"]);
+    expect(await commands(id)).toHaveLength(0);
   });
 
   it("returns 409 NO_DRAFT in SPEC_REVIEW without a draft", async () => {
