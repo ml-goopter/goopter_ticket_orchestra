@@ -1,0 +1,81 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildReviewPrompt (design.md §9.8) > matches the full example snapshot 1`] = `
+"## Specification (revision 3)
+### Repository
+
+orchestra-app
+
+### Objective
+
+Turn tickets into reviewed PRs.
+
+### Scope
+
+- build the widget
+
+### Out of scope
+
+- the gadget
+
+### Requirements
+
+- must be blue
+
+### Acceptance criteria
+
+- widget renders
+
+### Validation
+
+- run vitest
+
+### Constraints
+
+- no new deps
+
+### Dependencies
+
+
+
+
+## Decisions recorded on this task
+- issue_784: Receipt language is device-local. Clarification: Reinstall resets it. Chosen option: device-local (user@example.com on 2026-09-20)
+- issue_785: Blue is #0000ff. (lead@example.com on 2026-09-21)
+
+## Repository
+Name: goopter_odoo_modules
+Default branch: main
+Working branch: agent/GOOP-421-ab12cd
+Test command: pnpm test
+
+## Diff against the merge base
+\`\`\`diff
+diff --git a/src/widget.ts b/src/widget.ts
+--- a/src/widget.ts
++++ b/src/widget.ts
+@@ -1 +1 @@
+-export const colour = "red";
++export const colour = "blue";
+\`\`\`
+
+## Untracked files
+### src/new-file.ts
+\`\`\`
+export const added = 1;
+\`\`\`
+
+### docs/notes.md
+\`\`\`
+# Notes
+\`\`\`
+
+## Instructions
+Review the diff and the untracked files above against the specification and the recorded decisions. You may read the repository and run the test command to check your findings.
+
+Reply with exactly one JSON document and nothing else: no prose, no code fence. Its shape:
+
+{"verdict": "clean" | "findings" | "ask_user", "findings": [{"severity": "info" | "warning" | "blocking", "file": "<path, optional>", "line": <line number, optional>, "description": "<what is wrong>", "action": "<what the implementer should do>"}]}
+
+Use "clean" with an empty findings list when nothing needs to change. Use "ask_user" when the specification and decisions do not let you decide."
+`;

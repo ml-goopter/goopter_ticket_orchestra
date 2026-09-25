@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { agentTools } from "./agent-tools.js";
+import {
+  agentTools,
+  FindingSchema,
+  ReviewFindingsDocumentSchema,
+} from "./agent-tools.js";
 
 /**
  * design.md §8: one valid-input / missing-required-field pair per tool,
@@ -29,6 +33,25 @@ const CASES = {
   report_review_result: {
     valid: { round: 1, verdict: "clean", findings: [] },
     invalid: { round: 1, findings: [] }, // missing verdict
+  },
+  report_usage: {
+    valid: {
+      kind: "review",
+      round: 1,
+      model: "claude-opus-4",
+      input_tokens: 10,
+      cached_input_tokens: 2,
+      output_tokens: 5,
+      cost_usd: 0.01,
+    },
+    invalid: {
+      kind: "review",
+      model: "claude-opus-4",
+      input_tokens: 10,
+      cached_input_tokens: 2,
+      output_tokens: 5,
+      // missing cost_usd
+    },
   },
   report_pr_created: {
     valid: {
@@ -77,7 +100,7 @@ const CASES = {
 } as const;
 
 describe("agentTools (design.md §8)", () => {
-  it("has exactly the 8 tools §8 defines", () => {
+  it("has the 8 tools §8 defines plus report_usage (§9.7)", () => {
     expect(Object.keys(agentTools).sort()).toEqual(
       [
         "note",
@@ -88,6 +111,7 @@ describe("agentTools (design.md §8)", () => {
         "report_pr_created",
         "report_review_result",
         "report_review_started",
+        "report_usage",
       ].sort(),
     );
   });
@@ -114,6 +138,71 @@ describe("agentTools (design.md §8)", () => {
     expect(agentTools.report_review_started.roles).toEqual([
       "implementation",
     ]);
+  });
+
+  it("report_usage is implementation-only", () => {
+    expect(agentTools.report_usage.roles).toEqual(["implementation"]);
+  });
+
+  describe("report_usage input", () => {
+    const valid = CASES.report_usage.valid;
+
+    it("round is optional", () => {
+      const { round, ...rest } = valid;
+      void round;
+      expect(agentTools.report_usage.input.safeParse(rest).success).toBe(true);
+    });
+
+    it("rejects round 0, negative tokens, negative cost and an unknown kind", () => {
+      for (const bad of [
+        { ...valid, round: 0 },
+        { ...valid, input_tokens: -1 },
+        { ...valid, cached_input_tokens: 1.5 },
+        { ...valid, output_tokens: -1 },
+        { ...valid, cost_usd: -0.01 },
+        { ...valid, kind: "other" },
+      ]) {
+        expect(agentTools.report_usage.input.safeParse(bad).success).toBe(false);
+      }
+    });
+
+    it("returns a usage_id", () => {
+      expect(
+        agentTools.report_usage.output.safeParse({ usage_id: "u1" }).success,
+      ).toBe(true);
+      expect(agentTools.report_usage.output.safeParse({}).success).toBe(false);
+    });
+  });
+
+  it("report_review_result accepts an optional usage_id", () => {
+    const input = agentTools.report_review_result.input;
+    expect(
+      input.parse({ round: 1, verdict: "clean", findings: [], usage_id: "u1" })
+        .usage_id,
+    ).toBe("u1");
+    expect(
+      input.safeParse({ round: 1, verdict: "clean", findings: [], usage_id: 7 })
+        .success,
+    ).toBe(false);
+  });
+
+  it("ReviewFindingsDocumentSchema is the reviewer's { verdict, findings } reply", () => {
+    expect(
+      ReviewFindingsDocumentSchema.safeParse({
+        verdict: "findings",
+        findings: [
+          { severity: "warning", file: "a.ts", line: 3, description: "d", action: "a" },
+        ],
+      }).success,
+    ).toBe(true);
+    expect(
+      ReviewFindingsDocumentSchema.safeParse({ verdict: "maybe", findings: [] })
+        .success,
+    ).toBe(false);
+    expect(
+      ReviewFindingsDocumentSchema.safeParse({ verdict: "clean" }).success,
+    ).toBe(false);
+    expect(FindingSchema.safeParse({ severity: "info", description: "d", action: "a" }).success).toBe(true);
   });
 
   it("raise_issue covers both roles", () => {

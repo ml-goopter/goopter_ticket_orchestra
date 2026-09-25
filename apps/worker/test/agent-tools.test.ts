@@ -198,7 +198,15 @@ const eventsFor = (taskId: string) =>
 
 /** Every row a tool could write for this task, for "writes nothing" checks. */
 async function snapshot(s: Seeded) {
-  const [events, issueRows, notificationRows, reviewRows, prRows, revisionRows] =
+  const [
+    events,
+    issueRows,
+    notificationRows,
+    reviewRows,
+    prRows,
+    revisionRows,
+    usageRows,
+  ] =
     await Promise.all([
       eventsFor(s.taskId),
       db.query.issues.findMany({ where: (t, { eq }) => eq(t.taskId, s.taskId) }),
@@ -214,6 +222,9 @@ async function snapshot(s: Seeded) {
       db.query.specificationRevisions.findMany({
         where: (t, { eq }) => eq(t.taskId, s.taskId),
       }),
+      db.query.executionUsage.findMany({
+        where: (t, { eq }) => eq(t.executionId, s.executionId),
+      }),
     ]);
   const task = await getTask(s.taskId);
   const execution = await getExecution(s.executionId);
@@ -225,6 +236,13 @@ async function snapshot(s: Seeded) {
     reviews: reviewRows.length,
     pullRequests: prRows.length,
     revisions: revisionRows.map((r) => JSON.stringify(r.content)),
+    usage: usageRows.length,
+    totals: [
+      execution!.inputTokens,
+      execution!.cachedInputTokens,
+      execution!.outputTokens,
+      execution!.costUsd,
+    ],
     taskState: task!.state,
     needsHumanReason: task!.needsHumanReason,
     executionState: execution!.state,
@@ -360,6 +378,15 @@ const VALID_ARGS: Record<string, Record<string, unknown>> = {
   raise_issue: { ...RAISE_ARGS, blocking: false, severity: "info" },
   report_review_started: { round: 1 },
   report_review_result: { round: 1, verdict: "clean", findings: [] },
+  report_usage: {
+    kind: "review",
+    round: 1,
+    model: "gpt-5-codex",
+    input_tokens: 100,
+    cached_input_tokens: 20,
+    output_tokens: 30,
+    cost_usd: 0.25,
+  },
   report_pr_created: {
     url: "https://github.com/goopter/x/pull/1",
     number: 1,
@@ -456,7 +483,7 @@ describe("HTTP gate", () => {
     await expect(connect("not-a-real-token")).rejects.toThrow(/401|UNAUTHORIZED/);
   });
 
-  it("lists exactly the eight tools with their core schemas", async () => {
+  it("lists exactly the nine tools with their core schemas", async () => {
     const s = await seed({ taskState: "IMPLEMENTING" });
     const client = await connect(s.token);
 
@@ -471,6 +498,7 @@ describe("HTTP gate", () => {
       "report_pr_created",
       "report_review_result",
       "report_review_started",
+      "report_usage",
     ]);
     const raise = tools.find((t) => t.name === "raise_issue")!;
     expect(raise.inputSchema.required).toEqual(
@@ -949,6 +977,7 @@ describe("role checks write nothing (AC3)", () => {
   const wrongRole: Array<[string, "spec" | "implementation", TaskState]> = [
     ["report_review_started", "spec", "SPEC_IN_PROGRESS"],
     ["report_review_result", "spec", "SPEC_IN_PROGRESS"],
+    ["report_usage", "spec", "SPEC_IN_PROGRESS"],
     ["report_pr_created", "spec", "SPEC_IN_PROGRESS"],
     ["report_complete", "implementation", "IMPLEMENTING"],
     ["propose_spec", "implementation", "IMPLEMENTING"],
@@ -1250,6 +1279,195 @@ describe("report_review_result", () => {
 
     expect(data.instruction).toBeUndefined();
     expect((await getTask(s.taskId))!.state).toBe("IMPLEMENTING");
+  });
+});
+
+describe("report_review_result usage_id (design.md §9.7, §9.8)", () => {
+  async function reportUsage(s: Seeded): Promise<string> {
+    const data = expectOk(
+      await call(s.token, "report_usage", VALID_ARGS.report_usage!),
+    );
+    return data.usage_id as string;
+  }
+
+  it("stores the usage_id on the review_results row", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    const usageId = await reportUsage(s);
+
+    expectOk(
+      await call(s.token, "report_review_result", {
+        round: 1,
+        verdict: "clean",
+        findings: [],
+        usage_id: usageId,
+      }),
+    );
+
+    const [review] = await db.query.reviewResults.findMany({
+      where: (t, { eq }) => eq(t.executionId, s.executionId),
+    });
+    expect(review!.usageId).toBe(usageId);
+  });
+
+  it("without usage_id stores null", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+
+    expectOk(await call(s.token, "report_review_result", VALID_ARGS.report_review_result!));
+
+    const [review] = await db.query.reviewResults.findMany({
+      where: (t, { eq }) => eq(t.executionId, s.executionId),
+    });
+    expect(review!.usageId).toBeNull();
+  });
+
+  it("a usage_id from another execution is a tool error and writes nothing", async () => {
+    const other = await seed({ taskState: "REVIEWING" });
+    const foreign = await reportUsage(other);
+    const s = await seed({ taskState: "REVIEWING" });
+    const before = await snapshot(s);
+
+    const result = await call(s.token, "report_review_result", {
+      round: 1,
+      verdict: "findings",
+      findings: [{ severity: "warning", description: "d", action: "a" }],
+      usage_id: foreign,
+    });
+
+    expect(result.isError).toBe(true);
+    const after = await snapshot(s);
+    // Only the failed call's own agent.tool_call record and lease renewal.
+    expect({ ...after, events: before.events, leaseExpiresAt: 0 }).toEqual({
+      ...before,
+      leaseExpiresAt: 0,
+    });
+    const calls = (await eventsFor(s.taskId)).filter(
+      (e) => e.type === "agent.tool_call",
+    );
+    expect(calls.map((e) => (e.payload as { ok: boolean }).ok)).toEqual([false]);
+  });
+
+  for (const [label, usageId] of [
+    ["an unknown uuid", "00000000-0000-4000-8000-000000000000"],
+    ["a non-uuid string", "not-a-uuid"],
+  ] as const) {
+    it(`${label} as usage_id is a tool error and writes nothing`, async () => {
+      const s = await seed({ taskState: "REVIEWING" });
+      const before = await snapshot(s);
+
+      const result = await call(s.token, "report_review_result", {
+        round: 1,
+        verdict: "clean",
+        findings: [],
+        usage_id: usageId,
+      });
+
+      expect(result.isError).toBe(true);
+      const after = await snapshot(s);
+      expect({ ...after, events: before.events, leaseExpiresAt: 0 }).toEqual({
+        ...before,
+        leaseExpiresAt: 0,
+      });
+    });
+  }
+});
+
+describe("report_usage (design.md §9.7)", () => {
+  it("inserts execution_usage with the execution's runtime, adds to the totals, writes usage.recorded", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    const before = await snapshot(s);
+
+    const data = expectOk(
+      await call(s.token, "report_usage", VALID_ARGS.report_usage!),
+    );
+
+    expect(typeof data.usage_id).toBe("string");
+    const rows = await db.query.executionUsage.findMany({
+      where: (t, { eq }) => eq(t.executionId, s.executionId),
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id: data.usage_id,
+      kind: "review",
+      round: 1,
+      // seed() creates codex executions; the runtime comes from the row,
+      // not the caller.
+      runtime: "codex",
+      model: "gpt-5-codex",
+      inputTokens: 100,
+      cachedInputTokens: 20,
+      outputTokens: 30,
+    });
+    expect(Number(rows[0]!.costUsd)).toBeCloseTo(0.25, 6);
+
+    const execution = await getExecution(s.executionId);
+    expect(execution).toMatchObject({
+      inputTokens: 100,
+      cachedInputTokens: 20,
+      outputTokens: 30,
+    });
+    expect(Number(execution!.costUsd)).toBeCloseTo(0.25, 6);
+
+    const recorded = (await eventsFor(s.taskId)).filter(
+      (e) => e.type === "usage.recorded",
+    );
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]!.executionId).toBe(s.executionId);
+    expect(recorded[0]!.payload).toEqual({
+      usage_id: data.usage_id,
+      kind: "review",
+      round: 1,
+      model: "gpt-5-codex",
+      input_tokens: 100,
+      cached_input_tokens: 20,
+      output_tokens: 30,
+      cost_usd: 0.25,
+    });
+    // No state change.
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+    await expectRecorded(s, "report_usage", before.leaseExpiresAt);
+  });
+
+  it("accumulates the executions totals across calls and stores a missing round as null", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+
+    expectOk(await call(s.token, "report_usage", VALID_ARGS.report_usage!));
+    const { round, ...noRound } = VALID_ARGS.report_usage!;
+    void round;
+    const second = expectOk(
+      await call(s.token, "report_usage", {
+        ...noRound,
+        kind: "main",
+        input_tokens: 1,
+        cached_input_tokens: 2,
+        output_tokens: 3,
+        cost_usd: 0.5,
+      }),
+    );
+
+    const execution = await getExecution(s.executionId);
+    expect(execution).toMatchObject({
+      inputTokens: 101,
+      cachedInputTokens: 22,
+      outputTokens: 33,
+    });
+    expect(Number(execution!.costUsd)).toBeCloseTo(0.75, 6);
+    const row = await db.query.executionUsage.findFirst({
+      where: (t, { eq }) => eq(t.id, second.usage_id as string),
+    });
+    expect(row).toMatchObject({ kind: "main", round: null });
+  });
+
+  it("an invalid input writes nothing", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    const before = await snapshot(s);
+
+    const result = await call(s.token, "report_usage", {
+      ...VALID_ARGS.report_usage!,
+      input_tokens: -1,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(await snapshot(s)).toEqual(before);
   });
 });
 

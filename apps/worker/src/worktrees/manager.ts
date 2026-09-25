@@ -5,6 +5,7 @@ import {
   EXECUTION_CONTEXT_PATH,
   ExecutionContextSchema,
   type ExecutionContext,
+  type Runtime,
 } from "@orchestra/core";
 import { SetupFailedError } from "./errors.js";
 import { runGit, runShell } from "./run.js";
@@ -42,6 +43,8 @@ export interface PrepareImplementationInput {
   decisions: ExecutionContext["decisions"];
   /** Written to `context.json` as-is. Source is open (design.md OI3). */
   reviewCommand?: string | null;
+  /** `executions.runtime`; `orchestra-review` picks its adapter by it (§9.8). */
+  runtime: Runtime;
   /**
    * Start the working branch from `origin/agent/<KEY>-<short>` instead of
    * `origin/<default_branch>`: resume after eviction, or a retry from a
@@ -247,6 +250,7 @@ export class WorktreeManager {
         default_branch: repository.defaultBranch,
         branch,
       },
+      runtime: input.runtime,
       review_command: input.reviewCommand ?? null,
     } satisfies ExecutionContext);
     const contextFile = path.join(worktreePath, EXECUTION_CONTEXT_PATH);

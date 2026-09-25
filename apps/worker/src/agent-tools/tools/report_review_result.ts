@@ -1,6 +1,7 @@
 import { REVIEW_ROUND_LIMIT_INSTRUCTION } from "@orchestra/core";
 import {
   appendEvent,
+  executionUsageBelongsTo,
   incrementExecutionReviewRounds,
   insertReviewResult,
   transition,
@@ -24,18 +25,31 @@ export const ASK_USER_INSTRUCTION =
  *    increment in the same transaction instead.
  *  - `clean`: no transition. The agent goes on to push and open the PR.
  *  - `ask_user`: no transition. The agent is told to call `raise_issue`.
+ *
+ * `usage_id` (from `report_usage`, §9.7) is stored on the row. One that is
+ * unknown or belongs to another execution fails the call before any write.
  */
 export const reportReviewResult = defineTool({
   name: "report_review_result",
   description:
     "Record the result of a review round: verdict clean, findings, or ask_user, with the findings list.",
   async run({ tx, auth, now, actor }, input) {
+    if (
+      input.usage_id !== undefined &&
+      !(await executionUsageBelongsTo(tx, input.usage_id, auth.execution.id))
+    ) {
+      throw new Error(
+        `usage_id ${input.usage_id} is not a usage row of this execution`,
+      );
+    }
+
     const review = await insertReviewResult(tx, {
       executionId: auth.execution.id,
       round: input.round,
       verdict: input.verdict,
       findings: input.findings,
       reviewerRuntime: auth.execution.runtime,
+      usageId: input.usage_id ?? null,
       createdAt: now,
     });
 
