@@ -27,8 +27,9 @@ export type SpecApprovalResult =
   | { ok: false; errors: string[] };
 
 /**
- * Every list field except `risks` must be non-empty for a spec to be
- * approved (design.md §4.3).
+ * Every list field except `risks` and `dependencies` must be non-empty for a
+ * spec to be approved (design.md §4.3). An empty `dependencies` list means
+ * the task depends on nothing.
  */
 const REQUIRED_NON_EMPTY_LIST_FIELDS = [
   "scope",
@@ -37,13 +38,12 @@ const REQUIRED_NON_EMPTY_LIST_FIELDS = [
   "acceptance_criteria",
   "validation",
   "constraints",
-  "dependencies",
 ] as const satisfies readonly (keyof SpecContent)[];
 
 /**
  * Approval requires: the content is schema-valid, `repository` resolves via
- * `repositoryExists`, and every list field except `risks` is non-empty
- * (design.md §4.3).
+ * `repositoryExists`, and every list field except `risks` and `dependencies`
+ * is non-empty (design.md §4.3).
  */
 export function validateSpecForApproval(
   content: unknown,

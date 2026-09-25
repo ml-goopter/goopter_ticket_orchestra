@@ -62,7 +62,6 @@ describe("validateSpecForApproval (design.md §4.3 approval rule)", () => {
     "acceptance_criteria",
     "validation",
     "constraints",
-    "dependencies",
   ] as const;
 
   for (const field of requiredLists) {
@@ -80,6 +79,21 @@ describe("validateSpecForApproval (design.md §4.3 approval rule)", () => {
     const content = { ...VALID, risks: [] };
     const result = validateSpecForApproval(content, resolves);
     expect(result.ok).toBe(true);
+  });
+
+  it("accepts an empty dependencies list (the task depends on nothing)", () => {
+    const content = { ...VALID, dependencies: [] };
+    const result = validateSpecForApproval(content, resolves);
+    expect(result).toEqual({ ok: true, content });
+  });
+
+  it("still rejects an empty requirements list when dependencies is empty", () => {
+    const content = { ...VALID, dependencies: [], requirements: [] };
+    const result = validateSpecForApproval(content, resolves);
+    expect(result).toEqual({
+      ok: false,
+      errors: ["requirements must not be empty"],
+    });
   });
 
   it("reports two simultaneous failures together", () => {

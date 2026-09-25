@@ -115,6 +115,33 @@ describe("every row of TRANSITIONS resolves via resolveTransition", () => {
   });
 });
 
+describe("spec.revise edges (design.md §12.3 POST /spec/revise)", () => {
+  it.each([
+    ["SPEC_APPROVED", "SPEC_IN_PROGRESS"],
+    ["READY", "SPEC_IN_PROGRESS"],
+  ] as const)("task %s -(spec.revise)-> %s", (from, to) => {
+    expect(resolveTransition("task", from, "spec.revise")).toEqual({
+      ok: true,
+      to,
+    });
+  });
+
+  it("no other task state accepts spec.revise", () => {
+    const accepting = Object.values(TaskState).filter(
+      (from) => resolveTransition("task", from, "spec.revise").ok,
+    );
+    expect(accepting.sort()).toEqual(["READY", "SPEC_APPROVED"]);
+  });
+
+  it("no execution state accepts spec.revise", () => {
+    for (const from of Object.values(ExecutionState)) {
+      expect(resolveTransition("execution", from, "spec.revise").ok).toBe(
+        false,
+      );
+    }
+  });
+});
+
 describe("no duplicate (entity, from, trigger) keys", () => {
   it("every key is unique", () => {
     const keys = TRANSITIONS.map((r) => `${r.entity}:${r.from}:${r.trigger}`);

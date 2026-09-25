@@ -472,7 +472,7 @@ type SpecContent = {
 };
 ```
 
-Approval requires `repository` to resolve and every list except `risks` to be non-empty.
+Approval requires `repository` to resolve and every list except `risks` and `dependencies` to be non-empty. An empty `dependencies` list means the task depends on nothing and is promoted straight to `READY`.
 
 ---
 
