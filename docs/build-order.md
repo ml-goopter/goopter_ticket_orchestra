@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `eac1d98`.
+Status as of 2026-09-25, main at `d15274a` plus this change.
 
 ## Completed
 
@@ -22,17 +22,17 @@ Status as of 2026-09-25, main at `eac1d98`.
 | W5 | GOT.21 | api: task routes, cancel, retry, dependency and runtime patch | #12 |
 | W5 | GOT.22 | web: app shell, login, routing, api client, SSE client | #10 |
 | W5 | GOT.24 | worker: agent-tools MCP server with bearer tokens | #15 |
+| W5 | GOT.25 | worker: worktree manager | #22 |
+| W5 | GOT.23 | worker: Jira client and poller | #23 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch.
 
 ## Remaining
 
-Order within a wave is priority order. Critical path: GOT.25 → GOT.31 → GOT.39 → GOT.46 and GOT.47 → GOT.48 → GOT.49.
+Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.46 and GOT.47 → GOT.48 → GOT.49.
 
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
-| W5 | GOT.25 | worker: worktree manager | GOT.19 | M5 |
-| W5 | GOT.23 | worker: Jira client and poller | GOT.19 | M4 |
 | W5 | GOT.26 | worker: scheduler phases, claim, leases, capacity | GOT.16, 19 | M6 |
 | W5 | GOT.28 | api: LISTEN connection and SSE endpoints | GOT.21 | M3 |
 | W5 | GOT.32 | api: specification routes | GOT.21 | M5 |
@@ -63,6 +63,10 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 ## Carry-forward notes
 
 - GOT.31: lease renewal must go through the state-gated db helper; a runner-supplied `renewLease` that bypasses it can renew a cancelled execution. Every transaction that locks both rows takes the task row before the execution row (PR #17).
+- GOT.31: the worktree manager's setup command inherits the full worker environment (database URL, tokens, API keys) and has no timeout. Both were deferred to this task by user decision (PR #22).
+- GOT.31: a `WorktreeManager.prepareImplementation` call must follow the end of any earlier session for the same task, because a stale worktree holding the task branch is detached (PR #22).
+- GOT.31: run `pnpm typecheck` (or build) before `pnpm test` in a fresh checkout. Worker tests load workspace packages from `dist`, and a stale `dist` fails tests unrelated to the change.
+- GOT.26 is in progress: user decisions Q4 promotion included, Q5 `executions.model = 'default'` when the repository has none, Q6 `BLOCKED → READY` left out.
 - GOT.31: `renewTaskLease` refuses WAITING_FOR_USER by design (D5 frees the slot); the §6.4 heartbeat must not expect otherwise.
 - GOT.36: the SSE hook's default event types are cast to the caller's type parameter; pass `types` explicitly for dashboard events (PR #18, accepted minor).
 - GOT.40: `StartRequest.testCommand` carries the repository test command to the review role and must be a single plain command. Where the value comes from is design OI3 and needs a decision.
