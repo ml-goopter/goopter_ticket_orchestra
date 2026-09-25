@@ -1,12 +1,22 @@
 import { sign as signCookie } from "@fastify/cookie";
-import type { ExecutionState, TaskState } from "@orchestra/core";
+import type {
+  ExecutionState,
+  IssueStatus,
+  IssueType,
+  NotificationKind,
+  Severity,
+  TaskState,
+} from "@orchestra/core";
 import {
   createDb,
   executions,
+  issues,
+  notifications,
   projects,
   repositories,
   runMigrations,
   sessions,
+  specificationRevisions,
   taskDependencies,
   tasks,
   users,
@@ -340,4 +350,96 @@ export async function findExecutionById(
     select state from executions where id = ${executionId}
   `;
   return rows[0] ?? null;
+}
+
+export interface SeedRevisionOptions {
+  createdBy?: string | null;
+}
+
+/** Inserts one `specification_revisions` row directly, mirroring spec.test.ts's local helper. */
+export async function seedRevision(
+  db: Db,
+  taskId: string,
+  version: number,
+  status: "draft" | "approved" | "superseded",
+  content: unknown,
+  options: SeedRevisionOptions = {},
+): Promise<string> {
+  const [row] = await db
+    .insert(specificationRevisions)
+    .values({
+      taskId,
+      version,
+      status,
+      content,
+      createdBy: options.createdBy ?? null,
+    })
+    .returning({ id: specificationRevisions.id });
+  if (!row) throw new Error("seedRevision: insert returned no row");
+  return row.id;
+}
+
+export interface SeedIssueOptions {
+  taskId: string;
+  executionId: string;
+  type?: IssueType;
+  severity?: Severity;
+  blocking: boolean;
+  title?: string;
+  description?: string;
+  question?: string | null;
+  status?: IssueStatus;
+  createdAt?: Date;
+}
+
+/** Inserts one `issues` row directly, oldest first when seeded in order. */
+export async function seedIssue(db: Db, options: SeedIssueOptions): Promise<string> {
+  const [row] = await db
+    .insert(issues)
+    .values({
+      taskId: options.taskId,
+      executionId: options.executionId,
+      type: options.type ?? "QUESTION",
+      severity: options.severity ?? "blocking",
+      blocking: options.blocking,
+      title: options.title ?? "An issue",
+      description: options.description ?? "Issue description",
+      question: options.question ?? null,
+      status: options.status ?? "OPEN",
+      createdAt: options.createdAt ?? new Date("2026-01-01T00:00:00Z"),
+    })
+    .returning({ id: issues.id });
+  if (!row) throw new Error("seedIssue: insert returned no row");
+  return row.id;
+}
+
+export interface SeedNotificationOptions {
+  userId?: string | null;
+  taskId: string;
+  issueId?: string | null;
+  kind?: NotificationKind;
+  title?: string;
+  readAt?: Date | null;
+  createdAt?: Date;
+}
+
+/** Inserts one `notifications` row directly. */
+export async function seedNotification(
+  db: Db,
+  options: SeedNotificationOptions,
+): Promise<string> {
+  const [row] = await db
+    .insert(notifications)
+    .values({
+      userId: options.userId ?? null,
+      taskId: options.taskId,
+      issueId: options.issueId ?? null,
+      kind: options.kind ?? "issue_raised",
+      title: options.title ?? "Notification",
+      readAt: options.readAt ?? null,
+      createdAt: options.createdAt ?? new Date("2026-01-01T00:00:00Z"),
+    })
+    .returning({ id: notifications.id });
+  if (!row) throw new Error("seedNotification: insert returned no row");
+  return row.id;
 }
