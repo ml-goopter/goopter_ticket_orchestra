@@ -344,7 +344,10 @@ export async function listWorkersWithSlots(
     return {
       ...worker,
       heartbeatAgeSeconds,
-      freeSlots: worker.maxConcurrent - active,
+      // Clamped: a host can be over-assigned (manual reassignment, a race
+      // with the scheduler), and slots must never go negative for callers
+      // that add this to a budget (R4).
+      freeSlots: Math.max(0, worker.maxConcurrent - active),
     };
   });
 }

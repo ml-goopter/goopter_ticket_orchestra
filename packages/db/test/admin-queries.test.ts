@@ -217,4 +217,40 @@ describe("listWorkersWithSlots (AC4, AC6)", () => {
     expect(row?.heartbeatAgeSeconds).toBe(90);
     expect(row?.freeSlots).toBe(2);
   });
+
+  it("clamps free_slots at 0 when a host is over-assigned (R4)", async () => {
+    const fixtures = await seedFixtures(h.db, "ADMW2");
+    const taskId = await seedTask(h.db, fixtures, {
+      jiraKey: "ADMW2-1",
+      state: "IMPLEMENTING",
+    });
+
+    const now = new Date("2026-01-01T00:01:30Z");
+    const [worker] = await h.db
+      .insert(schema.agentWorkers)
+      .values({
+        host: "admq-worker-2",
+        capabilities: ["node"],
+        maxConcurrent: 1,
+        workspaceRoot: "/srv/orchestra",
+        lastHeartbeatAt: new Date("2026-01-01T00:00:00Z"),
+        startedAt: new Date("2026-01-01T00:00:00Z"),
+      })
+      .returning({ id: schema.agentWorkers.id });
+
+    const runningId1 = await seedExecution(h.db, taskId, { state: "RUNNING" });
+    const runningId2 = await seedExecution(h.db, taskId, {
+      state: "RUNNING",
+      attempt: 2,
+    });
+    await h.db
+      .update(schema.executions)
+      .set({ host: "admq-worker-2" })
+      .where(inArray(schema.executions.id, [runningId1, runningId2]));
+
+    const rows = await listWorkersWithSlots(h.db, now);
+    const row = rows.find((r) => r.id === worker!.id);
+    expect(row).toBeDefined();
+    expect(row?.freeSlots).toBe(0);
+  });
 });
