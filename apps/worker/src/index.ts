@@ -1,4 +1,5 @@
 import os from "node:os";
+import { ClaudeAdapter } from "@orchestra/adapters";
 import { createDb, type Db } from "@orchestra/db";
 import {
   DEFAULT_AGENT_TOOLS_HOST,
@@ -10,10 +11,16 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   startHeartbeat,
 } from "./heartbeat.js";
-import { startJiraPoller } from "./jira/index.js";
+import { createJiraClient, startJiraPoller } from "./jira/index.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PHASE_ORDER, createDefaultPhases } from "./phases/index.js";
 import { registerWorker } from "./registration.js";
+import {
+  createCommandHandlers,
+  createRunner,
+  registerCancelHandler,
+} from "./runner/index.js";
+import { WorktreeManager } from "./worktrees/index.js";
 import { detectRuntimes } from "./scheduler/index.js";
 import { installSignalHandlers } from "./shutdown.js";
 import { DEFAULT_TICK_INTERVAL_MS, createTickLoop } from "./tick.js";
@@ -70,7 +77,7 @@ async function main(): Promise<void> {
   log.info({ config: redactConfig(config) }, "worker registered");
 
   // design.md §8: one agent-tools MCP server per worker, on loopback. The
-  // registry is shared with the runner (GOT.31) once it exists.
+  // registry is shared with the runner (GOT.31).
   const registry = createExecutionRegistry();
   const toolsServer = createAgentToolsServer({
     db,
@@ -100,16 +107,45 @@ async function main(): Promise<void> {
     workerId,
     logger: log.child({ component: "jira-poller" }),
   });
-  // design.md §7.3: claim only tasks whose runtime binary is on PATH. No
-  // onClaimed handler yet: until the runner exists the claim phase is inert.
+  // design.md §7.3: claim only tasks whose runtime binary is on PATH.
   const runtimes = detectRuntimes();
   log.info({ runtimes }, "detected agent runtimes");
+
+  // design.md §9: the execution runner, fed by the claim phase (§6.3) and
+  // the command consumer (§6.1). Codex has no adapter yet (build step 9).
+  const jira =
+    config.jiraBaseUrl && config.jiraEmail && config.jiraApiToken
+      ? createJiraClient({
+          baseUrl: config.jiraBaseUrl,
+          email: config.jiraEmail,
+          apiToken: config.jiraApiToken,
+        })
+      : undefined;
+  const runner = createRunner({
+    db,
+    registry,
+    logger: log.child({ component: "runner" }),
+    workerId,
+    host: config.host,
+    worktrees: new WorktreeManager({ workspaceRoot: config.workspaceRoot }),
+    adapters: { claude: new ClaudeAdapter() },
+    toolsUrl: () => toolsServer.url,
+    ...(jira ? { fetchTicket: (key: string) => jira.getIssue(key) } : {}),
+    ...(config.githubToken ? { githubToken: config.githubToken } : {}),
+    quietTimeoutMs: config.agentQuietTimeoutMs,
+  });
+  const commands = createCommandHandlers();
+  registerCancelHandler(commands, runner);
 
   const loop = createTickLoop({
     db,
     workerId,
     config,
-    phases: createDefaultPhases({ runtimes }),
+    phases: createDefaultPhases({
+      runtimes,
+      onClaimed: runner.onClaimed,
+      commands,
+    }),
     logger: log,
     intervalMs: DEFAULT_TICK_INTERVAL_MS,
   });
@@ -128,6 +164,9 @@ async function main(): Promise<void> {
     logger: log,
     stop: async () => {
       await loop.stop();
+      // Abort live sessions and let their finally blocks revoke tokens
+      // before the tools server and the db go away.
+      await runner.shutdown();
       await toolsServer.stop();
       await stopJiraPoller();
       await stopHeartbeat();
