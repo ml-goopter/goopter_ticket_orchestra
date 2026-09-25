@@ -196,6 +196,32 @@ describe("GET /api/issues (AC1)", () => {
     expect((await get("/api/issues?status=BOGUS")).statusCode).toBe(400);
     expect((await get("/api/issues?blocking=yes")).statusCode).toBe(400);
   });
+
+  it("orders results by created_at ascending, regardless of insertion order", async () => {
+    const taskId = await newTask("IMPLEMENTING");
+    const execId = await seedExecution(h.db, taskId, { role: "implementation", state: "WAITING_FOR_USER" });
+    const later = await seedIssue(h.db, {
+      taskId,
+      executionId: execId,
+      blocking: true,
+      status: "OPEN",
+      createdAt: new Date("2026-01-05T00:00:00Z"),
+    });
+    const earlier = await seedIssue(h.db, {
+      taskId,
+      executionId: execId,
+      blocking: true,
+      status: "OPEN",
+      createdAt: new Date("2026-01-02T00:00:00Z"),
+    });
+
+    const res = await get(`/api/issues?status=OPEN&blocking=1`);
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>)
+      .map((r) => r.id)
+      .filter((id) => id === earlier || id === later);
+    expect(ids).toEqual([earlier, later]);
+  });
 });
 
 describe("GET /api/issues/:id (AC2)", () => {
@@ -314,7 +340,12 @@ describe("POST /api/issues/:id/resolve clarification (AC4)", () => {
       revisionId: null,
     });
 
-    expect((await issueRow(issueId)).status).toBe("RESOLVED");
+    const resolved = await issueRow(issueId);
+    expect(resolved.status).toBe("RESOLVED");
+    expect(resolved.resolution_kind).toBe("clarification");
+    expect(resolved.resolution).toBe("Use approach A");
+    expect(resolved.resolved_by).toBe(fx.userId);
+    expect(new Date(resolved.resolved_at!).getTime()).toBe(clock.now().getTime());
     const decisionRows = await decisions(issueId);
     expect(decisionRows).toHaveLength(1);
     expect(decisionRows[0]).toMatchObject({
@@ -380,7 +411,12 @@ describe("POST /api/issues/:id/resolve spec_revision (AC5, AC6)", () => {
       revisionId: expect.any(String),
     });
 
-    expect((await issueRow(issueId)).status).toBe("RESOLVED");
+    const resolved = await issueRow(issueId);
+    expect(resolved.status).toBe("RESOLVED");
+    expect(resolved.resolution_kind).toBe("spec_revision");
+    expect(resolved.resolution).toBe("Change the approach entirely");
+    expect(resolved.resolved_by).toBe(fx.userId);
+    expect(new Date(resolved.resolved_at!).getTime()).toBe(clock.now().getTime());
     expect((await taskRow(taskId)).state).toBe("SPEC_IN_PROGRESS");
     expect((await executionRow(execId)).state).toBe("WAITING_FOR_USER");
 
@@ -403,7 +439,10 @@ describe("POST /api/issues/:id/resolve spec_revision (AC5, AC6)", () => {
     );
     expect(supersedeEvent).toMatchObject({ superseded_by: issueId });
 
-    expect((await issueRow(otherOnSameExec)).status).toBe("SUPERSEDED");
+    const superseded = await issueRow(otherOnSameExec);
+    expect(superseded.status).toBe("SUPERSEDED");
+    expect(new Date(superseded.resolved_at!).getTime()).toBe(clock.now().getTime());
+    expect(superseded.resolution_kind).toBeNull();
     expect((await issueRow(issueOnDifferentExec)).status).toBe("OPEN");
   });
 
@@ -418,6 +457,48 @@ describe("POST /api/issues/:id/resolve spec_revision (AC5, AC6)", () => {
     const res = await post(`/api/issues/${issueId}/resolve`, { kind: "spec_revision", decision: "x" });
     expect(res.statusCode).toBe(409);
     expect(res.json().error.code).toBe("ILLEGAL_TRANSITION");
+    expect(await snapshot(issueId, taskId)).toEqual(before);
+  });
+
+  it("returns 409 EXECUTION_NOT_WAITING when the execution isn't waiting and writes nothing", async () => {
+    const taskId = await newTask("IMPLEMENTING");
+    const approved = await seedRevision(h.db, taskId, 1, "approved", content());
+    await setApprovedRevision(taskId, approved);
+    const execId = await seedExecution(h.db, taskId, { role: "implementation", state: "RUNNING" });
+    const issueId = await seedIssue(h.db, { taskId, executionId: execId, blocking: true });
+    const before = await snapshot(issueId, taskId);
+
+    const res = await post(`/api/issues/${issueId}/resolve`, { kind: "spec_revision", decision: "x" });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe("EXECUTION_NOT_WAITING");
+    expect(await snapshot(issueId, taskId)).toEqual(before);
+    expect((await issueRow(issueId)).status).toBe("OPEN");
+    expect((await taskRow(taskId)).state).toBe("IMPLEMENTING");
+  });
+
+  it("checks the transition before the execution state: SPEC_IN_PROGRESS with a running execution is ILLEGAL_TRANSITION, not EXECUTION_NOT_WAITING", async () => {
+    const taskId = await newTask("SPEC_IN_PROGRESS");
+    const approved = await seedRevision(h.db, taskId, 1, "approved", content());
+    await setApprovedRevision(taskId, approved);
+    const execId = await seedExecution(h.db, taskId, { role: "spec", state: "RUNNING" });
+    const issueId = await seedIssue(h.db, { taskId, executionId: execId, blocking: true });
+    const before = await snapshot(issueId, taskId);
+
+    const res = await post(`/api/issues/${issueId}/resolve`, { kind: "spec_revision", decision: "x" });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe("ILLEGAL_TRANSITION");
+    expect(await snapshot(issueId, taskId)).toEqual(before);
+  });
+
+  it("checks the execution state before the approved-revision check: no approved revision with a running execution is EXECUTION_NOT_WAITING, not NO_APPROVED_REVISION", async () => {
+    const taskId = await newTask("IMPLEMENTING");
+    const execId = await seedExecution(h.db, taskId, { role: "implementation", state: "RUNNING" });
+    const issueId = await seedIssue(h.db, { taskId, executionId: execId, blocking: true });
+    const before = await snapshot(issueId, taskId);
+
+    const res = await post(`/api/issues/${issueId}/resolve`, { kind: "spec_revision", decision: "x" });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe("EXECUTION_NOT_WAITING");
     expect(await snapshot(issueId, taskId)).toEqual(before);
   });
 
