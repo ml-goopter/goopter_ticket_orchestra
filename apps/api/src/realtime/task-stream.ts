@@ -48,6 +48,7 @@ export class TaskStream {
   private syncing = false;
   private resyncRequested = false;
   private buffer: StreamEvent[] = [];
+  private bufferedBytes = 0;
 
   constructor(private readonly options: TaskStreamOptions) {
     this.lastSentId = options.cursor;
@@ -58,10 +59,24 @@ export class TaskStream {
     void this.sync();
   }
 
+  /**
+   * Live events buffered during a sync count toward the connection's
+   * output cap. Past it the connection is dropped and the client resumes
+   * with Last-Event-ID, so a client stalled in its backlog cannot grow
+   * the buffer without bound.
+   */
   push(event: StreamEvent): void {
-    if (this.options.sse.isClosed) return;
+    const { sse } = this.options;
+    if (sse.isClosed) return;
     if (this.syncing) {
+      const bytes = Buffer.byteLength(event.frame);
+      if (sse.exceedsCap(this.bufferedBytes + bytes)) {
+        this.clearBuffer();
+        sse.drop();
+        return;
+      }
       this.buffer.push(event);
+      this.bufferedBytes += bytes;
       return;
     }
     this.send(event);
@@ -107,14 +122,20 @@ export class TaskStream {
       }
 
       const buffered = this.buffer.sort((a, b) => a.id - b.id);
-      this.buffer = [];
+      this.clearBuffer();
       for (const event of buffered) this.send(event);
     } catch (err) {
       // The client reconnects with Last-Event-ID and resumes from there.
+      this.clearBuffer();
       this.options.onError(err);
       sse.end();
     } finally {
       this.syncing = false;
     }
+  }
+
+  private clearBuffer(): void {
+    this.buffer = [];
+    this.bufferedBytes = 0;
   }
 }

@@ -89,14 +89,23 @@ export class RealtimeHub {
     }
     const load = this.options
       .loadEvent(this.options.db, payload.task_id, payload.event_id)
-      .catch((err: unknown) => {
-        this.options.log.error({ err, payload }, "realtime: event load failed");
-        return null;
-      });
+      .then(
+        (row) => ({ failed: false as const, row }),
+        (err: unknown) => {
+          this.options.log.error({ err, payload }, "realtime: event load failed");
+          return { failed: true as const };
+        },
+      );
     this.delivery = this.delivery
       .then(async () => {
-        const row = await load;
-        if (row) this.deliver(toStreamEvent(row));
+        const result = await load;
+        if (result.failed) {
+          // Re-read from each stream's last sent id before any later event
+          // is delivered, so the event whose load failed is not skipped.
+          this.resyncTask(payload.task_id);
+        } else if (result.row) {
+          this.deliver(toStreamEvent(result.row));
+        }
       })
       .catch((err: unknown) => {
         this.options.log.error({ err, payload }, "realtime: event delivery failed");
@@ -182,6 +191,12 @@ export class RealtimeHub {
     this.connections.add(sse);
     sse.onClose(() => this.connections.delete(sse));
     return sse;
+  }
+
+  private resyncTask(taskId: string): void {
+    const streams = this.taskStreams.get(taskId);
+    if (!streams) return;
+    for (const stream of streams) stream.resync();
   }
 
   private deliver(event: StreamEvent): void {

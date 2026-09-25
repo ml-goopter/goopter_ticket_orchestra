@@ -93,16 +93,33 @@ export class SseConnection {
     return this.closed;
   }
 
-  /** Returns false when the caller should `waitForDrain` before writing more. */
+  /**
+   * Returns false when the caller should `waitForDrain` before writing more.
+   * A chunk written while nothing else is unsent always stays, even one
+   * larger than the cap, so a single large frame cannot loop the client
+   * through reconnects.
+   */
   write(chunk: string): boolean {
     if (this.closed) return false;
+    const idle = this.res.writableLength === 0;
     if (!this.res.write(chunk)) this.needDrain = true;
-    if (this.res.writableLength > this.maxBufferedBytes) {
-      this.res.destroy();
-      this.handleClose();
+    if (!idle && this.res.writableLength > this.maxBufferedBytes) {
+      this.drop();
       return false;
     }
     return !this.needDrain;
+  }
+
+  /** True when `pendingBytes` held outside the response, added to its unsent output, exceed the cap. */
+  exceedsCap(pendingBytes: number): boolean {
+    return this.res.writableLength + pendingBytes > this.maxBufferedBytes;
+  }
+
+  /** Destroys the connection; the client resumes with `Last-Event-ID`. */
+  drop(): void {
+    if (this.closed) return;
+    this.res.destroy();
+    this.handleClose();
   }
 
   waitForDrain(): Promise<void> {

@@ -13,7 +13,8 @@ import {
   defaultLoadEvent,
   type RealtimeOptions,
 } from "../src/realtime/index.js";
-import { SseConnection } from "../src/realtime/sse.js";
+import { SseConnection, type StreamEvent } from "../src/realtime/sse.js";
+import { TaskStream } from "../src/realtime/task-stream.js";
 import {
   type Clock,
   type Fixtures,
@@ -48,6 +49,8 @@ const backlogHooks = new Map<
 >();
 /** Per-task hooks run after a cursor-less stream's anchor query resolves. */
 const anchorHooks = new Map<string, () => Promise<void> | void>();
+/** Tasks whose next live `loadEvent` call fails once. */
+const failNextLoad = new Set<string>();
 
 /** Wraps `defaultLoadAnchor` so a test can act right after the anchor is read. */
 const loadAnchorWithHooks: NonNullable<RealtimeOptions["loadAnchor"]> = async (
@@ -79,6 +82,7 @@ beforeAll(async () => {
       keepaliveMs: KEEPALIVE_MS,
       loadEvent: async (db, taskId, eventId) => {
         loads.push(eventId);
+        if (failNextLoad.delete(taskId)) throw new Error("injected load failure");
         return defaultLoadEvent(db, taskId, eventId);
       },
       listBacklog: async (db, taskId, after) => {
@@ -628,6 +632,25 @@ describe("GET /api/tasks/:id/stream", () => {
     }
   });
 
+  it("R2: an event whose live load fails still reaches the stream, before the next event", async () => {
+    const task = await newTask();
+    const anchorRead = anchored(task);
+    const client = await openStream(`/api/tasks/${task}/stream`);
+    try {
+      await anchorRead;
+      failNextLoad.add(task);
+      const e1 = await append(task, "agent.message", { n: 1 });
+      const e2 = await append(task, "agent.message", { n: 2 });
+      await client.waitForFrames(2);
+      await sleep(200);
+      expect(failNextLoad.has(task)).toBe(false);
+      expect(ids(client.frames)).toEqual([e1, e2]);
+    } finally {
+      failNextLoad.delete(task);
+      client.close();
+    }
+  });
+
   it("H7: sends a keepalive comment on the configured interval", async () => {
     const task = await newTask();
     const client = await openStream(`/api/tasks/${task}/stream`);
@@ -780,6 +803,57 @@ describe("auth, validation and cleanup (T7)", () => {
       expect(closes).toBe(1);
       sse.write("x".repeat(60));
       expect(res.written).toBe(120);
+    } finally {
+      sse.end();
+    }
+  });
+
+  it("R3: delivers one frame larger than the cap on an otherwise idle connection", () => {
+    const res = new FakeResponse();
+    const sse = new SseConnection(res.asServerResponse(), 60_000, 100);
+    try {
+      sse.write("x".repeat(150));
+      expect(sse.isClosed).toBe(false);
+      expect(res.destroyed).toBe(false);
+      expect(res.written).toBe(150);
+    } finally {
+      sse.end();
+    }
+  });
+
+  it("R1: live events buffered behind a stalled backlog drop the connection past the cap", async () => {
+    const res = new FakeResponse();
+    const sse = new SseConnection(res.asServerResponse(), 60_000, 100);
+    const event = (id: number): StreamEvent => ({
+      id,
+      taskId: "t",
+      type: "agent.message",
+      frame: `id: ${id}\ndata: ${"x".repeat(20)}\n\n`,
+    });
+    let errors = 0;
+    const stream = new TaskStream({
+      sse,
+      cursor: 0,
+      anchor: () => Promise.resolve(0),
+      backlog: () => Promise.resolve({ events: [event(1)], full: false }),
+      onError: () => {
+        errors += 1;
+      },
+    });
+    try {
+      stream.start();
+      // The backlog row fills the fake socket, so sync() waits for a drain
+      // that never comes and every live event is buffered.
+      await waitFor(() => res.written > 0);
+      let pushes = 0;
+      for (let id = 2; id <= 1000 && !sse.isClosed; id += 1) {
+        stream.push(event(id));
+        pushes += 1;
+      }
+      expect(sse.isClosed).toBe(true);
+      expect(res.destroyed).toBe(true);
+      expect(pushes).toBeLessThan(5);
+      expect(errors).toBe(0);
     } finally {
       sse.end();
     }
