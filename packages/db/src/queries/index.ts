@@ -11,3 +11,4 @@ export * from "./admin.js";
 export * from "./agent-tools.js";
 export * from "./jira.js";
 export * from "./scheduler.js";
+export * from "./stream.js";
