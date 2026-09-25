@@ -196,6 +196,32 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
     expect(git(bareClonePath(), "rev-parse", "origin/main")).toBe(newTip);
   });
 
+  it("F1: a git_url change reaches an existing bare clone on the next prepare", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+
+    const remote2 = path.join(tmp, "remote2.git");
+    const seed2 = path.join(tmp, "seed2");
+    git(tmp, "init", "-q", "-b", "main", "--bare", remote2);
+    git(tmp, "clone", "-q", remote2, seed2);
+    git(seed2, "checkout", "-q", "-B", "main");
+    writeFileSyncIn(seed2, "other.txt", "other");
+    git(seed2, "add", "other.txt");
+    git(seed2, "commit", "-q", "-m", "other commit");
+    git(seed2, "push", "-q", "-f", "origin", "main:main");
+    const newTip = git(seed2, "rev-parse", "HEAD");
+
+    const result = await manager.prepareImplementation(
+      implInput("exec-2", {
+        repository: { ...repository, gitUrl: remote2 },
+        task: { id: OTHER_TASK_ID, jiraKey: "GOOP-9", jiraSummary: "x" },
+      }),
+    );
+
+    expect(git(bareClonePath(), "remote", "get-url", "origin")).toBe(remote2);
+    expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(newTip);
+  });
+
   it("A3: fetch --prune leaves local agent branches in other worktrees alone", async () => {
     const manager = new WorktreeManager({ workspaceRoot });
     const first = await manager.prepareImplementation(implInput("exec-1"));

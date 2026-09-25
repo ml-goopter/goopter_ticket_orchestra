@@ -185,6 +185,13 @@ export class WorktreeManager {
    * Design.md §9.1 steps 1-4: fetch, add the worktree on the working branch,
    * run the setup command, write `.orchestra/context.json`.
    *
+   * Caller precondition: any earlier session for this task must already have
+   * ended before this is called. `releaseBranch` (GOT.25 D5) detaches a
+   * stale worktree's HEAD to free the branch purely from git state; the
+   * manager has no database access, so it cannot tell whether that
+   * worktree's agent process is still running. Calling this while an
+   * earlier session for the same task is still live races that session.
+   *
    * Throws `GitCommandError` for a git failure and `SetupFailedError` when
    * the setup command exits non-zero.
    */
@@ -351,6 +358,11 @@ export class WorktreeManager {
         if (!lostRace) throw err;
       }
     }
+    // repositories.git_url is editable through the admin API after the clone
+    // already exists, so keep the bare clone's origin in sync on every
+    // fetch, not only at creation. Runs under the caller's repo lock, same
+    // as the fetch below.
+    await runGit(barePath, ["remote", "set-url", "origin", gitUrl]);
     await runGit(barePath, ["fetch", "--quiet", "--prune", "origin"]);
   }
 
