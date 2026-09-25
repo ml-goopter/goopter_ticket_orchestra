@@ -10,6 +10,7 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   startHeartbeat,
 } from "./heartbeat.js";
+import { startJiraPoller } from "./jira/index.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PHASE_ORDER, createDefaultPhases } from "./phases/index.js";
 import { registerWorker } from "./registration.js";
@@ -90,6 +91,14 @@ async function main(): Promise<void> {
   }
 
   const stopHeartbeat = startHeartbeat(db, workerId, { logger: log });
+  // design.md §11.1: independent 60s-interval poller. No-ops with one
+  // warning when Jira credentials are absent (E4); never blocks startup.
+  const stopJiraPoller = startJiraPoller({
+    db,
+    config,
+    workerId,
+    logger: log.child({ component: "jira-poller" }),
+  });
   const loop = createTickLoop({
     db,
     workerId,
@@ -114,6 +123,7 @@ async function main(): Promise<void> {
     stop: async () => {
       await loop.stop();
       await toolsServer.stop();
+      await stopJiraPoller();
       await stopHeartbeat();
       await closeDb(db);
     },
