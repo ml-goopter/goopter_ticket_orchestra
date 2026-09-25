@@ -2,31 +2,36 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
-import type { ApiClient, User } from "../api/client.js";
+import type { BoardApiClient, User } from "../api/client.js";
 import { SessionProvider } from "../auth/SessionProvider.js";
 import { AppLayout } from "./AppLayout.js";
 
 afterEach(cleanup);
 
-function makeClient(user: User): ApiClient {
+function makeClient(user: User): BoardApiClient {
   return {
     request: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
     me: vi.fn().mockResolvedValue(user),
     health: vi.fn(),
+    listTasks: vi.fn().mockResolvedValue([]),
+    listIssues: vi.fn().mockResolvedValue([]),
+    listNotifications: vi.fn().mockResolvedValue([]),
+    markNotificationRead: vi.fn(),
   };
 }
 
 describe("AppLayout", () => {
   it("renders the attention drawer toggle with a zero count badge", async () => {
     const user: User = { id: "1", email: "a@b.com", displayName: "A" };
+    const client = makeClient(user);
 
     render(
       <MemoryRouter initialEntries={["/"]}>
-        <SessionProvider client={makeClient(user)}>
+        <SessionProvider client={client}>
           <Routes>
-            <Route element={<AppLayout />}>
+            <Route element={<AppLayout client={client} />}>
               <Route path="/" element={<div>content</div>} />
             </Route>
           </Routes>

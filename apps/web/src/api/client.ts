@@ -1,4 +1,12 @@
 import { z } from "zod";
+import {
+  IssueSchema,
+  NotificationSchema,
+  TaskCardSchema,
+  type Issue,
+  type Notification,
+  type TaskCard,
+} from "./types.js";
 
 /**
  * `POST /auth/login` and `GET /auth/me` both resolve to this shape
@@ -12,6 +20,32 @@ export const UserSchema = z.object({
 export type User = z.infer<typeof UserSchema>;
 
 const HealthSchema = z.object({ status: z.string() });
+
+/**
+ * Builds a leading `?a=b&c=d` query string, omitting any key whose value
+ * is `undefined` -- so an unset filter contributes nothing to the path
+ * rather than an empty `key=` pair.
+ */
+function buildQuery(params: Record<string, string | undefined>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) {
+      search.set(key, value);
+    }
+  }
+  const query = search.toString();
+  return query ? `?${query}` : "";
+}
+
+export interface ListTasksOptions {
+  /** `true` sends `?attention=1` (design.md §12.2); omitted otherwise. */
+  attention?: boolean;
+}
+
+export interface ListIssuesOptions {
+  status?: string;
+  blocking?: boolean;
+}
 
 /**
  * Every api error resolves to `{ error: { code, message } }`
@@ -62,11 +96,26 @@ export interface ApiClient {
 }
 
 /**
+ * The board and attention drawer's view of the api (GOT.36), kept as its
+ * own interface rather than widening `ApiClient` itself: `ApiClient` is
+ * the type every other view's tests mock against (e.g.
+ * `SessionProvider.test.tsx`, `router.test.tsx`), and adding required
+ * methods there would force an unrelated edit to files outside this
+ * task's `owned_paths`. `createApiClient()` implements both.
+ */
+export interface BoardApiClient extends ApiClient {
+  listTasks(options?: ListTasksOptions): Promise<TaskCard[]>;
+  listIssues(options?: ListIssuesOptions): Promise<Issue[]>;
+  listNotifications(): Promise<Notification[]>;
+  markNotificationRead(id: string): Promise<Notification>;
+}
+
+/**
  * Typed wrapper around the api (design.md §12.1). Cookies are httpOnly, so
  * every request is sent with `credentials: "include"` and the caller never
  * touches the session cookie directly (design.md §13).
  */
-export function createApiClient(options: ApiClientOptions = {}): ApiClient {
+export function createApiClient(options: ApiClientOptions = {}): BoardApiClient {
   const baseUrl = options.baseUrl ?? "/api";
   const fetchImpl = options.fetch ?? fetch;
 
@@ -117,5 +166,24 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     me: () => request<User>("GET", "/auth/me", { schema: UserSchema }),
     health: () =>
       request<{ status: string }>("GET", "/health", { schema: HealthSchema }),
+    listTasks: (options = {}) =>
+      request<TaskCard[]>(
+        "GET",
+        `/tasks${buildQuery({ attention: options.attention ? "1" : undefined })}`,
+        { schema: z.array(TaskCardSchema) },
+      ),
+    listIssues: (options = {}) =>
+      request<Issue[]>(
+        "GET",
+        `/issues${buildQuery({
+          status: options.status,
+          blocking: options.blocking === undefined ? undefined : options.blocking ? "1" : "0",
+        })}`,
+        { schema: z.array(IssueSchema) },
+      ),
+    listNotifications: () =>
+      request<Notification[]>("GET", "/notifications", { schema: z.array(NotificationSchema) }),
+    markNotificationRead: (id) =>
+      request<Notification>("POST", `/notifications/${id}/read`, { schema: NotificationSchema }),
   };
 }
