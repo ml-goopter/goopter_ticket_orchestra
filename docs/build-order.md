@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `878a3fb` plus this change.
+Status as of 2026-09-25, main at `cf54576` plus this change.
 
 ## Completed
 
@@ -25,8 +25,9 @@ Status as of 2026-09-25, main at `878a3fb` plus this change.
 | W5 | GOT.25 | worker: worktree manager | #22 |
 | W5 | GOT.23 | worker: Jira client and poller | #23 |
 | W5 | GOT.26 | worker: scheduler phases, claim, leases, capacity | #24 |
+| W5 | GOT.28 | api: LISTEN connection and SSE endpoints | #26 |
 
-Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch.
+Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
 ## Remaining
 
@@ -34,7 +35,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
-| W5 | GOT.28 | api: LISTEN connection and SSE endpoints | GOT.21 | M3 |
 | W5 | GOT.32 | api: specification routes | GOT.21 | M5 |
 | W5 | GOT.33 | api: issue routes, resolution, notifications | GOT.21 | M7 |
 | W5 | GOT.40 | review-wrapper: orchestra-review binary | GOT.14, 24 | M6 |
@@ -72,6 +72,8 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.43: `POST /tasks/:id/retry` moves NEEDS_HUMAN to READY even while the execution is still RUNNING (after a review-limit escalation). The claim skips READY tasks with a live execution, so the task waits, but the retry route should refuse or the escalation should end the execution (PR #24).
 - GOT.34/35: `BLOCKED → READY` (`dependency.resolved`) is not implemented; the user left it out of GOT.26 because §6.2 does not specify it.
 - GOT.31: `renewTaskLease` refuses WAITING_FOR_USER by design (D5 frees the slot); the §6.4 heartbeat must not expect otherwise.
+- GOT.33: `GET /stream` has no publisher for `notification` events yet; notifications are rows in their own table and never reach `NOTIFY` (user decision Q7, PR #26).
+- GOT.36: `GET /stream` has no replay (user decision Q8); the dashboard must refetch its lists when the stream reconnects (PR #26).
 - GOT.36: the SSE hook's default event types are cast to the caller's type parameter; pass `types` explicitly for dashboard events (PR #18, accepted minor).
 - GOT.40: `StartRequest.testCommand` carries the repository test command to the review role and must be a single plain command. Where the value comes from is design OI3 and needs a decision.
 - GOT.48 and GOT.49: need a sandbox GitHub repository, a Jira project, and credentials from the user.
