@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `b637e40` plus this change.
+Status as of 2026-09-25, main at `1d01374` plus this change.
 
 ## Completed
 
@@ -29,6 +29,7 @@ Status as of 2026-09-25, main at `b637e40` plus this change.
 | W5 | GOT.32 | api: specification routes | #27 |
 | W5 | GOT.33 | api: issue routes, resolution, notifications | #28 |
 | W5 | GOT.40 | review-wrapper: orchestra-review binary | #29 |
+| W6 | GOT.36 | web: board view and attention drawer | #30 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -39,7 +40,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
 | W6 | GOT.31 | worker: execution runner loop and command consumer | GOT.14, 15, 24, 25 | M5 |
-| W6 | GOT.36 | web: board view and attention drawer | GOT.21, 22, 28 | M3 |
 | W6 | GOT.41 | web: task detail timeline and side panel | GOT.21, 22, 28 | M6 |
 | W6 | GOT.34 | worker: lease sweeper and dead-host release | GOT.26 | M8 |
 | W6 | GOT.35 | worker: worktree sweeper | GOT.25 | M8 |
@@ -80,8 +80,9 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.47: `send_message` on an issue carries `{ issue_id, text }` and `resume_with_decision` carries `{ issue_id, decision_id }`. Both are enqueued only while the execution is WAITING_FOR_USER; a message on a non-blocking issue is refused with 409 (PR #28).
 - GOT.47: resolving as `spec_revision` leaves the execution WAITING_FOR_USER and enqueues nothing; `/spec/approve` later enqueues `resume_with_revision` (PR #27, #28).
 - GOT.42: broadcast notifications (`user_id` null) share one `read_at` across users; one user's read marks it read for all (PR #28, accepted as designed).
-- GOT.36: `GET /stream` has no replay (user decision Q8); the dashboard must refetch its lists when the stream reconnects (PR #26).
-- GOT.36: the SSE hook's default event types are cast to the caller's type parameter; pass `types` explicitly for dashboard events (PR #18, accepted minor).
+- GOT.38/41/42: `GET /stream` and `/tasks/:id/stream` have no replay for the global stream (user decision Q8); every view must refetch when the stream reconnects. Reuse `apps/web/src/board/useEventReconnect.ts` and the `useLatestRequest` stale-response guard from PR #30 rather than writing new fetch plumbing (PR #26, #30).
+- GOT.38/41/42: the SSE hook's default event types are cast to the caller's type parameter; pass `types` explicitly (PR #18, accepted minor).
+- GOT.38/41/42: the web api client's typed methods live in `apps/web/src/api/types.ts` and `client.ts` (`BoardApiClient`); extend them there. `AppLayout` owns the client instance and passes it down (PR #30).
 - GOT.39: `StartRequest.testCommand` carries the repository test command to the review role and must be a single plain command. The wrapper reads it from `context.review_command`; where that value comes from is design OI3 and needs a decision.
 - GOT.39: the runner must prepend `packages/review-wrapper/bin` to the agent's PATH (user decision Q7, no bundler) and invoke `orchestra-review --round N` after `report_review_started(N)`. Read the exit code, not stdout, for the outcome: 0 clean, 1 findings, 2 ask_user, 3 error. The round-limit stop instruction from `report_review_result` reaches the agent only on the wrapper's stderr (PR #29).
 - GOT.39: the wrapper calls `report_review_result` itself, so the implementing agent must not call it again for the same round (PR #29).
