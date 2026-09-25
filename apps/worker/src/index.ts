@@ -14,6 +14,7 @@ import { startJiraPoller } from "./jira/index.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PHASE_ORDER, createDefaultPhases } from "./phases/index.js";
 import { registerWorker } from "./registration.js";
+import { detectRuntimes } from "./scheduler/index.js";
 import { installSignalHandlers } from "./shutdown.js";
 import { DEFAULT_TICK_INTERVAL_MS, createTickLoop } from "./tick.js";
 
@@ -99,11 +100,16 @@ async function main(): Promise<void> {
     workerId,
     logger: log.child({ component: "jira-poller" }),
   });
+  // design.md §7.3: claim only tasks whose runtime binary is on PATH. No
+  // onClaimed handler yet: until the runner exists the claim phase is inert.
+  const runtimes = detectRuntimes();
+  log.info({ runtimes }, "detected agent runtimes");
+
   const loop = createTickLoop({
     db,
     workerId,
     config,
-    phases: createDefaultPhases(),
+    phases: createDefaultPhases({ runtimes }),
     logger: log,
     intervalMs: DEFAULT_TICK_INTERVAL_MS,
   });

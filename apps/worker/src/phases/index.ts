@@ -1,3 +1,8 @@
+import {
+  createClaimPhase,
+  createPromotePhase,
+  type SchedulerDeps,
+} from "../scheduler/index.js";
 import type { Phase, TickContext } from "../tick.js";
 
 /**
@@ -48,8 +53,18 @@ function stub(name: PhaseName): Phase {
 
 /**
  * The phases the worker registers at startup, in §6 order. Returns a fresh
- * array each call so a caller cannot mutate the registry.
+ * array each call so a caller cannot mutate the registry. §6.2 promotion and
+ * §6.3 claim are real; the other phases are still stubs.
  */
-export function createDefaultPhases(): Phase[] {
-  return PHASE_ORDER.map((name) => stub(name));
+export function createDefaultPhases(deps: SchedulerDeps = {}): Phase[] {
+  return PHASE_ORDER.map((name) => {
+    switch (name) {
+      case "promote_approved":
+        return createPromotePhase();
+      case "claim":
+        return createClaimPhase(deps);
+      default:
+        return stub(name);
+    }
+  });
 }
