@@ -7,7 +7,14 @@ export const PACKAGE_NAME = "@orchestra/review-wrapper";
 
 export { parseRound } from "./args.js";
 export { ExitCode, ReviewError, USAGE } from "./errors.js";
-export { collectChanges, runGit, type GitRunner, type WorktreeChanges } from "./git.js";
+export {
+  collectChanges,
+  resolveWorktreeRoot,
+  runGit,
+  DIRECTORY_CONTENT_MARKER,
+  type GitRunner,
+  type WorktreeChanges,
+} from "./git.js";
 export { parseReviewReply } from "./reply.js";
 export { createMcpReporter, type ReviewReporter } from "./reporter.js";
 export { CODEX_UNAVAILABLE_MESSAGE, runReview, type RunDeps } from "./run.js";

@@ -1,9 +1,11 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { REVIEW_SYSTEM_PROMPT } from "@orchestra/prompts";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CODEX_UNAVAILABLE_MESSAGE,
+  DIRECTORY_CONTENT_MARKER,
   runReview,
   type RunDeps,
 } from "../src/index.js";
@@ -12,6 +14,7 @@ import {
   createTestRepo,
   DECOY_TRANSCRIPT,
   FakeAdapter,
+  git,
   reviewTurn,
   startFakeToolsServer,
   type FakeToolsServer,
@@ -150,6 +153,74 @@ describe("prompt inputs (AC5)", () => {
     expect(result.code).toBe(0);
     expect(result.adapter.starts[0]!.prompt).toContain("No changes to tracked files.");
     expect(result.adapter.starts[0]!.prompt).toContain("## Untracked files\nNone.");
+  });
+
+  it("records a symlink's readlink target, never the linked file's content (F2)", async () => {
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "orchestra-outside-"));
+    const outsideFile = path.join(outsideDir, "secret.txt");
+    await fs.writeFile(outsideFile, "SENTINEL-OUTSIDE-CONTENT\n");
+    const linked = await createTestRepo({
+      extra: async (dir) => {
+        await fs.symlink(outsideFile, path.join(dir, "linked.txt"));
+      },
+    });
+    try {
+      const result = await run({ cwd: linked.dir });
+
+      const prompt = result.adapter.starts[0]!.prompt;
+      expect(prompt).not.toContain("SENTINEL-OUTSIDE-CONTENT");
+      expect(prompt).toContain("### linked.txt");
+      expect(prompt).toContain(outsideFile);
+    } finally {
+      await linked.cleanup();
+      await fs.rm(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("lists an untracked nested git repo as a directory, without reading it (F3)", async () => {
+    const repo2 = await createTestRepo({
+      extra: async (dir) => {
+        const nested = path.join(dir, "nested-repo");
+        await fs.mkdir(nested);
+        git(nested, "init", "-q", "-b", "main");
+      },
+    });
+    try {
+      const result = await run({ cwd: repo2.dir });
+
+      expect(result.code).not.toBe(3);
+      const prompt = result.adapter.starts[0]!.prompt;
+      expect(prompt).toContain(`### nested-repo\n\`\`\`\n${DIRECTORY_CONTENT_MARKER}\n\`\`\``);
+    } finally {
+      await repo2.cleanup();
+    }
+  });
+});
+
+describe("worktree root resolution (F4)", () => {
+  it("resolves context.json, the diff and the untracked listing against the worktree root when run from a subdirectory", async () => {
+    const result = await run({ cwd: path.join(repo.dir, "src") });
+
+    expect(result.code).toBe(1);
+    const prompt = result.adapter.starts[0]!.prompt;
+    expect(prompt).toContain("COMMITTED-CHANGE");
+    expect(prompt).toContain("UNCOMMITTED-EDIT");
+    expect(prompt).toContain("### src/new-file.ts");
+    expect(result.adapter.starts[0]!.cwd).toBe(repo.dir);
+  });
+
+  it("a cwd outside any git repository exits 3 with a clear message", async () => {
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "orchestra-non-repo-"));
+    try {
+      const result = await run({ cwd: outside });
+
+      expect(result.code).toBe(3);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(/git/);
+      expect(result.adapterCreated).toBe(false);
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
   });
 });
 

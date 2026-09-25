@@ -27,9 +27,12 @@ export class FakeAdapter implements AgentAdapter {
 
   constructor(
     private readonly script: AgentEvent[] | { throws: Error },
+    /** Invoked at the very top of `start()`, before anything else runs. */
+    private readonly onStart?: () => void,
   ) {}
 
   async *start(req: StartRequest): AsyncGenerator<AgentEvent> {
+    this.onStart?.();
     this.starts.push(req);
     if ("throws" in this.script) throw this.script.throws;
     for (const event of this.script) yield event;
@@ -241,7 +244,12 @@ export interface TestRepo {
  * transcript next to `context.json`.
  */
 export async function createTestRepo(
-  options: { withOriginRef?: boolean; context?: unknown } = {},
+  options: {
+    withOriginRef?: boolean;
+    context?: unknown;
+    /** Runs after the standard repo is committed, before `.orchestra/` is written. */
+    extra?: (dir: string) => Promise<void>;
+  } = {},
 ): Promise<TestRepo> {
   const dir = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), "orchestra-review-")),
@@ -276,6 +284,8 @@ export async function createTestRepo(
 
   await write("src/size.ts", "export const size = 2; // UNCOMMITTED-EDIT\n");
   await write("src/new-file.ts", "export const UNTRACKED_CONTENT = 1;\n");
+
+  if (options.extra) await options.extra(dir);
 
   await fs.appendFile(path.join(dir, ".git", "info", "exclude"), "\n.orchestra/\n");
   await write(

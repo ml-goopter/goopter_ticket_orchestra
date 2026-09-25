@@ -14,7 +14,7 @@ import {
 import { buildReviewPrompt, REVIEW_SYSTEM_PROMPT } from "@orchestra/prompts";
 import { parseRound } from "./args.js";
 import { ExitCode, ReviewError } from "./errors.js";
-import { collectChanges, runGit, type GitRunner } from "./git.js";
+import { collectChanges, resolveWorktreeRoot, runGit, type GitRunner } from "./git.js";
 import { parseReviewReply } from "./reply.js";
 import { createMcpReporter, type ReviewReporter } from "./reporter.js";
 
@@ -28,7 +28,12 @@ const UNKNOWN_MODEL = "unknown";
 export interface RunDeps {
   argv: readonly string[];
   env: Readonly<Record<string, string | undefined>>;
-  /** Worktree root. */
+  /**
+   * The invoking cwd, which may be a subdirectory of the worktree.
+   * Resolved to the worktree root via `git rev-parse --show-toplevel`
+   * before context.json, the diff, the untracked listing or the adapter
+   * cwd are derived from it.
+   */
   cwd: string;
   stdout: (text: string) => void | Promise<void>;
   stderr: (text: string) => void | Promise<void>;
@@ -66,14 +71,16 @@ export async function runReview(deps: RunDeps): Promise<number> {
     const url = requireEnv(deps.env, "ORCHESTRA_URL");
     const token = requireEnv(deps.env, "ORCHESTRA_TOKEN");
     const readFile = deps.readFile ?? ((file: string) => fs.readFile(file, "utf8"));
+    const git = deps.git ?? runGit;
+    const root = await resolveWorktreeRoot(deps.cwd, git);
 
-    const context = await readContext(deps.cwd, readFile);
+    const context = await readContext(root, readFile);
     if (context.runtime === "codex") {
       throw new ReviewError(CODEX_UNAVAILABLE_MESSAGE);
     }
 
-    const changes = await collectChanges(deps.cwd, context.repository.default_branch, {
-      git: deps.git ?? runGit,
+    const changes = await collectChanges(root, context.repository.default_branch, {
+      git,
       readFile,
     });
 
@@ -98,7 +105,7 @@ export async function runReview(deps: RunDeps): Promise<number> {
     });
 
     const request: StartRequest = {
-      cwd: deps.cwd,
+      cwd: root,
       systemPrompt: REVIEW_SYSTEM_PROMPT,
       prompt,
       allowedTools: "review",
