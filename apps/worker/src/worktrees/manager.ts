@@ -285,6 +285,14 @@ export class WorktreeManager {
    * Deletes `work/<executionId>` and prunes git's record of it. When
    * `options.branch` is set, also deletes that local branch unless another
    * worktree has it checked out.
+   *
+   * The directory deletion runs under the same per-repository lock as
+   * `prepareImplementation`'s fetch/prune/`releaseBranch` sequence. A
+   * concurrent prepare's `releaseBranch` lists worktrees and spawns git with
+   * cwd set to each listed worktree path (GOT.25 D5); deleting that
+   * directory out from under it while it is mid-sequence would make that
+   * spawn fail with `GitCommandError`. Serialising remove and prepare on one
+   * repository through `withRepoLock` closes that window.
    */
   async remove(
     executionId: string,
@@ -300,9 +308,8 @@ export class WorktreeManager {
       `${options.repositoryName}.git`,
     );
 
-    await fs.rm(worktreePath, { recursive: true, force: true });
-
     return withRepoLock(barePath, async () => {
+      await fs.rm(worktreePath, { recursive: true, force: true });
       if (!(await exists(barePath))) return { branchDeleted: false };
       await runGit(barePath, ["worktree", "prune"]);
       if (branch === null) return { branchDeleted: false };

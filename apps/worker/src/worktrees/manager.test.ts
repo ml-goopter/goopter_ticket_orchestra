@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EXECUTION_CONTEXT_PATH, ExecutionContextSchema } from "@orchestra/core";
 import {
   GitCommandError,
@@ -14,6 +14,7 @@ import {
   type PrepareImplementationInput,
   type WorktreeRepository,
 } from "./index.js";
+import * as runModule from "./run.js";
 
 /**
  * Real git against a local bare repository acting as the remote. No network.
@@ -587,5 +588,80 @@ describe("WorktreeManager.remove (design.md §6.6)", () => {
       manager.remove("exec-1", { repositoryName: repository.name, branch: BRANCH }),
     ).resolves.toEqual({ branchDeleted: true });
     expect(worktreeRecords()).not.toContain(result.worktreePath);
+  });
+
+  it("Y1: a concurrent remove's directory deletion does not fail prepareImplementation's releaseBranch", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const stale = await manager.prepareImplementation(implInput("exec-1"));
+    writeFileSyncIn(stale.worktreePath, "uncommitted.txt", "keep me");
+
+    // Simulates `remove()` racing `prepareImplementation`'s locked
+    // fetch/prune/releaseBranch sequence: real `fs.rm` on the stale
+    // worktree is deferred until `prepareImplementation`'s own `worktree
+    // prune` step (which still sees the intact directory) has completed,
+    // then finishes before `releaseBranch` lists worktrees and spawns git
+    // with the stale worktree's path as cwd.
+    const realRm = fs.rm.bind(fs);
+    const realRunGit = runModule.runGit;
+    // `gate` opens the first time `prepareImplementation`'s own `worktree
+    // prune` step is observed. `deleted`, once set by the (mocked) `fs.rm`
+    // call on the stale worktree, resolves only after the gate is open and
+    // the real deletion has finished, so the prune hook below can await it
+    // and guarantee the directory is gone before `releaseBranch` runs.
+    let openGate: () => void = () => {};
+    let gateOpen = false;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let deleted: Promise<void> | undefined;
+
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(((
+      target: Parameters<typeof fs.rm>[0],
+      opts: Parameters<typeof fs.rm>[1],
+    ) => {
+      if (target === stale.worktreePath && !deleted) {
+        deleted = gate.then(() => realRm(target, opts));
+        return deleted;
+      }
+      return realRm(target, opts);
+    }) as typeof fs.rm);
+
+    const runGitSpy = vi
+      .spyOn(runModule, "runGit")
+      .mockImplementation(async (cwd, args) => {
+        const result = await realRunGit(cwd, args);
+        if (
+          !gateOpen &&
+          cwd === bareClonePath() &&
+          args[0] === "worktree" &&
+          args[1] === "prune"
+        ) {
+          gateOpen = true;
+          openGate();
+          if (deleted) await deleted;
+        }
+        return result;
+      });
+
+    try {
+      // Dispatched first so it claims the repository lock first: under the
+      // fix, `remove`'s directory deletion cannot run until this prepare's
+      // whole locked sequence (including `releaseBranch`) has finished.
+      const preparePromise = manager.prepareImplementation(implInput("exec-2"));
+      const removePromise = manager
+        .remove("exec-1", { repositoryName: repository.name, branch: BRANCH })
+        .catch(() => undefined);
+
+      const fresh = await preparePromise;
+      await removePromise;
+
+      expect(git(fresh.worktreePath, "branch", "--show-current")).toBe(BRANCH);
+      expect(git(fresh.worktreePath, "rev-parse", "HEAD")).toBe(
+        remoteTip("main"),
+      );
+    } finally {
+      rmSpy.mockRestore();
+      runGitSpy.mockRestore();
+    }
   });
 });
