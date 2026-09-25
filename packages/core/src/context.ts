@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { RuntimeSchema } from "./enums.js";
 import { SpecContentSchema } from "./spec-content.js";
 
 /**
@@ -39,6 +40,11 @@ export const ExecutionContextSchema = z.object({
     /** Working branch, `agent/<KEY>-<short>`. */
     branch: z.string().min(1),
   }),
+  /**
+   * Runtime of the parent execution (`executions.runtime`). `orchestra-review`
+   * starts its review session through the same adapter (design.md §9.8).
+   */
+  runtime: RuntimeSchema,
   /**
    * Command the review role may run. Its source is open (design.md OI3), so
    * it is caller-supplied and `null` when unknown.

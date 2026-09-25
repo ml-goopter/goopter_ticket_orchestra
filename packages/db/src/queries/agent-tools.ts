@@ -1,5 +1,9 @@
 import { and, desc, eq, exists, inArray, sql } from "drizzle-orm";
-import { executions, taskLeases } from "../schema/executions.js";
+import {
+  executionUsage,
+  executions,
+  taskLeases,
+} from "../schema/executions.js";
 import { issues } from "../schema/issues.js";
 import { notifications } from "../schema/notifications.js";
 import { projects } from "../schema/projects.js";
@@ -177,6 +181,80 @@ export async function incrementExecutionReviewRounds(
     throw new Error(`execution not found: ${executionId}`);
   }
   return row.reviewRounds;
+}
+
+export type InsertExecutionUsageInput = typeof executionUsage.$inferInsert;
+
+/** Inserts one `execution_usage` row (design.md §4.2, §9.7 `report_usage`). */
+export async function insertExecutionUsage(
+  db: DbOrTx,
+  input: InsertExecutionUsageInput,
+): Promise<{ id: string }> {
+  const [row] = await db
+    .insert(executionUsage)
+    .values(input)
+    .returning({ id: executionUsage.id });
+  if (!row) throw new Error("insertExecutionUsage: insert returned no row");
+  return row;
+}
+
+export interface ExecutionUsageTotalsDelta {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  /** Decimal string, as `numeric` columns take it. */
+  costUsd: string;
+}
+
+/**
+ * Adds one usage row's tokens and cost to the execution's running totals
+ * (design.md §9.3 "add to execution totals"). In-place SQL increments, so
+ * two concurrent calls cannot lose one.
+ */
+export async function addExecutionUsageTotals(
+  db: DbOrTx,
+  executionId: string,
+  delta: ExecutionUsageTotalsDelta,
+): Promise<void> {
+  const [row] = await db
+    .update(executions)
+    .set({
+      inputTokens: sql`${executions.inputTokens} + ${delta.inputTokens}`,
+      cachedInputTokens: sql`${executions.cachedInputTokens} + ${delta.cachedInputTokens}`,
+      outputTokens: sql`${executions.outputTokens} + ${delta.outputTokens}`,
+      costUsd: sql`${executions.costUsd} + ${delta.costUsd}::numeric`,
+    })
+    .where(eq(executions.id, executionId))
+    .returning({ id: executions.id });
+  if (!row) throw new Error(`execution not found: ${executionId}`);
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Whether `usageId` names an `execution_usage` row of `executionId`, so
+ * `report_review_result` can refuse a usage id that is unknown or belongs
+ * to another execution. A value that is not a uuid is simply not found
+ * rather than a Postgres cast error.
+ */
+export async function executionUsageBelongsTo(
+  db: DbOrTx,
+  usageId: string,
+  executionId: string,
+): Promise<boolean> {
+  if (!UUID_PATTERN.test(usageId)) return false;
+  const [row] = await db
+    .select({ id: executionUsage.id })
+    .from(executionUsage)
+    .where(
+      and(
+        eq(executionUsage.id, usageId),
+        eq(executionUsage.executionId, executionId),
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
 }
 
 export type InsertIssueInput = typeof issues.$inferInsert;

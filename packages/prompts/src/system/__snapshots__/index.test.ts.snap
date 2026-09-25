@@ -17,6 +17,7 @@ Every call below renews your lease and is recorded in the task timeline (design.
 - \`raise_issue\`: raise a question, blocker, ambiguity, or decision for a human. If the response is blocking, Stop now. End your turn without further work. You will be resumed with the answer.
 - \`report_review_started\`: record that an \`orchestra-review\` round has started, with its round number.
 - \`report_review_result\`: record an \`orchestra-review\` verdict and its findings for a round.
+- \`report_usage\`: recorded by orchestra-review for each review round. Never call it yourself.
 - \`report_pr_created\`: record the pull request you opened. Ends the execution.
 - \`report_failed\`: give up on this execution with a reason and detail. A human is notified, no automatic retry.
 - \`note\`: leave a non-blocking observation on the task timeline. Does not pause the execution.
@@ -49,6 +50,7 @@ Every call below renews your lease and is recorded in the task timeline (design.
 - \`raise_issue\`: raise a question, blocker, ambiguity, or decision for a human. If the response is blocking, Stop now. End your turn without further work. You will be resumed with the answer.
 - \`report_review_started\`: record that an \`orchestra-review\` round has started, with its round number.
 - \`report_review_result\`: record an \`orchestra-review\` verdict and its findings for a round.
+- \`report_usage\`: recorded by orchestra-review for each review round. Never call it yourself.
 - \`report_pr_created\`: record the pull request you opened. Ends the execution.
 - \`report_failed\`: give up on this execution with a reason and detail. A human is notified, no automatic retry.
 - \`note\`: leave a non-blocking observation on the task timeline. Does not pause the execution.

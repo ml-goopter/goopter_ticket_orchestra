@@ -114,6 +114,7 @@ function implInput(
       },
     ],
     reviewCommand: "pnpm test",
+    runtime: "claude",
     ...overrides,
   };
 }
@@ -446,6 +447,7 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
         default_branch: "main",
         branch: BRANCH,
       },
+      runtime: "claude",
       review_command: "pnpm test",
     });
 
@@ -455,6 +457,22 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
       "utf8",
     );
     expect(exclude.split("\n").filter((l) => l === ".orchestra/")).toHaveLength(1);
+  });
+
+  it("writes the execution's runtime into context.json", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const result = await manager.prepareImplementation(
+      implInput("exec-1", { runtime: "codex" }),
+    );
+    const context = ExecutionContextSchema.parse(
+      JSON.parse(
+        await fs.readFile(
+          path.join(result.worktreePath, EXECUTION_CONTEXT_PATH),
+          "utf8",
+        ),
+      ),
+    );
+    expect(context.runtime).toBe("codex");
   });
 
   it("A8: writes review_command null when the caller supplies none", async () => {

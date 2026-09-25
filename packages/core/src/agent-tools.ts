@@ -1,5 +1,10 @@
 import { z } from "zod";
-import { IssueTypeSchema, ReviewVerdictSchema, SeveritySchema } from "./enums.js";
+import {
+  IssueTypeSchema,
+  ReviewVerdictSchema,
+  SeveritySchema,
+  UsageKindSchema,
+} from "./enums.js";
 import { SpecContentSchema } from "./spec-content.js";
 
 /**
@@ -21,7 +26,8 @@ const OptionSchema = z.object({
   tradeoff: z.string(),
 });
 
-const FindingSchema = z.object({
+/** One review finding (design.md §8 `report_review_result`, §9.8). */
+export const FindingSchema = z.object({
   severity: SeveritySchema,
   file: z.string().optional(),
   line: z.number().int().nonnegative().optional(),
@@ -68,6 +74,8 @@ export const ReportReviewResultInputSchema = z.object({
   round: z.number().int().positive(),
   verdict: ReviewVerdictSchema,
   findings: z.array(FindingSchema),
+  /** `report_usage` result for this round's review session (design.md §9.7). */
+  usage_id: z.string().optional(),
 });
 export type ReportReviewResultInput = z.infer<
   typeof ReportReviewResultInputSchema
@@ -80,6 +88,38 @@ export const ReportReviewResultOutputSchema = z.object({
 export type ReportReviewResultOutput = z.infer<
   typeof ReportReviewResultOutputSchema
 >;
+
+/**
+ * The JSON document a review session replies with and `orchestra-review`
+ * prints to stdout (design.md §9.8).
+ */
+export const ReviewFindingsDocumentSchema = z.object({
+  verdict: ReviewVerdictSchema,
+  findings: z.array(FindingSchema),
+});
+export type ReviewFindingsDocument = z.infer<
+  typeof ReviewFindingsDocumentSchema
+>;
+
+// report_usage — roles: implementation (design.md §9.7: `orchestra-review`
+// runs report their own usage with `kind = review`)
+const TokenCountSchema = z.number().int().nonnegative();
+
+export const ReportUsageInputSchema = z.object({
+  kind: UsageKindSchema,
+  round: z.number().int().positive().optional(),
+  model: z.string(),
+  input_tokens: TokenCountSchema,
+  cached_input_tokens: TokenCountSchema,
+  output_tokens: TokenCountSchema,
+  cost_usd: z.number().nonnegative(),
+});
+export type ReportUsageInput = z.infer<typeof ReportUsageInputSchema>;
+
+export const ReportUsageOutputSchema = z.object({
+  usage_id: z.string(),
+});
+export type ReportUsageOutput = z.infer<typeof ReportUsageOutputSchema>;
 
 // report_pr_created — roles: implementation
 export const ReportPrCreatedInputSchema = z.object({
@@ -131,7 +171,8 @@ export type NoteOutput = z.infer<typeof NoteOutputSchema>;
 
 /**
  * Registry of every agent-tools MCP tool, its allowed roles (design.md §8
- * "roles" column), and its input/output zod schemas.
+ * "roles" column), and its input/output zod schemas. `report_usage` is not
+ * in the §8 table; §9.7 has `orchestra-review` record its own usage.
  */
 export const agentTools = {
   raise_issue: {
@@ -148,6 +189,11 @@ export const agentTools = {
     roles: ["implementation"],
     input: ReportReviewResultInputSchema,
     output: ReportReviewResultOutputSchema,
+  },
+  report_usage: {
+    roles: ["implementation"],
+    input: ReportUsageInputSchema,
+    output: ReportUsageOutputSchema,
   },
   report_pr_created: {
     roles: ["implementation"],

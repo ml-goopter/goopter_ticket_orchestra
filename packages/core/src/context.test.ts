@@ -41,6 +41,7 @@ const VALID: ExecutionContext = {
     default_branch: "main",
     branch: "agent/GOOP-421-0b7c2f4e",
   },
+  runtime: "claude",
   review_command: null,
 };
 
@@ -65,6 +66,21 @@ describe("ExecutionContextSchema (design.md §9.1 step 4, §9.8)", () => {
     const { review_command, ...rest } = VALID;
     void review_command;
     expect(ExecutionContextSchema.safeParse(rest).success).toBe(false);
+  });
+
+  it("rejects a missing runtime (the wrapper picks its adapter by it)", () => {
+    const { runtime, ...rest } = VALID;
+    void runtime;
+    expect(ExecutionContextSchema.safeParse(rest).success).toBe(false);
+  });
+
+  it("accepts codex and rejects an unknown runtime", () => {
+    expect(
+      ExecutionContextSchema.parse({ ...VALID, runtime: "codex" }).runtime,
+    ).toBe("codex");
+    expect(
+      ExecutionContextSchema.safeParse({ ...VALID, runtime: "gemini" }).success,
+    ).toBe(false);
   });
 
   it("rejects a missing working branch", () => {

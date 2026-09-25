@@ -5,11 +5,18 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "orchestra-review": "./bin/orchestra-review.js"
+  },
   "scripts": {
     "build": "tsc -b",
     "test": "vitest run"
   },
   "dependencies": {
-    "@orchestra/core": "workspace:*"
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "@orchestra/adapters": "workspace:*",
+    "@orchestra/core": "workspace:*",
+    "@orchestra/prompts": "workspace:*",
+    "zod": "^4.6.5"
   }
 }
