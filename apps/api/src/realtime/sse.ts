@@ -63,9 +63,16 @@ export function endStreamImmediately(res: ServerResponse): void {
  * `Last-Event-ID`. `write` reports backpressure and `waitForDrain`
  * resolves once the client catches up (or the connection closes).
  */
+/** A frame larger than the cap, admitted on an idle connection and not yet flushed. */
+interface OversizedFrame {
+  /** Its unsent bytes (with any transfer framing) right after it was written. */
+  bytes: number;
+}
+
 export class SseConnection {
   private closed = false;
   private needDrain = false;
+  private oversized: OversizedFrame | undefined;
   private readonly keepalive: NodeJS.Timeout | undefined;
   private readonly closeCallbacks: Array<() => void> = [];
   private readonly drainWaiters = new Set<() => void>();
@@ -93,26 +100,43 @@ export class SseConnection {
     return this.closed;
   }
 
+  /** True while any output, including an exempt oversized frame, is unsent. */
+  get hasUnsentOutput(): boolean {
+    return this.res.writableLength > 0;
+  }
+
   /**
    * Returns false when the caller should `waitForDrain` before writing more.
    * A chunk written while nothing else is unsent always stays, even one
    * larger than the cap, so a single large frame cannot loop the client
-   * through reconnects.
+   * through reconnects. Until such a frame is flushed its bytes are not
+   * counted against the cap, so a keepalive or event written behind it is
+   * not dropped on its account.
    */
   write(chunk: string): boolean {
     if (this.closed) return false;
     const idle = this.res.writableLength === 0;
+    if (idle) this.oversized = undefined;
+    if (idle && Buffer.byteLength(chunk) > this.maxBufferedBytes) {
+      const frame = { bytes: 0 };
+      this.oversized = frame;
+      if (!this.res.write(chunk, () => this.releaseOversized(frame))) {
+        this.needDrain = true;
+      }
+      if (this.oversized === frame) frame.bytes = this.res.writableLength;
+      return !this.needDrain;
+    }
     if (!this.res.write(chunk)) this.needDrain = true;
-    if (!idle && this.res.writableLength > this.maxBufferedBytes) {
+    if (!idle && this.countedBytes() > this.maxBufferedBytes) {
       this.drop();
       return false;
     }
     return !this.needDrain;
   }
 
-  /** True when `pendingBytes` held outside the response, added to its unsent output, exceed the cap. */
+  /** True when `pendingBytes` held outside the response, added to its counted unsent output, exceed the cap. */
   exceedsCap(pendingBytes: number): boolean {
-    return this.res.writableLength + pendingBytes > this.maxBufferedBytes;
+    return this.countedBytes() + pendingBytes > this.maxBufferedBytes;
   }
 
   /** Destroys the connection; the client resumes with `Last-Event-ID`. */
@@ -141,6 +165,16 @@ export class SseConnection {
     if (this.closed) return;
     this.res.end();
     this.handleClose();
+  }
+
+  /** Unsent output counted against the cap: all of it except an in-flight oversized frame. */
+  private countedBytes(): number {
+    const exempt = this.oversized?.bytes ?? 0;
+    return Math.max(0, this.res.writableLength - exempt);
+  }
+
+  private releaseOversized(frame: OversizedFrame): void {
+    if (this.oversized === frame) this.oversized = undefined;
   }
 
   private releaseDrainWaiters(): void {

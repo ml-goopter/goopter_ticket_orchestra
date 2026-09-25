@@ -63,14 +63,18 @@ export class TaskStream {
    * Live events buffered during a sync count toward the connection's
    * output cap. Past it the connection is dropped and the client resumes
    * with Last-Event-ID, so a client stalled in its backlog cannot grow
-   * the buffer without bound.
+   * the buffer without bound. One event larger than the cap is still
+   * buffered when nothing else is buffered or unsent: a cursor-less
+   * stream that has sent nothing would otherwise reconnect without
+   * Last-Event-ID and re-anchor past it.
    */
   push(event: StreamEvent): void {
     const { sse } = this.options;
     if (sse.isClosed) return;
     if (this.syncing) {
       const bytes = Buffer.byteLength(event.frame);
-      if (sse.exceedsCap(this.bufferedBytes + bytes)) {
+      const alone = this.buffer.length === 0 && !sse.hasUnsentOutput;
+      if (!alone && sse.exceedsCap(this.bufferedBytes + bytes)) {
         this.clearBuffer();
         sse.drop();
         return;

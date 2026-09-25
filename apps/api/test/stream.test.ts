@@ -858,25 +858,146 @@ describe("auth, validation and cleanup (T7)", () => {
       sse.end();
     }
   });
+
+  it("F1: an oversized frame followed by a keepalive and a normal event is fully delivered", async () => {
+    const res = new FakeResponse();
+    const sse = new SseConnection(res.asServerResponse(), 20, 100);
+    const big = fakeEvent(1, 150);
+    const normal = fakeEvent(2, 20);
+    try {
+      expect(sse.write(big.frame)).toBe(false);
+      await waitFor(() => res.chunks.includes(": keepalive\n\n"));
+      expect(sse.isClosed).toBe(false);
+      expect(sse.exceedsCap(normal.frame.length)).toBe(false);
+      sse.write(normal.frame);
+      expect(sse.isClosed).toBe(false);
+
+      res.flush();
+      await sse.waitForDrain();
+      expect(sse.isClosed).toBe(false);
+      expect(res.destroyed).toBe(false);
+      expect(eventChunks(res)).toEqual([big.frame, normal.frame]);
+    } finally {
+      sse.end();
+    }
+  });
+
+  it("F1: a live event buffered behind an in-flight oversized backlog frame does not drop the stream", async () => {
+    const res = new FakeResponse();
+    const sse = new SseConnection(res.asServerResponse(), 20, 100);
+    const big = fakeEvent(1, 150);
+    const normal = fakeEvent(2, 20);
+    const stream = new TaskStream({
+      sse,
+      cursor: 0,
+      anchor: () => Promise.resolve(0),
+      backlog: () => Promise.resolve({ events: [big], full: false }),
+      onError: () => {},
+    });
+    try {
+      stream.start();
+      await waitFor(() => res.chunks.includes(": keepalive\n\n"));
+      stream.push(normal);
+      expect(sse.isClosed).toBe(false);
+
+      res.flush();
+      await waitFor(() => eventChunks(res).length === 2 || sse.isClosed);
+      expect(sse.isClosed).toBe(false);
+      expect(res.destroyed).toBe(false);
+      expect(eventChunks(res)).toEqual([big.frame, normal.frame]);
+    } finally {
+      sse.end();
+    }
+  });
+
+  it("F1/Y2: normal frames queued behind an in-flight oversized frame still drop the connection past the cap", () => {
+    const res = new FakeResponse();
+    const sse = new SseConnection(res.asServerResponse(), 60_000, 100);
+    try {
+      sse.write("x".repeat(150));
+      sse.write("x".repeat(60));
+      expect(sse.isClosed).toBe(false);
+      sse.write("x".repeat(60));
+      expect(sse.isClosed).toBe(true);
+      expect(res.destroyed).toBe(true);
+    } finally {
+      sse.end();
+    }
+  });
+
+  it("F2: a cursor-less stream that has sent nothing delivers an oversized event received while anchoring", async () => {
+    const res = new FakeResponse();
+    const sse = new SseConnection(res.asServerResponse(), 60_000, 100);
+    let resolveAnchor!: (id: number) => void;
+    const anchor = new Promise<number>((resolve) => (resolveAnchor = resolve));
+    const big = fakeEvent(5, 150);
+    const stream = new TaskStream({
+      sse,
+      cursor: undefined,
+      anchor: () => anchor,
+      backlog: () => Promise.resolve({ events: [], full: false }),
+      onError: () => {},
+    });
+    try {
+      stream.start();
+      stream.push(big);
+      expect(sse.isClosed).toBe(false);
+
+      resolveAnchor(4);
+      await waitFor(() => eventChunks(res).length === 1 || sse.isClosed);
+      expect(sse.isClosed).toBe(false);
+      expect(res.destroyed).toBe(false);
+      expect(eventChunks(res)).toEqual([big.frame]);
+    } finally {
+      sse.end();
+    }
+  });
 });
 
+/** A task event whose frame is exactly `size` bytes of ASCII. */
+function fakeEvent(id: number, size: number): StreamEvent {
+  const head = `id: ${id}\ndata: `;
+  const pad = size - head.length - 2;
+  return {
+    id,
+    taskId: "t",
+    type: "agent.message",
+    frame: `${head}${"x".repeat(pad)}\n\n`,
+  };
+}
+
+/** Everything written to `res` except keepalive comments. */
+function eventChunks(res: FakeResponse): string[] {
+  return res.chunks.filter((chunk) => !chunk.startsWith(":"));
+}
+
 /**
- * A `ServerResponse` whose client never reads: every write stays buffered
- * in `writableLength`.
+ * A `ServerResponse` whose client never reads until `flush()`: every write
+ * stays buffered in `writableLength`.
  */
 class FakeResponse extends EventEmitter {
   writableLength = 0;
   written = 0;
   destroyed = false;
   writableEnded = false;
+  readonly chunks: string[] = [];
+  private readonly flushCallbacks: Array<() => void> = [];
   writeHead(): this {
     return this;
   }
   flushHeaders(): void {}
-  write(chunk: string): boolean {
+  write(chunk: string, callback?: () => void): boolean {
     this.writableLength += chunk.length;
     this.written += chunk.length;
+    this.chunks.push(chunk);
+    if (callback) this.flushCallbacks.push(callback);
     return this.writableLength < 16;
+  }
+  /** The client takes everything unsent: write callbacks run, then `drain`. */
+  flush(): void {
+    this.writableLength = 0;
+    for (const callback of this.flushCallbacks.splice(0)) callback();
+    this.emit("drain");
   }
   end(): this {
     this.writableEnded = true;
