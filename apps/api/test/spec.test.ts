@@ -1,5 +1,6 @@
 import type { SpecContent } from "@orchestra/core";
 import {
+  executionCommands,
   listDependencies,
   lockDependencyGraph,
   lockTaskForPromotion,
@@ -407,6 +408,58 @@ describe("POST /api/tasks/:id/spec/request-review and send-back (P4)", () => {
       expect(await auditTriggers(specExec)).toEqual(execAuditsBefore);
     },
   );
+
+  async function seedStartCommand(
+    taskId: string,
+    claimedAt: Date | null,
+    completedAt: Date | null,
+  ): Promise<void> {
+    await h.db.insert(executionCommands).values({
+      taskId,
+      executionId: null,
+      type: "start_spec_session",
+      payload: {},
+      createdBy: fx.userId,
+      claimedAt,
+      completedAt,
+    });
+  }
+
+  async function commandTimes(taskId: string) {
+    return h.sql<{ claimed_at: Date | null; completed_at: Date | null }[]>`
+      select claimed_at, completed_at from execution_commands where task_id = ${taskId} order by created_at, id`;
+  }
+
+  it.each([
+    ["unclaimed", null],
+    ["claimed but not completed", new Date("2026-01-01T00:00:00Z")],
+  ] as const)(
+    "returns 409 SPEC_SESSION_BUSY with a %s start_spec_session command and writes nothing",
+    async (_label, claimedAt) => {
+      const { id } = await newTask("SPEC_IN_PROGRESS");
+      await seedRevision(id, 1, "draft", content());
+      await seedStartCommand(id, claimedAt, null);
+      const before = await snapshot(id);
+      const timesBefore = await commandTimes(id);
+
+      const res = await post(`/api/tasks/${id}/spec/request-review`);
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error.code).toBe("SPEC_SESSION_BUSY");
+      expect(await snapshot(id)).toEqual(before);
+      expect(await commandTimes(id)).toEqual(timesBefore);
+    },
+  );
+
+  it("moves to SPEC_REVIEW when the start_spec_session command has completed", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    await seedRevision(id, 1, "draft", content());
+    const at = new Date("2026-01-01T00:00:00Z");
+    await seedStartCommand(id, at, at);
+    const res = await post(`/api/tasks/${id}/spec/request-review`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ from: "SPEC_IN_PROGRESS", to: "SPEC_REVIEW" });
+    expect((await taskRow(id)).state).toBe("SPEC_REVIEW");
+  });
 
   it("returns 409 NO_DRAFT without a draft and writes nothing", async () => {
     const { id } = await newTask("SPEC_IN_PROGRESS");

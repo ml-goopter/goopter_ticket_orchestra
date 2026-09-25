@@ -13,6 +13,7 @@ import {
   approveRevision,
   findProjectRepositoryByName,
   getRevisionByStatus,
+  hasPendingSpecSessionStart,
   insertDraftRevision,
   insertExecutionCommand,
   listDependencies,
@@ -251,6 +252,17 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
       return await app.db.transaction(async (tx) => {
         await lockTask(tx, id, "spec.review_requested");
         requireDraft(await getRevisionByStatus(tx, id, "draft"));
+        // A start_spec_session command not yet completed means a spec agent is
+        // about to start and could overwrite the draft under review. Checked
+        // before the execution read: once the command reads as completed, the
+        // execution it created is visible to the next statement.
+        if (await hasPendingSpecSessionStart(tx, id)) {
+          throw new AppError(
+            409,
+            "SPEC_SESSION_BUSY",
+            "The spec session is still starting. Review can be requested once it is running or has ended.",
+          );
+        }
         // Only a RUNNING spec execution can be completed here (§5.2). Any other
         // live one would survive approval and keep the scheduler from ever
         // promoting or claiming the task, so refuse before any write.

@@ -4,7 +4,7 @@ import type {
   Runtime,
   TaskState,
 } from "@orchestra/core";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { executionCommands, executions } from "../schema/executions.js";
 import { repositories } from "../schema/projects.js";
 import {
@@ -78,6 +78,29 @@ export async function lockTaskExecutionIds(
     .orderBy(asc(executions.createdAt), asc(executions.id))
     .for("update");
   return rows.map((row) => row.id);
+}
+
+/**
+ * True when the task has a `start_spec_session` command that has not
+ * completed, claimed or not: the spec session is still starting and has no
+ * execution row yet. Call with the task row already locked.
+ */
+export async function hasPendingSpecSessionStart(
+  tx: Tx,
+  taskId: string,
+): Promise<boolean> {
+  const [row] = await tx
+    .select({ id: executionCommands.id })
+    .from(executionCommands)
+    .where(
+      and(
+        eq(executionCommands.taskId, taskId),
+        eq(executionCommands.type, "start_spec_session"),
+        isNull(executionCommands.completedAt),
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
 }
 
 export interface SpecRevisionRow {
