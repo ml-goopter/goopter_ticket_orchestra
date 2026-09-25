@@ -268,7 +268,7 @@ export async function insertQueuedExecution(
   return row;
 }
 
-export interface InsertTaskLeaseInput {
+export interface ReplaceTaskLeaseInput {
   taskId: string;
   executionId: string;
   workerId: string;
@@ -276,16 +276,32 @@ export interface InsertTaskLeaseInput {
   expiresAt: Date;
 }
 
-/** Inserts the task's lease (§4.2 `task_leases`, one per task). */
-export async function insertTaskLease(
+/**
+ * Writes the task's lease (§4.2 `task_leases`, one per task), overwriting
+ * any row the task already has. Leases are not deleted when an execution
+ * ends, so a task that returns to `READY` still carries its ended
+ * execution's lease; a `READY` task has no live execution, so that row is
+ * stale. Call only with the task row already locked, so the lease row is
+ * locked after it (task-then-execution lock order).
+ */
+export async function replaceTaskLease(
   tx: Tx,
-  input: InsertTaskLeaseInput,
+  input: ReplaceTaskLeaseInput,
 ): Promise<{ id: string }> {
   const [row] = await tx
     .insert(taskLeases)
     .values(input)
+    .onConflictDoUpdate({
+      target: taskLeases.taskId,
+      set: {
+        executionId: input.executionId,
+        workerId: input.workerId,
+        acquiredAt: input.acquiredAt,
+        expiresAt: input.expiresAt,
+      },
+    })
     .returning({ id: taskLeases.id });
-  if (!row) throw new Error("insertTaskLease: insert returned no row");
+  if (!row) throw new Error("replaceTaskLease: upsert returned no row");
   return row;
 }
 

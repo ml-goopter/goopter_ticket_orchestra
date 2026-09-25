@@ -649,6 +649,114 @@ describe("claim (design.md §6.3, §7.3)", () => {
     expect(created!.attempt).toBe(3);
   });
 
+  describe("a task back in READY with a leftover lease (S11, S12)", () => {
+    const LATER = new Date(NOW.getTime() + 60 * 60 * 1000);
+
+    /**
+     * Claims the task for real, then ends that execution in FAILED and puts
+     * the task back to READY (as NEEDS_HUMAN -> READY on human.retry does),
+     * leaving the first claim's lease row in place.
+     */
+    async function claimThenFail(workerId: string, task: string) {
+      const first = await runClaim(workerId);
+      expect(first?.taskId).toBe(task);
+      await raw("update executions set state = 'FAILED' where id = $1", [
+        first!.executionId,
+      ]);
+      await raw("update tasks set state = 'READY' where id = $1", [task]);
+      const leftover = await leasesFor(task);
+      expect(leftover).toHaveLength(1);
+      expect(leftover[0]!.executionId).toBe(first!.executionId);
+      return first!;
+    }
+
+    it("claims the task and replaces the old lease with one for the new execution (S11)", async () => {
+      const worker = await seedWorker();
+      const repo = await seedRepo();
+      const task = await seedTask({ state: "READY", repositoryId: repo });
+      const first = await claimThenFail(worker.id, task);
+
+      const claim = await claimNextTask({
+        db,
+        workerId: worker.id,
+        runtimes: ["claude"],
+        now: LATER,
+      });
+
+      expect(claim?.taskId).toBe(task);
+      expect(claim!.executionId).not.toBe(first.executionId);
+      expect(await taskState(task)).toBe("IMPLEMENTING");
+
+      const leases = await leasesFor(task);
+      expect(leases).toHaveLength(1);
+      expect(leases[0]).toMatchObject({
+        executionId: claim!.executionId,
+        workerId: worker.id,
+      });
+      expect(leases[0]!.acquiredAt.getTime()).toBe(LATER.getTime());
+      expect(leases[0]!.expiresAt.getTime()).toBe(
+        LATER.getTime() + 5 * 60 * 1000,
+      );
+
+      const all = await executionsFor(task);
+      const previous = all.find((e) => e.id === first.executionId)!;
+      const created = all.find((e) => e.id === claim!.executionId)!;
+      expect(created.state).toBe("ASSIGNED");
+      expect(created.attempt).toBe(previous.attempt + 1);
+    });
+
+    it("replaces a lease another worker held and still claims the next task on the following tick (S12)", async () => {
+      const previousHolder = await seedWorker({ maxConcurrent: 5 });
+      const worker = await seedWorker({ maxConcurrent: 5 });
+      const repo = await seedRepo({ maxWorktrees: 5 });
+      const retried = await seedTask({ state: "READY", repositoryId: repo, priority: 1 });
+      await claimThenFail(previousHolder.id, retried);
+      const lower = await seedTask({ state: "READY", repositoryId: repo, priority: 2 });
+      const { calls, onClaimed } = recorder();
+      const phase = createClaimPhase({ runtimes: ["claude"], onClaimed });
+
+      await phase.run(ctx(worker.id, LATER));
+      await phase.run(ctx(worker.id, LATER));
+
+      expect(calls.map((c) => c.taskId)).toEqual([retried, lower]);
+      expect(await taskState(retried)).toBe("IMPLEMENTING");
+      expect(await taskState(lower)).toBe("IMPLEMENTING");
+      const retriedLeases = await leasesFor(retried);
+      expect(retriedLeases).toHaveLength(1);
+      expect(retriedLeases[0]).toMatchObject({
+        executionId: calls[0]!.executionId,
+        workerId: worker.id,
+      });
+      expect(await leasesFor(lower)).toMatchObject([
+        { executionId: calls[1]!.executionId, workerId: worker.id },
+      ]);
+    });
+
+    it("keeps the old lease row untouched when a later claim step fails (S7)", async () => {
+      const worker = await seedWorker();
+      const repo = await seedRepo();
+      const task = await seedTask({ state: "READY", repositoryId: repo });
+      await claimThenFail(worker.id, task);
+      const leaseBefore = await leasesFor(task);
+      const before = await writeSnapshot();
+
+      await withFailingTrigger(
+        "tasks",
+        "before update",
+        "new.state = 'IMPLEMENTING'",
+        async () => {
+          await expect(
+            claimNextTask({ db, workerId: worker.id, runtimes: ["claude"], now: LATER }),
+          ).rejects.toThrow();
+        },
+      );
+
+      expect(await writeSnapshot()).toEqual(before);
+      expect(await leasesFor(task)).toEqual(leaseBefore);
+      expect(await taskState(task)).toBe("READY");
+    });
+  });
+
   describe("rolls back every write when a step fails (S7)", () => {
     const steps: Array<[string, string, string, string]> = [
       ["execution insert", "executions", "before insert", "new.state = 'QUEUED'"],

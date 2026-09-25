@@ -3,9 +3,9 @@ import {
   countSlotHoldingExecutions,
   getClaimWorker,
   insertQueuedExecution,
-  insertTaskLease,
   listReadyTasksWithUndetectedRuntime,
   nextExecutionAttempt,
+  replaceTaskLease,
   selectClaimCandidate,
   transition,
   type Db,
@@ -38,10 +38,10 @@ export interface ClaimOptions {
 /**
  * design.md §6.3: in one transaction, check this worker has a free slot,
  * lock the most urgent eligible `READY` task, insert its implementation
- * execution (`QUEUED`, then `ASSIGNED` through `transition()`), insert the
- * lease, and move the task `READY -> IMPLEMENTING` (`task.claimed`). Any
- * failure rolls every one of those back. Returns null when there is no free
- * slot or no eligible task.
+ * execution (`QUEUED`, then `ASSIGNED` through `transition()`), write the
+ * lease (replacing an ended execution's leftover row), and move the task
+ * `READY -> IMPLEMENTING` (`task.claimed`). Any failure rolls every one of
+ * those back. Returns null when there is no free slot or no eligible task.
  *
  * Lock order: the candidate query locks the task row first; the execution
  * row is created and locked after it.
@@ -92,7 +92,9 @@ export async function claimNextTask(
       actor,
     });
 
-    await insertTaskLease(tx, {
+    // Replaces a leftover lease from the task's ended execution, if any: a
+    // READY task has no live execution, and the task row is locked above.
+    await replaceTaskLease(tx, {
       taskId: candidate.taskId,
       executionId,
       workerId,
