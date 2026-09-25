@@ -163,6 +163,36 @@ describe("createTickLoop (design.md §6)", () => {
     expect(calls).toBe(2);
   });
 
+  it("survives an onError that throws: the next phase and the next tick still run", async () => {
+    const ran: string[] = [];
+    let onErrorCalls = 0;
+    const { loop } = build(
+      [
+        {
+          name: "explodes",
+          run: async (ctx) => {
+            ran.push(`explodes@${ctx.tick}`);
+            throw new Error("phase exploded");
+          },
+        },
+        { name: "after", run: async (ctx) => void ran.push(`after@${ctx.tick}`) },
+      ],
+      {
+        onError: () => {
+          onErrorCalls += 1;
+          throw new Error("onError exploded");
+        },
+      },
+    );
+
+    await expect(loop.runOnce()).resolves.toBeUndefined();
+    await expect(loop.runOnce()).resolves.toBeUndefined();
+
+    expect(onErrorCalls).toBe(2);
+    expect(ran).toEqual(["explodes@1", "after@1", "explodes@2", "after@2"]);
+    expect(loop.tick).toBe(2);
+  });
+
   it("survives a phase that throws with no onError registered", async () => {
     const { loop } = build([
       { name: "explodes", run: async () => { throw new Error("nope"); } },

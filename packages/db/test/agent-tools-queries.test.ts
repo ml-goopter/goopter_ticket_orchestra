@@ -1,5 +1,12 @@
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+} from "vitest";
 import * as schema from "../src/schema/index.js";
 import {
   findExecutionByTokenHash,
@@ -10,6 +17,7 @@ import {
   insertPullRequest,
   insertReviewResult,
   lockExecutionForTool,
+  lockTaskForTool,
   renewTaskLease,
   setExecutionToolsTokenHash,
   upsertDraftSpecificationRevision,
@@ -83,6 +91,51 @@ describe("tools token hash (design.md §8)", () => {
   it("never resolves the empty string, so a blank column can not authenticate", async () => {
     expect(await findExecutionByTokenHash(h.db, "")).toBeNull();
   });
+
+  it("has a partial unique index on tools_token_hash where it is not null", async () => {
+    const rows = await h.sql<{ indexdef: string }[]>`
+      select indexdef from pg_indexes
+      where tablename = 'executions'
+        and indexname = 'executions_tools_token_hash_key'
+    `;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.indexdef).toMatch(/CREATE UNIQUE INDEX/);
+    expect(rows[0]!.indexdef).toMatch(/\(tools_token_hash\)/);
+    expect(rows[0]!.indexdef).toMatch(/WHERE \(tools_token_hash IS NOT NULL\)/);
+  });
+
+  it("rejects a second execution holding the same token hash, allows many nulls", async () => {
+    const taskId = await seedTask(h.db, fx, {
+      jiraKey: nextKey(),
+      state: "IMPLEMENTING",
+    });
+    const first = await seedExecution(h.db, taskId, { state: "RUNNING" });
+    const second = await seedExecution(h.db, taskId, {
+      state: "RUNNING",
+      attempt: 2,
+    });
+    const third = await seedExecution(h.db, taskId, {
+      state: "QUEUED",
+      attempt: 3,
+    });
+
+    await setExecutionToolsTokenHash(h.db, first, "duplicatehash");
+    const err = await setExecutionToolsTokenHash(
+      h.db,
+      second,
+      "duplicatehash",
+    ).then(
+      () => undefined,
+      (e: unknown) => e as { code?: string; cause?: { code?: string } },
+    );
+    expect(err).toBeDefined();
+    // drizzle wraps driver errors; the Postgres code sits on `cause`.
+    expect(err!.code ?? err!.cause?.code).toBe("23505");
+
+    await setExecutionToolsTokenHash(h.db, first, null);
+    await setExecutionToolsTokenHash(h.db, second, null);
+    await setExecutionToolsTokenHash(h.db, third, null);
+  });
 });
 
 describe("lockExecutionForTool (design.md §8)", () => {
@@ -138,6 +191,69 @@ describe("lockExecutionForTool (design.md §8)", () => {
   });
 });
 
+describe("lock helpers with key share (design.md §8)", () => {
+  // Held in "key share": a plain column update still proceeds, while a
+  // `SELECT ... FOR UPDATE` (what `transition()` takes) waits for the holder.
+  for (const table of ["tasks", "executions"] as const) {
+    it(`${table}: key share lets a non-key update through and blocks FOR UPDATE`, async () => {
+      const taskId = await seedTask(h.db, fx, {
+        jiraKey: nextKey(),
+        state: "IMPLEMENTING",
+      });
+      const executionId = await seedExecution(h.db, taskId, { state: "RUNNING" });
+      const id = table === "tasks" ? taskId : executionId;
+
+      let release!: () => void;
+      const released = new Promise<void>((r) => (release = r));
+      let locked!: () => void;
+      const lockTaken = new Promise<void>((r) => (locked = r));
+
+      const holder = h.db.transaction(async (tx) => {
+        if (table === "tasks") {
+          expect(await lockTaskForTool(tx, taskId, "key share")).toBe(true);
+        } else {
+          expect(
+            await lockExecutionForTool(tx, executionId, "key share"),
+          ).toMatchObject({ state: "RUNNING" });
+        }
+        locked();
+        await released;
+      });
+      await lockTaken;
+      // Release the holder even when an assertion below fails.
+      onTestFinished(() => release());
+
+      // `lock_timeout` turns a blocked update into error 55P03 instead of a hang.
+      const nonKeyUpdate = await h.sql
+        .begin(async (sql) => {
+          await sql`set local lock_timeout = '1s'`;
+          await (table === "tasks"
+            ? sql`update tasks set updated_at = now() where id = ${id}`
+            : sql`update executions set review_rounds = 1 where id = ${id}`);
+        })
+        .then(
+          () => "ok",
+          (e: unknown) => `error ${(e as { code?: string }).code}`,
+        );
+      expect(nonKeyUpdate).toBe("ok");
+
+      let forUpdateGranted = false;
+      const forUpdate = h.sql
+        .begin(async (sql) => {
+          await sql`select id from ${sql(table)} where id = ${id} for update`;
+        })
+        .then(() => void (forUpdateGranted = true));
+      await new Promise((r) => setTimeout(r, 300));
+      expect(forUpdateGranted).toBe(false);
+
+      release();
+      await holder;
+      await forUpdate;
+      expect(forUpdateGranted).toBe(true);
+    });
+  }
+});
+
 describe("renewTaskLease (design.md §6.4, §8)", () => {
   it("moves expires_at forward and returns the new expiry", async () => {
     const taskId = await seedTask(h.db, fx, {
@@ -177,6 +293,48 @@ describe("renewTaskLease (design.md §6.4, §8)", () => {
 
     expect(await renewTaskLease(h.db, executionId, new Date())).toBeNull();
   });
+
+  const cases: Array<{ state: "ASSIGNED" | "RUNNING" | "WAITING_FOR_USER" | "COMPLETED" | "FAILED" | "CANCELLED"; renews: boolean }> = [
+    { state: "ASSIGNED", renews: true },
+    { state: "RUNNING", renews: true },
+    { state: "WAITING_FOR_USER", renews: false },
+    { state: "COMPLETED", renews: false },
+    { state: "FAILED", renews: false },
+    { state: "CANCELLED", renews: false },
+  ];
+
+  for (const c of cases) {
+    it(`${c.renews ? "renews" : "does not renew"} the lease of a ${c.state} execution`, async () => {
+      const taskId = await seedTask(h.db, fx, {
+        jiraKey: nextKey(),
+        state: "IMPLEMENTING",
+      });
+      const executionId = await seedExecution(h.db, taskId, { state: c.state });
+      const workerId = await seedWorker(`atq-live-${executionId.slice(0, 8)}`);
+      const first = new Date("2026-01-01T00:00:00.000Z");
+      await h.db.insert(schema.taskLeases).values({
+        taskId,
+        executionId,
+        workerId,
+        expiresAt: first,
+      });
+
+      const next = new Date("2026-01-01T00:05:00.000Z");
+      const returned = await renewTaskLease(h.db, executionId, next);
+
+      const [row] = await h.db
+        .select()
+        .from(schema.taskLeases)
+        .where(eq(schema.taskLeases.executionId, executionId));
+      if (c.renews) {
+        expect(returned?.getTime()).toBe(next.getTime());
+        expect(row!.expiresAt.getTime()).toBe(next.getTime());
+      } else {
+        expect(returned).toBeNull();
+        expect(row!.expiresAt.getTime()).toBe(first.getTime());
+      }
+    });
+  }
 });
 
 describe("incrementExecutionReviewRounds (design.md §5.3)", () => {

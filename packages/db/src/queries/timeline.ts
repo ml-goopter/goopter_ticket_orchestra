@@ -9,9 +9,12 @@ export const TIMELINE_LIMIT_DEFAULT = 200;
 /** Hard ceiling, so one request cannot drag the whole event log out. */
 export const TIMELINE_LIMIT_MAX = 1000;
 
-/** Clamps a caller-supplied page size into `[1, TIMELINE_LIMIT_MAX]`. */
+/**
+ * Clamps a caller-supplied page size into `[1, TIMELINE_LIMIT_MAX]`. A
+ * missing or non-finite value (`NaN`, `±Infinity`) gets the default.
+ */
 export function clampTimelineLimit(limit: number | undefined): number {
-  if (limit === undefined) {
+  if (limit === undefined || !Number.isFinite(limit)) {
     return TIMELINE_LIMIT_DEFAULT;
   }
   return Math.min(Math.max(Math.trunc(limit), 1), TIMELINE_LIMIT_MAX);

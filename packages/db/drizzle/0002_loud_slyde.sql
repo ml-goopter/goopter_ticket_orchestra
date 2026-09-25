@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "executions_tools_token_hash_key" ON "executions" USING btree ("tools_token_hash") WHERE "executions"."tools_token_hash" is not null;

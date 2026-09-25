@@ -3,6 +3,7 @@ import { ExecutionState, type AgentToolName } from "@orchestra/core";
 import {
   findExecutionByTokenHash,
   lockExecutionForTool,
+  lockTaskForTool,
   setExecutionToolsTokenHash,
   type AgentToolsExecutionContext,
   type DbOrTx,
@@ -119,19 +120,31 @@ export class TokenRevokedError extends Error {
 }
 
 /**
- * The in-transaction half of authorization. `authenticate` runs before the
- * transaction without a lock, so the execution may leave RUNNING and have
- * its token revoked before the tool writes. This locks the execution row,
+ * The in-transaction half of authorization, and the tool transaction's
+ * first statements. `authenticate` runs before the transaction without a
+ * lock, so the execution may leave RUNNING and have its token revoked
+ * before the tool writes. This locks the task row, then the execution row,
  * then confirms the stored hash still matches `bearer` and the state still
  * allows `tool`. Throws `TokenRevokedError` otherwise, which rolls the
  * transaction back.
+ *
+ * Lock order is task, then execution: the order the api cancel route takes
+ * them. Locking the execution first deadlocks against a concurrent cancel,
+ * because every tool later touches the task row (a `transition()`, or the
+ * foreign-key check of any insert that references the task). `taskId` comes
+ * from the pre-transaction `authenticate`; `executions.task_id` never
+ * changes, so it is safe to lock by.
  */
 export async function reauthorize(
   tx: Tx,
+  taskId: string,
   executionId: string,
   bearer: string,
   tool: AgentToolName,
 ): Promise<void> {
+  if (!(await lockTaskForTool(tx, taskId))) {
+    throw new TokenRevokedError();
+  }
   const row = await lockExecutionForTool(tx, executionId);
   if (
     !row ||
