@@ -63,10 +63,12 @@ export function endStreamImmediately(res: ServerResponse): void {
  * `Last-Event-ID`. `write` reports backpressure and `waitForDrain`
  * resolves once the client catches up (or the connection closes).
  */
-/** A frame larger than the cap, admitted on an idle connection and not yet flushed. */
+/** A frame larger than the cap, admitted while no other was in flight, and not yet flushed. */
 interface OversizedFrame {
-  /** Its unsent bytes (with any transfer framing) right after it was written. */
+  /** Unsent bytes its own write added, with any transfer framing. */
   bytes: number;
+  /** Unsent bytes written after it; none of them can be sent before it is. */
+  behind: number;
 }
 
 export class SseConnection {
@@ -92,7 +94,8 @@ export class SseConnection {
     res.on("close", () => this.handleClose());
     res.on("drain", () => {
       this.needDrain = false;
-      this.releaseDrainWaiters();
+      if (this.res.writableLength === 0) this.oversized = undefined;
+      this.releaseDrainWaitersIfClear();
     });
   }
 
@@ -100,38 +103,52 @@ export class SseConnection {
     return this.closed;
   }
 
-  /** True while any output, including an exempt oversized frame, is unsent. */
-  get hasUnsentOutput(): boolean {
-    return this.res.writableLength > 0;
+  /** True while an oversized frame is exempt from the cap and not yet flushed. */
+  get hasOversizedInFlight(): boolean {
+    return this.oversized !== undefined;
+  }
+
+  /** True when a frame of `bytes` is larger than the cap on its own. */
+  isOversized(bytes: number): boolean {
+    return bytes > this.maxBufferedBytes;
   }
 
   /**
    * Returns false when the caller should `waitForDrain` before writing more.
-   * A chunk written while nothing else is unsent always stays, even one
-   * larger than the cap, so a single large frame cannot loop the client
-   * through reconnects. Until such a frame is flushed its bytes are not
-   * counted against the cap, so a keepalive or event written behind it is
-   * not dropped on its account.
+   *
+   * A frame larger than the cap is admitted when no other oversized frame
+   * is in flight, whatever else is unsent, so a single large frame cannot
+   * loop the client through reconnects. Until it is flushed only its own
+   * bytes are left out of the cap; everything written before or after it
+   * still counts. The write reports backpressure until it is flushed, so
+   * a caller that waits never sends a second oversized frame behind it;
+   * one that does not wait has the second counted, which drops the
+   * connection.
    */
   write(chunk: string): boolean {
     if (this.closed) return false;
-    const idle = this.res.writableLength === 0;
-    if (idle) this.oversized = undefined;
-    if (idle && Buffer.byteLength(chunk) > this.maxBufferedBytes) {
-      const frame = { bytes: 0 };
+    const before = this.res.writableLength;
+    if (before === 0) this.oversized = undefined;
+    if (!this.oversized && this.isOversized(Buffer.byteLength(chunk))) {
+      const frame: OversizedFrame = { bytes: 0, behind: 0 };
       this.oversized = frame;
       if (!this.res.write(chunk, () => this.releaseOversized(frame))) {
         this.needDrain = true;
       }
-      if (this.oversized === frame) frame.bytes = this.res.writableLength;
-      return !this.needDrain;
+      if (this.oversized === frame) {
+        frame.bytes = Math.max(0, this.res.writableLength - before);
+      }
+    } else {
+      if (!this.res.write(chunk)) this.needDrain = true;
+      if (this.oversized) {
+        this.oversized.behind += Math.max(0, this.res.writableLength - before);
+      }
     }
-    if (!this.res.write(chunk)) this.needDrain = true;
-    if (!idle && this.countedBytes() > this.maxBufferedBytes) {
+    if (before > 0 && this.countedBytes() > this.maxBufferedBytes) {
       this.drop();
       return false;
     }
-    return !this.needDrain;
+    return !this.needDrain && !this.oversized;
   }
 
   /** True when `pendingBytes` held outside the response, added to its counted unsent output, exceed the cap. */
@@ -146,8 +163,9 @@ export class SseConnection {
     this.handleClose();
   }
 
+  /** Resolves once the client has taken what was written and no oversized frame is in flight, or on close. */
   waitForDrain(): Promise<void> {
-    if (this.closed || !this.needDrain) return Promise.resolve();
+    if (this.closed || (!this.needDrain && !this.oversized)) return Promise.resolve();
     return new Promise((resolve) => this.drainWaiters.add(resolve));
   }
 
@@ -167,14 +185,27 @@ export class SseConnection {
     this.handleClose();
   }
 
-  /** Unsent output counted against the cap: all of it except an in-flight oversized frame. */
+  /**
+   * Unsent output counted against the cap: all of it except what is left
+   * of an in-flight oversized frame. Output leaves in write order, so the
+   * frame's unsent part is whatever remains once the bytes behind it are
+   * set aside, and never more than the frame itself.
+   */
   private countedBytes(): number {
-    const exempt = this.oversized?.bytes ?? 0;
-    return Math.max(0, this.res.writableLength - exempt);
+    const unsent = this.res.writableLength;
+    const frame = this.oversized;
+    if (!frame) return unsent;
+    return unsent - Math.min(frame.bytes, Math.max(0, unsent - frame.behind));
   }
 
   private releaseOversized(frame: OversizedFrame): void {
-    if (this.oversized === frame) this.oversized = undefined;
+    if (this.oversized !== frame) return;
+    this.oversized = undefined;
+    this.releaseDrainWaitersIfClear();
+  }
+
+  private releaseDrainWaitersIfClear(): void {
+    if (!this.needDrain && !this.oversized) this.releaseDrainWaiters();
   }
 
   private releaseDrainWaiters(): void {
@@ -186,6 +217,7 @@ export class SseConnection {
   private handleClose(): void {
     if (this.closed) return;
     this.closed = true;
+    this.oversized = undefined;
     clearInterval(this.keepalive);
     this.releaseDrainWaiters();
     for (const callback of this.closeCallbacks) callback();

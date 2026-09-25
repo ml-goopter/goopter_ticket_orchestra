@@ -273,13 +273,13 @@ interface FreshApp {
  * A second app on the shared database with a hub that has seen no
  * notification yet, so no earlier test's traffic shapes its state.
  */
-async function startFreshApp(): Promise<FreshApp> {
+async function startFreshApp(realtime: RealtimeOptions = {}): Promise<FreshApp> {
   const before = new Set(await listenPids());
   const fresh = await buildApp({
     db: h.db,
     config: testConfig({ DATABASE_URL: h.connectionString }),
     now: clock.now,
-    realtime: { keepaliveMs: KEEPALIVE_MS, loadAnchor: loadAnchorWithHooks },
+    realtime: { keepaliveMs: KEEPALIVE_MS, loadAnchor: loadAnchorWithHooks, ...realtime },
   });
   await fresh.listen({ port: 0, host: "127.0.0.1" });
   const { port } = fresh.server.address() as AddressInfo;
@@ -953,6 +953,186 @@ describe("auth, validation and cleanup (T7)", () => {
     }
   });
 });
+
+describe("oversized frames on a real HTTP connection", () => {
+  const CAP = 1000;
+
+  it("W1a: a backlog of [small row, oversized row] delivers both and the connection stays open", async () => {
+    const fresh = await startFreshApp({ maxBufferedBytes: CAP });
+    let client: StreamClient | undefined;
+    try {
+      const task = await newTask();
+      const small = await append(task, "agent.message", { n: 1 });
+      const big = await append(task, "agent.message", { text: "x".repeat(5000) });
+      client = await openStream(
+        `/api/tasks/${task}/stream`,
+        { "last-event-id": "0" },
+        { baseUrl: fresh.baseUrl },
+      );
+      await client.waitForFrames(2, 5000);
+      const live = await append(task, "agent.message", { n: 3 });
+      await client.waitForFrames(3, 5000);
+      await sleep(200);
+      expect(ids(client.frames)).toEqual([small, big, live]);
+      expect(client.ended).toBe(false);
+    } finally {
+      client?.close();
+      await fresh.app.close();
+    }
+  });
+
+  it("W1b: live push(small) then push(oversized) in the same tick delivers both", async () => {
+    const raw = await openRawTaskStream({ maxBufferedBytes: CAP, cursor: 0 });
+    try {
+      await sleep(50);
+      raw.stream.push(fakeEvent(1, 50));
+      raw.stream.push(fakeEvent(2, 5000));
+      await raw.client.waitForFrames(2, 5000);
+      await sleep(100);
+      expect(ids(raw.client.frames)).toEqual([1, 2]);
+      expect(raw.sse.isClosed).toBe(false);
+      expect(raw.client.ended).toBe(false);
+    } finally {
+      await raw.close();
+    }
+  });
+
+  it("W1b: push(small) then push(oversized) while a cursor-less stream is anchoring delivers both", async () => {
+    let resolveAnchor!: (id: number) => void;
+    const anchor = new Promise<number>((resolve) => (resolveAnchor = resolve));
+    const raw = await openRawTaskStream({
+      maxBufferedBytes: CAP,
+      cursor: undefined,
+      anchor: () => anchor,
+    });
+    try {
+      raw.stream.push(fakeEvent(1, 50));
+      raw.stream.push(fakeEvent(2, 5000));
+      expect(raw.sse.isClosed).toBe(false);
+      resolveAnchor(0);
+      await raw.client.waitForFrames(2, 5000);
+      await sleep(100);
+      expect(ids(raw.client.frames)).toEqual([1, 2]);
+      expect(raw.sse.isClosed).toBe(false);
+      expect(raw.client.ended).toBe(false);
+    } finally {
+      resolveAnchor(0);
+      await raw.close();
+    }
+  });
+
+  it("W1c: a second oversized frame while the first is in flight drops the connection, so a flood stays bounded", async () => {
+    const raw = await openRawTaskStream({ maxBufferedBytes: CAP, cursor: 0 });
+    try {
+      await sleep(50);
+      let pushes = 0;
+      for (let id = 1; id <= 100 && !raw.sse.isClosed; id += 1) {
+        raw.stream.push(fakeEvent(id, 5000));
+        pushes += 1;
+      }
+      expect(pushes).toBe(2);
+      expect(raw.sse.isClosed).toBe(true);
+      await waitFor(() => raw.client.ended);
+    } finally {
+      await raw.close();
+    }
+  });
+
+  it("W1c: an oversized frame is admitted again once the previous one has flushed", async () => {
+    const raw = await openRawTaskStream({ maxBufferedBytes: CAP, cursor: 0 });
+    try {
+      await sleep(50);
+      raw.stream.push(fakeEvent(1, 5000));
+      await raw.client.waitForFrames(1, 5000);
+      await sleep(50);
+      raw.stream.push(fakeEvent(2, 5000));
+      await raw.client.waitForFrames(2, 5000);
+      await sleep(100);
+      expect(ids(raw.client.frames)).toEqual([1, 2]);
+      expect(raw.sse.isClosed).toBe(false);
+    } finally {
+      await raw.close();
+    }
+  });
+
+  it("W1c: a backlog of two oversized rows waits for the first to flush and delivers both", async () => {
+    const raw = await openRawTaskStream({
+      maxBufferedBytes: CAP,
+      cursor: 0,
+      backlog: [fakeEvent(1, 50), fakeEvent(2, 5000), fakeEvent(3, 5000), fakeEvent(4, 50)],
+    });
+    try {
+      await raw.client.waitForFrames(4, 5000);
+      await sleep(100);
+      expect(ids(raw.client.frames)).toEqual([1, 2, 3, 4]);
+      expect(raw.sse.isClosed).toBe(false);
+      expect(raw.client.ended).toBe(false);
+    } finally {
+      await raw.close();
+    }
+  });
+
+  it("W1c: an in-flight oversized frame's exemption does not outlive its connection", async () => {
+    const res = new FakeResponse();
+    const sse = new SseConnection(res.asServerResponse(), 60_000, 100);
+    expect(sse.write("x".repeat(150))).toBe(false);
+    expect(sse.hasOversizedInFlight).toBe(true);
+    const drained = sse.waitForDrain();
+    sse.drop();
+    await drained;
+    expect(sse.hasOversizedInFlight).toBe(false);
+  });
+});
+
+interface RawTaskStream {
+  client: StreamClient;
+  sse: SseConnection;
+  stream: TaskStream;
+  close(): Promise<void>;
+}
+
+/**
+ * A `TaskStream` served by a plain listening Node HTTP server and read by
+ * the real `openStream` client, so writes go through a real socket.
+ */
+async function openRawTaskStream(options: {
+  maxBufferedBytes: number;
+  cursor: number | undefined;
+  anchor?: () => Promise<number>;
+  backlog?: StreamEvent[];
+}): Promise<RawTaskStream> {
+  let opened!: (value: { sse: SseConnection; stream: TaskStream }) => void;
+  const ready = new Promise<{ sse: SseConnection; stream: TaskStream }>(
+    (resolve) => (opened = resolve),
+  );
+  const server = http.createServer((_req, res) => {
+    const sse = new SseConnection(res, 60_000, options.maxBufferedBytes);
+    const stream = new TaskStream({
+      sse,
+      cursor: options.cursor,
+      anchor: options.anchor ?? (() => Promise.resolve(0)),
+      backlog: () => Promise.resolve({ events: options.backlog ?? [], full: false }),
+      onError: () => {},
+    });
+    stream.start();
+    opened({ sse, stream });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  const client = await openStream("/", {}, { baseUrl: `http://127.0.0.1:${port}` });
+  const { sse, stream } = await ready;
+  return {
+    client,
+    sse,
+    stream,
+    async close() {
+      client.close();
+      sse.end();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
 
 /** A task event whose frame is exactly `size` bytes of ASCII. */
 function fakeEvent(id: number, size: number): StreamEvent {

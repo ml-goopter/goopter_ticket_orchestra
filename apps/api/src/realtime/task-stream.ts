@@ -48,7 +48,9 @@ export class TaskStream {
   private syncing = false;
   private resyncRequested = false;
   private buffer: StreamEvent[] = [];
+  /** Bytes of buffered events, except one oversized event, which is exempt. */
   private bufferedBytes = 0;
+  private bufferHasOversized = false;
 
   constructor(private readonly options: TaskStreamOptions) {
     this.lastSentId = options.cursor;
@@ -64,23 +66,27 @@ export class TaskStream {
    * output cap. Past it the connection is dropped and the client resumes
    * with Last-Event-ID, so a client stalled in its backlog cannot grow
    * the buffer without bound. One event larger than the cap is still
-   * buffered when nothing else is buffered or unsent: a cursor-less
-   * stream that has sent nothing would otherwise reconnect without
-   * Last-Event-ID and re-anchor past it.
+   * buffered, with its bytes left out of the cap, when no other oversized
+   * event is buffered or in flight: a cursor-less stream that has sent
+   * nothing would otherwise reconnect without Last-Event-ID and re-anchor
+   * past it.
    */
   push(event: StreamEvent): void {
     const { sse } = this.options;
     if (sse.isClosed) return;
     if (this.syncing) {
       const bytes = Buffer.byteLength(event.frame);
-      const alone = this.buffer.length === 0 && !sse.hasUnsentOutput;
-      if (!alone && sse.exceedsCap(this.bufferedBytes + bytes)) {
+      const exempt =
+        sse.isOversized(bytes) && !this.bufferHasOversized && !sse.hasOversizedInFlight;
+      const counted = exempt ? 0 : bytes;
+      if (sse.exceedsCap(this.bufferedBytes + counted)) {
         this.clearBuffer();
         sse.drop();
         return;
       }
       this.buffer.push(event);
-      this.bufferedBytes += bytes;
+      this.bufferedBytes += counted;
+      if (exempt) this.bufferHasOversized = true;
       return;
     }
     this.send(event);
@@ -141,5 +147,6 @@ export class TaskStream {
   private clearBuffer(): void {
     this.buffer = [];
     this.bufferedBytes = 0;
+    this.bufferHasOversized = false;
   }
 }
