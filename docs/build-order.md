@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `a86a3c3` plus this change.
+Status as of 2026-09-25, main at `3e96c57` plus this change.
 
 ## Completed
 
@@ -27,6 +27,7 @@ Status as of 2026-09-25, main at `a86a3c3` plus this change.
 | W5 | GOT.26 | worker: scheduler phases, claim, leases, capacity | #24 |
 | W5 | GOT.28 | api: LISTEN connection and SSE endpoints | #26 |
 | W5 | GOT.32 | api: specification routes | #27 |
+| W5 | GOT.33 | api: issue routes, resolution, notifications | #28 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -36,7 +37,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
-| W5 | GOT.33 | api: issue routes, resolution, notifications | GOT.21 | M7 |
 | W5 | GOT.40 | review-wrapper: orchestra-review binary | GOT.14, 24 | M6 |
 | W6 | GOT.31 | worker: execution runner loop and command consumer | GOT.14, 15, 24, 25 | M5 |
 | W6 | GOT.36 | web: board view and attention drawer | GOT.21, 22, 28 | M3 |
@@ -76,7 +76,10 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.37: request-review refuses while a `start_spec_session` command is uncompleted. The worker must complete that command and create the spec execution in one transaction, or the guard has a gap (PR #27).
 - GOT.37: the scheduler's live and paused execution filters ignore `role`, so any live spec execution also blocks promotion and claim of the task (PR #24, #27).
 - GOT.38: `PUT /spec/draft` takes `{ content }`. `/spec/revise` returns 409 `DRAFT_EXISTS` when a draft already exists, and no route deletes a draft (PR #27).
-- GOT.33: `GET /stream` has no publisher for `notification` events yet; notifications are rows in their own table and never reach `NOTIFY` (user decision Q7, PR #26).
+- GOT.42: `GET /stream` has no publisher for `notification` events; notifications are rows in their own table and never reach `NOTIFY` (user decision Q7, PR #26). The issue views must poll or refetch.
+- GOT.47: `send_message` on an issue carries `{ issue_id, text }` and `resume_with_decision` carries `{ issue_id, decision_id }`. Both are enqueued only while the execution is WAITING_FOR_USER; a message on a non-blocking issue is refused with 409 (PR #28).
+- GOT.47: resolving as `spec_revision` leaves the execution WAITING_FOR_USER and enqueues nothing; `/spec/approve` later enqueues `resume_with_revision` (PR #27, #28).
+- GOT.42: broadcast notifications (`user_id` null) share one `read_at` across users; one user's read marks it read for all (PR #28, accepted as designed).
 - GOT.36: `GET /stream` has no replay (user decision Q8); the dashboard must refetch its lists when the stream reconnects (PR #26).
 - GOT.36: the SSE hook's default event types are cast to the caller's type parameter; pass `types` explicitly for dashboard events (PR #18, accepted minor).
 - GOT.40: `StartRequest.testCommand` carries the repository test command to the review role and must be a single plain command. Where the value comes from is design OI3 and needs a decision.
