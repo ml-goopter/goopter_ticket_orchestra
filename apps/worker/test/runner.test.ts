@@ -10,10 +10,12 @@ import type {
 import type { Runtime } from "@orchestra/core";
 import {
   agentWorkers,
+  appendEvent,
   executionCommands,
   executionUsage,
   executions,
   issues,
+  lockTaskForTool,
   projects,
   repositories,
   specificationRevisions,
@@ -581,6 +583,56 @@ describe("event loop (design.md §9.3)", () => {
     expect(types.indexOf("agent.message.delta")).toBeGreaterThan(-1);
     expect(types.indexOf("agent.message.delta")).toBeLessThan(types.indexOf("execution.completed"));
     expect(types).not.toContain("agent.tool_call");
+  });
+
+  it("an orchestra tool call waits for a delta the 200 ms timer already sent, so the tool's event lands after it", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    // A test transaction holds the task row, so the timer's delta write
+    // stays queued behind the lock. If the runner lets the tool run before
+    // that write lands, the tool's agent.note is written inside the holding
+    // transaction and gets the lower id. Otherwise the lock is released
+    // after a grace period and the tool writes its note once it runs.
+    let toolRan!: () => void;
+    const ran = new Promise<void>((resolve) => (toolRan = resolve));
+    let noteWritten = false;
+    const note = { taskId: s.taskId, executionId: s.executionId, type: "agent.note" as const, payload: { text: "noted" } };
+    h.adapter.script = async function* () {
+      yield { type: "session", sessionId: "sess-o3" };
+      let locked!: () => void;
+      const lockHeld = new Promise<void>((resolve) => (locked = resolve));
+      const holder = db.transaction(async (tx) => {
+        await lockTaskForTool(tx, s.taskId);
+        locked();
+        const toolFirst = await Promise.race([
+          ran.then(() => true),
+          sleep(700).then(() => false),
+        ]);
+        if (toolFirst) {
+          await appendEvent(tx, note);
+          noteWritten = true;
+        }
+      });
+      await lockHeld;
+      yield { type: "text", delta: "Noting" };
+      // The 200 ms timer empties the buffer; its write waits on the lock.
+      await sleep(350);
+      yield { type: "tool_call", name: "mcp__orchestra__note", input: { text: "noted" } };
+      toolRan();
+      await holder;
+      if (!noteWritten) await db.transaction((tx) => appendEvent(tx, note));
+      await completeViaTool(s.executionId);
+      yield { type: "turn_done", finalText: "Noting" };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    const events = await eventsFor(s.executionId);
+    const delta = events.find((e) => e.type === "agent.message.delta");
+    const noteRow = events.find((e) => e.type === "agent.note");
+    expect(delta?.payload).toEqual({ text: "Noting" });
+    expect(noteRow).toBeDefined();
+    expect(delta!.id).toBeLessThan(noteRow!.id);
   });
 
   it("resets the quiet timer on every event (§9.4)", async () => {

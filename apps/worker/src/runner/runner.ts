@@ -468,7 +468,8 @@ export function createRunner(deps: RunnerDeps): Runner {
       const flush = (): Promise<void> => {
         cancel(flushTimer);
         flushTimer = undefined;
-        if (buffer === "") return Promise.resolve();
+        // The timer may have emptied the buffer with its write still queued.
+        if (buffer === "") return writes.drain();
         const text = redact(buffer);
         buffer = "";
         return writes.push("agent.message.delta", () =>
