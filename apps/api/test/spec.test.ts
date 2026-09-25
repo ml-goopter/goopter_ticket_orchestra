@@ -377,6 +377,37 @@ describe("POST /api/tasks/:id/spec/request-review and send-back (P4)", () => {
     expect((await taskRow(id)).state).toBe("SPEC_REVIEW");
   });
 
+  it("moves to SPEC_REVIEW when the only spec executions have ended", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    await seedRevision(id, 1, "draft", content());
+    const done = await seedExecution(h.db, id, { role: "spec", state: "COMPLETED" });
+    const failed = await seedExecution(h.db, id, { role: "spec", state: "FAILED" });
+    const res = await post(`/api/tasks/${id}/spec/request-review`);
+    expect(res.statusCode).toBe(200);
+    expect((await taskRow(id)).state).toBe("SPEC_REVIEW");
+    expect((await executionRow(done)).state).toBe("COMPLETED");
+    expect((await executionRow(failed)).state).toBe("FAILED");
+  });
+
+  it.each(["QUEUED", "ASSIGNED", "WAITING_FOR_USER"] as const)(
+    "returns 409 SPEC_SESSION_BUSY with a %s spec execution and writes nothing",
+    async (execState) => {
+      const { id } = await newTask("SPEC_IN_PROGRESS");
+      await seedRevision(id, 1, "draft", content());
+      const specExec = await seedExecution(h.db, id, { role: "spec", state: execState });
+      const before = await snapshot(id);
+      const execBefore = await executionRow(specExec);
+      const execAuditsBefore = await auditTriggers(specExec);
+
+      const res = await post(`/api/tasks/${id}/spec/request-review`);
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error.code).toBe("SPEC_SESSION_BUSY");
+      expect(await snapshot(id)).toEqual(before);
+      expect(await executionRow(specExec)).toEqual(execBefore);
+      expect(await auditTriggers(specExec)).toEqual(execAuditsBefore);
+    },
+  );
+
   it("returns 409 NO_DRAFT without a draft and writes nothing", async () => {
     const { id } = await newTask("SPEC_IN_PROGRESS");
     await seedRevision(id, 1, "approved", content());

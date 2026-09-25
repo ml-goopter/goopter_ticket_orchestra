@@ -56,6 +56,9 @@ const LIVE_EXECUTION_STATES = [
   "WAITING_FOR_USER",
 ] as const;
 
+/** Live spec execution states that request-review cannot complete, so it refuses. */
+const BUSY_SPEC_EXECUTION_STATES = ["QUEUED", "ASSIGNED", "WAITING_FOR_USER"] as const;
+
 /** Dependency states that make an approved task `BLOCKED` (§6.2). */
 const FAILED_DEPENDENCY_STATES: ReadonlySet<TaskState> = new Set<TaskState>([
   "FAILED",
@@ -248,6 +251,17 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
       return await app.db.transaction(async (tx) => {
         await lockTask(tx, id, "spec.review_requested");
         requireDraft(await getRevisionByStatus(tx, id, "draft"));
+        // Only a RUNNING spec execution can be completed here (§5.2). Any other
+        // live one would survive approval and keep the scheduler from ever
+        // promoting or claiming the task, so refuse before any write.
+        const busy = await lockTaskExecutionIds(tx, id, "spec", BUSY_SPEC_EXECUTION_STATES);
+        if (busy.length > 0) {
+          throw new AppError(
+            409,
+            "SPEC_SESSION_BUSY",
+            "The spec session is queued, assigned or waiting for the user. Review can be requested once it is running or has ended.",
+          );
+        }
         const result = await transition(tx, {
           entity: "task",
           id,
