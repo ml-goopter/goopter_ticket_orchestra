@@ -16,6 +16,25 @@ export function hashPassword(password: string): Promise<string> {
   return hash(password, PASSWORD_HASH_OPTIONS);
 }
 
+let dummyHash: Promise<string> | undefined;
+
+/**
+ * A fixed argon2id hash under `PASSWORD_HASH_OPTIONS`, computed once and
+ * cached. Login runs `verifyPassword` against this when there is no live
+ * user (unknown email, or a disabled account) so that case costs the same
+ * argon2id work as a wrong password on a real account — otherwise the
+ * response timing would let a caller enumerate registered emails.
+ */
+export function getDummyPasswordHash(): Promise<string> {
+  if (!dummyHash) {
+    dummyHash = hash(
+      "orchestra-timing-parity-dummy-password",
+      PASSWORD_HASH_OPTIONS,
+    );
+  }
+  return dummyHash;
+}
+
 /** Never throws: an unparseable digest just fails verification. */
 export async function verifyPassword(
   digest: string,

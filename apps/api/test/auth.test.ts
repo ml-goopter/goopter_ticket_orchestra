@@ -6,7 +6,16 @@ import {
   users,
 } from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import {
   type Clock,
   type TestDb,
@@ -17,6 +26,21 @@ import {
   sessionCookieHeader,
   startTestDb,
 } from "./harness.js";
+
+// Wraps the real `verifyPassword` so R5's tests can assert it is called
+// exactly once per login attempt (including unknown-email and
+// disabled-user cases) and inspect the digest it was called with, without
+// changing its behaviour.
+vi.mock("../src/lib/passwords.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/lib/passwords.js")>();
+  return {
+    ...actual,
+    verifyPassword: vi.fn(actual.verifyPassword),
+  };
+});
+
+import { PASSWORD_HASH_OPTIONS, verifyPassword } from "../src/lib/passwords.js";
 
 function extractCookie(setCookieHeader: string | string[] | undefined): {
   raw: string;
@@ -194,6 +218,122 @@ describe("auth", () => {
         headers: { cookie: cookie.raw },
       });
       expect(meRes.statusCode).toBe(401);
+    });
+  });
+
+  describe("argon2 verification path (R5)", () => {
+    function parseArgon2Params(encoded: string) {
+      const paramsSection = encoded.match(/\$argon2id\$v=\d+\$([^$]+)\$/)?.[1];
+      if (!paramsSection) {
+        throw new Error(`unparseable argon2 digest: ${encoded}`);
+      }
+      const params = Object.fromEntries(
+        paramsSection.split(",").map((pair) => pair.split("=")),
+      );
+      return {
+        memoryCost: Number(params.m),
+        timeCost: Number(params.t),
+        parallelism: Number(params.p),
+      };
+    }
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it("runs verifyPassword exactly once against a hash matching PASSWORD_HASH_OPTIONS for an unknown email", async () => {
+      const app = await withApp();
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "nobody@example.com", password: "irrelevant" },
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(verifyPassword).toHaveBeenCalledTimes(1);
+      const [digest] = vi.mocked(verifyPassword).mock.calls[0]!;
+      expect(parseArgon2Params(digest)).toEqual({
+        memoryCost: PASSWORD_HASH_OPTIONS.memoryCost,
+        timeCost: PASSWORD_HASH_OPTIONS.timeCost,
+        parallelism: PASSWORD_HASH_OPTIONS.parallelism,
+      });
+    });
+
+    it("runs verifyPassword exactly once against the same dummy hash for a disabled user, even with the correct password", async () => {
+      const app = await withApp();
+      await seedUser(testDb.db, {
+        email: "disabled-r5@example.com",
+        password: "correct horse battery",
+        disabled: true,
+      });
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: {
+          email: "disabled-r5@example.com",
+          password: "correct horse battery",
+        },
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(verifyPassword).toHaveBeenCalledTimes(1);
+      const [digest] = vi.mocked(verifyPassword).mock.calls[0]!;
+      expect(parseArgon2Params(digest)).toEqual({
+        memoryCost: PASSWORD_HASH_OPTIONS.memoryCost,
+        timeCost: PASSWORD_HASH_OPTIONS.timeCost,
+        parallelism: PASSWORD_HASH_OPTIONS.parallelism,
+      });
+
+      // Same cached dummy hash as the unknown-email case, not the user's
+      // own (disabled) password hash: proves the disabled path takes the
+      // identical branch rather than happening to also match parameters.
+      const unknownEmailRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "nobody-2@example.com", password: "irrelevant" },
+      });
+      expect(unknownEmailRes.statusCode).toBe(401);
+      const [unknownDigest] = vi.mocked(verifyPassword).mock.calls[1]!;
+      expect(unknownDigest).toBe(digest);
+    });
+
+    it("runs verifyPassword exactly once for a wrong password on an existing user", async () => {
+      const app = await withApp();
+      await seedUser(testDb.db, {
+        email: "wrongpw-r5@example.com",
+        password: "correct horse battery",
+      });
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "wrongpw-r5@example.com", password: "wrong password" },
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(verifyPassword).toHaveBeenCalledTimes(1);
+    });
+
+    it("runs verifyPassword exactly once for a correct password", async () => {
+      const app = await withApp();
+      await seedUser(testDb.db, {
+        email: "rightpw-r5@example.com",
+        password: "correct horse battery",
+      });
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: {
+          email: "rightpw-r5@example.com",
+          password: "correct horse battery",
+        },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(verifyPassword).toHaveBeenCalledTimes(1);
     });
   });
 

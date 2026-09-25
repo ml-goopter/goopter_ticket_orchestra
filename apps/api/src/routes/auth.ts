@@ -2,7 +2,7 @@ import { deleteSession, findUserByEmail, insertSession } from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { AppError, AUTH_INVALID_CREDENTIALS, AUTH_REQUIRED } from "../lib/errors.js";
-import { verifyPassword } from "../lib/passwords.js";
+import { getDummyPasswordHash, verifyPassword } from "../lib/passwords.js";
 import { SESSION_COOKIE_NAME, SESSION_TTL_MS } from "../plugins/auth.js";
 
 const LoginBodySchema = z.object({
@@ -43,13 +43,15 @@ export default async function authRoutes(
       const row = await findUserByEmail(app.db, email);
 
       // Unknown email, disabled user, and wrong password all return the
-      // exact same body so a caller cannot enumerate accounts.
-      if (!row || row.disabledAt !== null) {
-        throw AUTH_INVALID_CREDENTIALS;
-      }
-
-      const passwordOk = await verifyPassword(row.passwordHash, password);
-      if (!passwordOk) {
+      // exact same body so a caller cannot enumerate accounts. `verifyPassword`
+      // always runs, against a fixed dummy hash when there is no live user,
+      // so the three cases also cost the same argon2id work (R5).
+      const digest =
+        row && row.disabledAt === null
+          ? row.passwordHash
+          : await getDummyPasswordHash();
+      const passwordOk = await verifyPassword(digest, password);
+      if (!row || row.disabledAt !== null || !passwordOk) {
         throw AUTH_INVALID_CREDENTIALS;
       }
 

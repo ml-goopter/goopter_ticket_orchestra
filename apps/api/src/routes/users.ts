@@ -23,10 +23,15 @@ const CreateUserSchema = z
   })
   .strict();
 
+/**
+ * `.strict()` rejects a `disabled` field with 400 rather than silently
+ * ignoring it: no api route sets `disabled_at` (R3, design.md §12.5 lists
+ * the route but not this field; users.disable is out of scope pending a
+ * design decision).
+ */
 const PatchUserSchema = z
   .object({
     display_name: z.string().min(1, "display_name is required"),
-    disabled: z.boolean(),
   })
   .strict()
   .partial();
@@ -98,9 +103,6 @@ export default async function usersRoutes(app: FastifyInstance): Promise<void> {
     const row = await updateAdminUser(app.db, request.params.id, {
       ...(parsed.data.display_name !== undefined
         ? { displayName: parsed.data.display_name }
-        : {}),
-      ...(parsed.data.disabled !== undefined
-        ? { disabledAt: parsed.data.disabled ? app.now() : null }
         : {}),
     });
     if (!row) throw notFound(request.params.id);

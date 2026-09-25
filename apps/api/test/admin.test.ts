@@ -467,58 +467,45 @@ describe("admin routes", () => {
       expect(res.statusCode).toBe(400);
     });
 
-    it("disables and re-enables a user, gating login (AC3)", async () => {
+    it("rejects a `disabled` field with 400 and writes nothing, but display_name still updates (R3, AC5)", async () => {
       const app = await withAuthedApp();
       const createRes = await app.inject({
         method: "POST",
         url: "/api/users",
         headers: { cookie },
         payload: {
-          email: "togglable@example.com",
+          email: "notoggle@example.com",
           password: "a very long password",
-          display_name: "Togglable",
+          display_name: "No Toggle",
         },
       });
       const created = createRes.json();
 
-      const disableRes = await app.inject({
+      const patchRes = await app.inject({
         method: "PATCH",
         url: `/api/users/${created.id}`,
         headers: { cookie },
         payload: { disabled: true },
       });
-      expect(disableRes.statusCode).toBe(200);
-      expect(disableRes.json().disabled_at).not.toBeNull();
-      expect(disableRes.json()).not.toHaveProperty("password_hash");
+      expect(patchRes.statusCode).toBe(400);
 
-      const loginAfterDisableRes = await app.inject({
-        method: "POST",
-        url: "/api/auth/login",
-        payload: {
-          email: "togglable@example.com",
-          password: "a very long password",
-        },
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/users/${created.id}`,
+        headers: { cookie },
       });
-      expect(loginAfterDisableRes.statusCode).toBe(401);
+      expect(getRes.json().disabled_at).toBeNull();
+      expect(getRes.json().display_name).toBe("No Toggle");
 
-      const enableRes = await app.inject({
+      const renameRes = await app.inject({
         method: "PATCH",
         url: `/api/users/${created.id}`,
         headers: { cookie },
-        payload: { disabled: false },
+        payload: { display_name: "Still Works" },
       });
-      expect(enableRes.statusCode).toBe(200);
-      expect(enableRes.json().disabled_at).toBeNull();
-
-      const loginAfterEnableRes = await app.inject({
-        method: "POST",
-        url: "/api/auth/login",
-        payload: {
-          email: "togglable@example.com",
-          password: "a very long password",
-        },
-      });
-      expect(loginAfterEnableRes.statusCode).toBe(200);
+      expect(renameRes.statusCode).toBe(200);
+      expect(renameRes.json().display_name).toBe("Still Works");
+      expect(renameRes.json().disabled_at).toBeNull();
     });
   });
 
