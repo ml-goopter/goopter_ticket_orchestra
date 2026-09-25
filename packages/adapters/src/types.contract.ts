@@ -56,6 +56,7 @@ export type StartRequestHasExactlyTheseFields = Assert<
       mcp: { url: string; token: string };
       env: Record<string, string>;
       maxBudgetUsd?: number;
+      testCommand?: string;
     }
   >
 >;
@@ -71,6 +72,7 @@ export type ResumeRequestHasExactlyTheseFields = Assert<
       mcp: { url: string; token: string };
       env: Record<string, string>;
       maxBudgetUsd?: number;
+      testCommand?: string;
       sessionId: string;
       usageBaseline?: UsageBaseline;
     }
@@ -137,6 +139,9 @@ export const START_REQUEST_SAMPLE: StartRequest = {
   mcp: { url: "http://127.0.0.1:4599/mcp", token: "t" },
   env: { ORCHESTRA_TOKEN: "t" },
   maxBudgetUsd: 5,
+  // `testCommand` is deliberately absent: it is an optional extension of §7
+  // (design.md §7.1's review-only test-command grant), and `types.test.ts`
+  // pins this sample's field set to exactly the base §7 shape.
 };
 
 export const RESUME_REQUEST_SAMPLE: ResumeRequest = {

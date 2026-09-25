@@ -3,8 +3,11 @@ import { EXECUTION_EVENT_TYPES, type ExecutionEventType } from "@orchestra/core"
 
 export type EventStreamStatus = "connecting" | "open" | "closed";
 
-export interface StreamEvent {
-  type: ExecutionEventType | "message";
+/** Default `StreamEvent["type"]` when a caller does not supply `types`. */
+export type DefaultStreamEventType = ExecutionEventType | "message";
+
+export interface StreamEvent<T extends string = DefaultStreamEventType> {
+  type: T;
   data: unknown;
   id: string | null;
 }
@@ -27,12 +30,23 @@ export interface EventSourceLike {
 
 export type EventSourceFactory = (url: string) => EventSourceLike;
 
-export interface UseEventStreamOptions {
-  onEvent?: (event: StreamEvent) => void;
+export interface UseEventStreamOptions<T extends string = DefaultStreamEventType> {
+  onEvent?: (event: StreamEvent<T>) => void;
   /** Defaults to true; set false to tear the connection down. */
   enabled?: boolean;
   /** Defaults to the real `EventSource`. */
   createEventSource?: EventSourceFactory;
+  /**
+   * Event types to subscribe to. Defaults to every execution event type plus
+   * "message". The dashboard passes the §12.6 `GET /stream` set —
+   * `task.state_changed`, `issue.created`, `issue.resolved`, `notification`
+   * — to receive `notification` events, which the default list omits.
+   *
+   * `T` is inferred from this array (pass `as const` for a literal union), so
+   * `StreamEvent<T>["type"]` narrows to exactly the configured types without
+   * a cast at the call site.
+   */
+  types?: readonly T[];
 }
 
 export interface UseEventStreamResult {
@@ -48,7 +62,10 @@ const defaultFactory: EventSourceFactory = (url) =>
 
 // The server sends `event: <type>` per row (design.md §12.6), so the client
 // has to subscribe to every known type plus the unnamed default "message".
-const SUBSCRIBED_TYPES: readonly string[] = [...EXECUTION_EVENT_TYPES, "message"];
+const SUBSCRIBED_TYPES: readonly DefaultStreamEventType[] = [
+  ...EXECUTION_EVENT_TYPES,
+  "message",
+];
 
 /**
  * SSE subscription with `Last-Event-ID` resume (design.md §12.6). Browsers
@@ -57,11 +74,18 @@ const SUBSCRIBED_TYPES: readonly string[] = [...EXECUTION_EVENT_TYPES, "message"
  * exponential backoff (1s, 2s, 4s, ... capped at 30s), reset once the
  * connection opens successfully.
  */
-export function useEventStream(
+export function useEventStream<T extends string = DefaultStreamEventType>(
   url: string,
-  options: UseEventStreamOptions = {},
+  options: UseEventStreamOptions<T> = {},
 ): UseEventStreamResult {
-  const { onEvent, enabled = true, createEventSource = defaultFactory } = options;
+  const {
+    onEvent,
+    enabled = true,
+    createEventSource = defaultFactory,
+    // Only reached when the caller also leaves `T` at its default, so the
+    // default list's `DefaultStreamEventType` elements are always valid `T`s.
+    types = SUBSCRIBED_TYPES as unknown as readonly T[],
+  } = options;
 
   const [status, setStatus] = useState<EventStreamStatus>("closed");
   const [lastEventId, setLastEventId] = useState<string | null>(null);
@@ -72,6 +96,15 @@ export function useEventStream(
   const lastEventIdRef = useRef<string | null>(null);
   const attemptRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Depending on `types` itself reconnects on every render for a caller that
+  // passes an inline array literal, since a new array is `!==` the previous
+  // one even when its contents are identical (F2). Keying on the de-duped,
+  // sorted contents instead means only an actual change in the type *set*
+  // triggers the effect below. `JSON.stringify` of the array (rather than a
+  // joined string) avoids the collision a joined key has between e.g.
+  // `["a,b"]` and `["a", "b"]` (F4).
+  const typesKey = JSON.stringify([...new Set(types)].sort());
 
   useEffect(() => {
     if (!enabled) {
@@ -93,9 +126,9 @@ export function useEventStream(
         return;
       }
 
-      const after = lastEventIdRef.current ?? "";
+      const after = lastEventIdRef.current;
       const separator = url.includes("?") ? "&" : "?";
-      const fullUrl = `${url}${separator}after=${after}`;
+      const fullUrl = after === null ? url : `${url}${separator}after=${after}`;
 
       setStatus("connecting");
       const source = createEventSource(fullUrl);
@@ -117,7 +150,7 @@ export function useEventStream(
         timerRef.current = setTimeout(connect, delay);
       };
 
-      for (const type of SUBSCRIBED_TYPES) {
+      for (const type of types) {
         source.addEventListener(type, (event) => {
           if (disposed) return;
           if (event.lastEventId) {
@@ -133,7 +166,7 @@ export function useEventStream(
           }
 
           onEventRef.current?.({
-            type: type as StreamEvent["type"],
+            type,
             data,
             id: event.lastEventId ?? null,
           });
@@ -150,7 +183,9 @@ export function useEventStream(
       attemptRef.current = 0;
       setStatus("closed");
     };
-  }, [url, enabled, createEventSource]);
+    // `types` itself is intentionally not a dependency: `typesKey` is its
+    // stable, content-based stand-in (F2).
+  }, [url, enabled, createEventSource, typesKey]);
 
   return { status, lastEventId };
 }

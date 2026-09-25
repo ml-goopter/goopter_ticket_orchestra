@@ -97,6 +97,49 @@ export interface AllowedToolsOptions {
 }
 
 /**
+ * Thrown by `validateTestCommand` when a value cannot safely become the
+ * `Bash(<testCommand>)` argument of a permission rule.
+ */
+export class InvalidTestCommandError extends Error {
+  override readonly name = "InvalidTestCommandError";
+}
+
+/**
+ * Characters that let a test command escape the single `Bash(<testCommand>)`
+ * rule it is meant to produce, or turn it into more than the one command the
+ * review role is meant to run (coordinator decision, F2): `(` / `)` can close
+ * the rule early and open a new one (`pnpm test) Bash(rm -rf`), `*` turns a
+ * fixed command into a prefix wildcard, a newline or carriage return can
+ * inject a second rule line, and `&` / `;` / `|` / backtick / `$` / `<` / `>`
+ * chain, substitute, or redirect into a second command within the one rule.
+ */
+const FORBIDDEN_TEST_COMMAND_CHARS = /[()*\n\r&;|`$<>]/;
+
+/**
+ * Guards `Bash(${testCommand})` in `allowedToolsFor` (F1, design.md §7.1):
+ * the review role is read-only, so a crafted or careless test command must
+ * not be able to widen its permission rule. Throws `InvalidTestCommandError`
+ * rather than silently dropping or sanitising the value, so an invalid
+ * command is never allowed to run under a name that isn't what was asked for.
+ */
+export function validateTestCommand(command: string): void {
+  const trimmed = command.trim();
+  if (trimmed === "") {
+    throw new InvalidTestCommandError("test command must not be empty");
+  }
+  if (FORBIDDEN_TEST_COMMAND_CHARS.test(command)) {
+    throw new InvalidTestCommandError(
+      `test command contains a disallowed character: ${JSON.stringify(command)}`,
+    );
+  }
+  if (trimmed.endsWith(":*")) {
+    throw new InvalidTestCommandError(
+      `test command must not end with ":*": ${JSON.stringify(command)}`,
+    );
+  }
+}
+
+/**
  * Resolves a policy to the `allowedTools` list passed to the runtime.
  *
  * Returns a fresh array each call so a caller cannot mutate a shared policy.
@@ -110,7 +153,14 @@ export function allowedToolsFor(
       return [...SPEC_TOOLS];
     case "review": {
       const tools: string[] = [...REVIEW_TOOLS];
-      if (opts.testCommand) tools.push(`Bash(${opts.testCommand})`);
+      // `!== undefined` rather than a truthiness check (F3): an omitted
+      // `testCommand` legitimately skips the grant, but an explicit `""`
+      // must reach `validateTestCommand` and throw rather than being
+      // silently treated the same as "not supplied".
+      if (opts.testCommand !== undefined) {
+        validateTestCommand(opts.testCommand);
+        tools.push(`Bash(${opts.testCommand})`);
+      }
       return tools;
     }
     case "implementation":

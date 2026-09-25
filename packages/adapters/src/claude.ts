@@ -11,6 +11,7 @@ import type {
 import {
   allowedToolsFor,
   builtinToolsFor,
+  InvalidTestCommandError,
   permissionModeFor,
   settingSourcesFor,
 } from "./policies.js";
@@ -98,27 +99,41 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   start(req: StartRequest, signal: AbortSignal): AsyncIterable<AgentEvent> {
+    const redact = redactorFor(req.mcp.token);
+    let options: Options;
+    try {
+      options = { ...baseOptions(req), systemPrompt: req.systemPrompt };
+    } catch (error) {
+      if (error instanceof InvalidTestCommandError) {
+        return invalidTestCommandStream(error, redact);
+      }
+      throw error;
+    }
     return runQuery(
       this.#query,
       req.prompt,
-      { ...baseOptions(req), systemPrompt: req.systemPrompt },
+      options,
       signal,
       // A fresh session has no earlier turns, so the runtime's cumulative
       // totals are already this session's totals.
-      { redact: redactorFor(req.mcp.token) },
+      { redact },
     );
   }
 
   resume(req: ResumeRequest, signal: AbortSignal): AsyncIterable<AgentEvent> {
-    const run: RunConfig = { redact: redactorFor(req.mcp.token) };
+    const redact = redactorFor(req.mcp.token);
+    let options: Options;
+    try {
+      options = { ...baseOptions(req), resume: req.sessionId };
+    } catch (error) {
+      if (error instanceof InvalidTestCommandError) {
+        return invalidTestCommandStream(error, redact);
+      }
+      throw error;
+    }
+    const run: RunConfig = { redact };
     if (req.usageBaseline) run.usageBaseline = req.usageBaseline;
-    return runQuery(
-      this.#query,
-      req.prompt,
-      { ...baseOptions(req), resume: req.sessionId },
-      signal,
-      run,
-    );
+    return runQuery(this.#query, req.prompt, options, signal, run);
   }
 
   /**
@@ -166,13 +181,17 @@ export class ClaudeAdapter implements AgentAdapter {
 function baseOptions(req: StartRequest | ResumeRequest): Options {
   const policy = req.allowedTools;
   const permissionMode = permissionModeFor(policy);
+  // `testCommand` is an optional extension of §7 (design.md §7.1); only the
+  // `review` policy uses it, so `allowedToolsFor`/`builtinToolsFor` ignore it
+  // for `spec` and `implementation`.
+  const policyOpts = { testCommand: req.testCommand };
   const options: Options = {
     cwd: req.cwd,
     // design.md §7.1. The tool allow list, not a prompt, is the boundary, so
     // the read-only roles run under `dontAsk`: unlisted tools are denied
     // rather than auto-approved, and `tools` keeps them out of the session
     // altogether.
-    allowedTools: allowedToolsFor(policy),
+    allowedTools: allowedToolsFor(policy, policyOpts),
     // sdk.d.ts ~2245: omitted loads user, project and local
     // `.claude/settings*.json` from the target repository, so its own
     // `permissions.allow` could re-grant a read-only or unrestricted-Bash
@@ -191,7 +210,7 @@ function baseOptions(req: StartRequest | ResumeRequest): Options {
     // the CLI subprocess loses PATH, HOME and its credentials.
     env: { ...process.env, ...req.env },
   };
-  const tools = builtinToolsFor(policy);
+  const tools = builtinToolsFor(policy, policyOpts);
   if (tools !== undefined) options.tools = tools;
   // The SDK ignores `bypassPermissions` unless this companion flag is set.
   if (permissionMode === "bypassPermissions") {
@@ -200,6 +219,19 @@ function baseOptions(req: StartRequest | ResumeRequest): Options {
   if (req.model !== undefined) options.model = req.model;
   if (req.maxBudgetUsd !== undefined) options.maxBudgetUsd = req.maxBudgetUsd;
   return options;
+}
+
+/**
+ * Terminal stream for a request whose `testCommand` failed validation (F1,
+ * design.md §7.1, §9.5). Non-retriable: the value is wrong, not transient,
+ * so retrying the same request produces the same rejection. `query` is never
+ * called — the invalid value never reaches a permission rule at all.
+ */
+async function* invalidTestCommandStream(
+  error: InvalidTestCommandError,
+  redact: (text: string) => string,
+): AsyncGenerator<AgentEvent> {
+  yield { type: "error", message: redact(error.message), retriable: false };
 }
 
 /** Per-run concerns that are not SDK options. */
