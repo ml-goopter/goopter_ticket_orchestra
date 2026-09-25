@@ -243,3 +243,171 @@ describe("NOTIFY on commit (AC4)", () => {
     }
   });
 });
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Committed event ids for `taskId`, read on a pooled connection. */
+async function committedIds(taskId: string): Promise<bigint[]> {
+  const rows = await h.db
+    .select({ id: schema.executionEvents.id })
+    .from(schema.executionEvents)
+    .where(eq(schema.executionEvents.taskId, taskId))
+    .orderBy(schema.executionEvents.id);
+  return rows.map((r) => r.id);
+}
+
+async function advisoryLockCount(): Promise<number> {
+  const [row] = await h.sql<{ n: number }[]>`
+    select count(*)::int as n from pg_locks where locktype = 'advisory'`;
+  return row!.n;
+}
+
+class HeldRollback extends Error {}
+
+/**
+ * Opens a transaction, appends one event for `taskId`, then keeps the
+ * transaction open until `release()`. It then commits, or rolls back when
+ * `rollback` is set.
+ */
+function holdAppend(taskId: string, options: { rollback?: boolean } = {}) {
+  const appended = deferred<bigint>();
+  const gate = deferred();
+  const done = h.db
+    .transaction(async (tx) => {
+      const { id } = await appendEvent(tx, {
+        taskId,
+        type: "agent.note",
+        payload: { holder: true },
+      });
+      appended.resolve(id);
+      await gate.promise;
+      if (options.rollback) throw new HeldRollback();
+    })
+    .then(
+      () => "committed" as const,
+      (err: unknown) => {
+        if (err instanceof HeldRollback) return "rolled back" as const;
+        throw err;
+      },
+    );
+  return { appended: appended.promise, release: () => gate.resolve(), done };
+}
+
+/**
+ * Starts a second transaction that appends one event for `taskId` and, the
+ * moment its insert returns (before it commits), records which ids were
+ * already committed as seen from another connection.
+ */
+function startSecondAppend(taskId: string) {
+  const state = {
+    appended: false,
+    committedWhenAppended: [] as bigint[],
+  };
+  const result = h.db.transaction(async (tx) => {
+    const { id } = await appendEvent(tx, {
+      taskId,
+      type: "agent.note",
+      payload: { holder: false },
+    });
+    state.appended = true;
+    state.committedWhenAppended = await committedIds(taskId);
+    return id;
+  });
+  return { state, result };
+}
+
+describe("per-task commit order (design.md §12.6)", () => {
+  it("makes a second appender for the same task wait until the first commits, so ids commit in id order", async () => {
+    const taskId = await seedTask(h.db, fx, {
+      jiraKey: "EVT-ORD-1",
+      state: "IMPLEMENTING",
+    });
+    const first = holdAppend(taskId);
+    try {
+      const firstId = await first.appended;
+      const second = startSecondAppend(taskId);
+
+      await sleep(500);
+      // Without the per-task lock the second insert returns at once and can
+      // commit while the first, lower id is still uncommitted.
+      expect(second.state.appended).toBe(false);
+      expect(await committedIds(taskId)).toEqual([]);
+
+      first.release();
+      expect(await first.done).toBe("committed");
+      const secondId = await second.result;
+
+      expect(secondId).toBeGreaterThan(firstId);
+      // The first id was already committed when the second id was assigned.
+      expect(second.state.committedWhenAppended).toEqual([firstId]);
+      expect(await committedIds(taskId)).toEqual([firstId, secondId]);
+      expect(await advisoryLockCount()).toBe(0);
+    } finally {
+      first.release();
+      await first.done.catch(() => undefined);
+    }
+  });
+
+  it("does not block appends for a different task in a concurrent open transaction", async () => {
+    const heldTaskId = await seedTask(h.db, fx, {
+      jiraKey: "EVT-ORD-2",
+      state: "IMPLEMENTING",
+    });
+    const otherTaskId = await seedTask(h.db, fx, {
+      jiraKey: "EVT-ORD-3",
+      state: "IMPLEMENTING",
+    });
+    const first = holdAppend(heldTaskId);
+    try {
+      await first.appended;
+      const second = startSecondAppend(otherTaskId);
+
+      const outcome = await Promise.race([
+        second.result.then((id) => ({ id })),
+        sleep(2000).then(() => "timed out" as const),
+      ]);
+
+      expect(outcome).not.toBe("timed out");
+      const { id } = outcome as { id: bigint };
+      expect(await committedIds(otherTaskId)).toEqual([id]);
+      // The held transaction is still open and uncommitted.
+      expect(await committedIds(heldTaskId)).toEqual([]);
+    } finally {
+      first.release();
+      await first.done.catch(() => undefined);
+    }
+  });
+
+  it("releases the lock on rollback, so a waiting appender proceeds", async () => {
+    const taskId = await seedTask(h.db, fx, {
+      jiraKey: "EVT-ORD-4",
+      state: "IMPLEMENTING",
+    });
+    const first = holdAppend(taskId, { rollback: true });
+    try {
+      const firstId = await first.appended;
+      const second = startSecondAppend(taskId);
+
+      await sleep(500);
+      expect(second.state.appended).toBe(false);
+
+      first.release();
+      expect(await first.done).toBe("rolled back");
+      const secondId = await second.result;
+
+      expect(secondId).toBeGreaterThan(firstId);
+      expect(second.state.committedWhenAppended).toEqual([]);
+      expect(await committedIds(taskId)).toEqual([secondId]);
+      expect(await advisoryLockCount()).toBe(0);
+    } finally {
+      first.release();
+      await first.done.catch(() => undefined);
+    }
+  });
+});
