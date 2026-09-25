@@ -2,10 +2,16 @@ import { z } from "zod";
 import {
   IssueSchema,
   NotificationSchema,
+  TaskAggregateSchema,
   TaskCardSchema,
+  TaskTransitionResultSchema,
+  TimelinePageSchema,
   type Issue,
   type Notification,
+  type TaskAggregate,
   type TaskCard,
+  type TaskTransitionResult,
+  type TimelinePage,
 } from "./types.js";
 
 /**
@@ -45,6 +51,12 @@ export interface ListTasksOptions {
 export interface ListIssuesOptions {
   status?: string;
   blocking?: boolean;
+}
+
+export interface GetTimelineOptions {
+  /** Exclusive lower bound: the last event id already loaded. */
+  after?: number;
+  limit?: number;
 }
 
 /**
@@ -108,6 +120,14 @@ export interface BoardApiClient extends ApiClient {
   listIssues(options?: ListIssuesOptions): Promise<Issue[]>;
   listNotifications(): Promise<Notification[]>;
   markNotificationRead(id: string): Promise<Notification>;
+  /** `GET /tasks/:id` (design.md §12.2), the task detail aggregate. */
+  getTask(id: string): Promise<TaskAggregate>;
+  /** `GET /tasks/:id/timeline?after=&limit=` (design.md §12.2, §12.6). */
+  getTimeline(id: string, options?: GetTimelineOptions): Promise<TimelinePage>;
+  /** `POST /tasks/:id/cancel` (design.md §12.2). */
+  cancelTask(id: string): Promise<TaskTransitionResult>;
+  /** `POST /tasks/:id/retry`, only legal from `NEEDS_HUMAN` (design.md §12.2). */
+  retryTask(id: string): Promise<TaskTransitionResult>;
 }
 
 /**
@@ -185,5 +205,24 @@ export function createApiClient(options: ApiClientOptions = {}): BoardApiClient 
       request<Notification[]>("GET", "/notifications", { schema: z.array(NotificationSchema) }),
     markNotificationRead: (id) =>
       request<Notification>("POST", `/notifications/${id}/read`, { schema: NotificationSchema }),
+    getTask: (id) =>
+      request<TaskAggregate>("GET", `/tasks/${id}`, { schema: TaskAggregateSchema }),
+    getTimeline: (id, options = {}) =>
+      request<TimelinePage>(
+        "GET",
+        `/tasks/${id}/timeline${buildQuery({
+          after: options.after === undefined ? undefined : String(options.after),
+          limit: options.limit === undefined ? undefined : String(options.limit),
+        })}`,
+        { schema: TimelinePageSchema },
+      ),
+    cancelTask: (id) =>
+      request<TaskTransitionResult>("POST", `/tasks/${id}/cancel`, {
+        schema: TaskTransitionResultSchema,
+      }),
+    retryTask: (id) =>
+      request<TaskTransitionResult>("POST", `/tasks/${id}/retry`, {
+        schema: TaskTransitionResultSchema,
+      }),
   };
 }

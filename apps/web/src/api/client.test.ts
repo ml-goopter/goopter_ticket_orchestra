@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { makeTaskAggregate } from "../task/fixtures.js";
 import { ApiError, createApiClient } from "./client.js";
 
 function fakeResponse(status: number, body: unknown): Response {
@@ -173,6 +174,79 @@ describe("createApiClient", () => {
     expect(result).toEqual(read);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/notifications/n1/read");
+    expect(init.method).toBe("POST");
+  });
+
+  it("getTask(id) hits GET /tasks/:id and validates the response", async () => {
+    const aggregate = makeTaskAggregate();
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, aggregate));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.getTask("task-1");
+
+    expect(result).toEqual(aggregate);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe("/api/tasks/task-1");
+  });
+
+  const timelinePage = {
+    events: [
+      {
+        id: 1,
+        taskId: "task-1",
+        executionId: null,
+        type: "agent.note",
+        payload: { n: 1 },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
+    nextAfter: 1,
+  };
+
+  it("getTimeline(id, { after, limit }) hits GET /tasks/:id/timeline?after=&limit=", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, timelinePage));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.getTimeline("task-1", { after: 0, limit: 200 });
+
+    expect(result).toEqual(timelinePage);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe("/api/tasks/task-1/timeline?after=0&limit=200");
+  });
+
+  it("getTimeline(id) with no options hits GET /tasks/:id/timeline with no query string", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, timelinePage));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    await client.getTimeline("task-1");
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe("/api/tasks/task-1/timeline");
+  });
+
+  it("cancelTask(id) posts to /tasks/:id/cancel and validates the response", async () => {
+    const body = { from: "IMPLEMENTING", to: "CANCELLED" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.cancelTask("task-1");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/cancel");
+    expect(init.method).toBe("POST");
+  });
+
+  it("retryTask(id) posts to /tasks/:id/retry and validates the response", async () => {
+    const body = { from: "NEEDS_HUMAN", to: "IMPLEMENTING" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.retryTask("task-1");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/retry");
     expect(init.method).toBe("POST");
   });
 });
