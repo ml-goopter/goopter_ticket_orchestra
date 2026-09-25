@@ -31,6 +31,9 @@ Maps onto the global workflow. Steps 1-2 are mine, 3-4 are the Implementer's, 5 
 
 1. **Environment.** `treehouse get` for each parallel Implementer. One worktree per Implementer, never shared. Return every worktree when its task closes.
 2. **Plan.** Restate requirements, name the files and line ranges to change, define acceptance criteria and verification steps. Wait for user approval before dispatching anyone.
+   - **Approval is per task.** Before dispatching each task's Implementer, I show the user that task's plan and spec: objective, `owned_paths`, `forbidden_paths`, acceptance criteria, test command, `model`, and any decisions I made. I dispatch only after the user approves that task. Approving a wave, a milestone, or a list of tasks approves the order, not the individual specs.
+   - A fix round inside an approved task's review loop needs no new approval unless it changes scope, `owned_paths`, or acceptance criteria. Any such change goes back to the user first.
+   - **No unrequested features.** A contract contains only behaviour that `Orchestration-layer-spec.v1.md`, `docs/design.md`, or the tracker task states. If I think a feature is implied but not written (for example a column exists but no route sets it), I list it in the plan as a question and leave it out of the contract unless the user confirms it.
 3. **Dispatch.** One `Implementer` per scoped task, each with its own `worktree`, `owned_paths`, and `forbidden_paths`. Parallel tasks must have disjoint `owned_paths` — if they cannot, the tasks are wrongly cut and I re-split them rather than letting two agents race the same file.
 4. **Verify.** Re-run the test command myself. A reported `PASS` I did not observe does not count.
 5. **Review.** Dispatch a `Reviewer` with the contract and `diff_base` only. Never pass it the Implementer's envelope or reasoning; independence is the reason it catches anything.
