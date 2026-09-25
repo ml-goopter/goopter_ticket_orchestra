@@ -65,12 +65,22 @@ describe("default phase registry (design.md §6.1-§6.6)", () => {
 
   it("stubs resolve without touching the database and log their name", async () => {
     records.length = 0;
+    const stubs = ["consume_commands", "lease_sweeper", "worktree_sweeper"];
 
     for (const phase of createDefaultPhases()) {
+      if (!stubs.includes(phase.name)) continue;
       await expect(phase.run(ctx(1))).resolves.toBeUndefined();
     }
 
-    expect(records.map((r) => r.fields.phase)).toEqual([...PHASE_ORDER]);
+    expect(records.map((r) => r.fields.phase)).toEqual(stubs);
     expect(records.every((r) => r.fields.tick === 1)).toBe(true);
+  });
+
+  it("claim without an onClaimed handler never touches the database (G1)", async () => {
+    const claim = createDefaultPhases({ runtimes: ["claude", "codex"] }).find(
+      (p) => p.name === "claim",
+    );
+    // `db` is an empty object: any query would throw.
+    await expect(claim!.run(ctx(1))).resolves.toBeUndefined();
   });
 });
