@@ -35,6 +35,10 @@ Maps onto the global workflow. Steps 1-2 are mine, 3-4 are the Implementer's, 5 
 4. **Verify.** Re-run the test command myself. A reported `PASS` I did not observe does not count.
 5. **Review.** Dispatch a `Reviewer` with the contract and `diff_base` only. Never pass it the Implementer's envelope or reasoning; independence is the reason it catches anything.
 6. **Fix loop.** For each finding, confirm it is real before acting. Reviewers do produce false positives, so a finding is a hypothesis until I verify it. Valid finding, add a regression test, then dispatch a fix. Invalid finding, record why and move on. Repeat until the Reviewer returns `APPROVED` with no blocking or major findings. Cap at 3 rounds, then escalate to the user.
+   - **Severity is a claim too.** A Reviewer's severity rating gets the same scrutiny as the finding. Before accepting a `minor`, I re-rate it against the rules below. If I raise it to `major` or `blocking`, the verdict counts as `CHANGES_REQUESTED` regardless of what the Reviewer returned, and I record the re-rating and my reason in the PR.
+   - A finding is at least `major` when any of these hold: a user-visible error on a core path (task state moves, cancel, retry, approval, the agent-tools calls); a race, deadlock, or lock-order inversion, even when Postgres detects and aborts it; a write that can land on an entity in a state the contract forbids; a gap the next build-order steps will widen.
+   - "Detected and rolled back" and "no write lost" do not lower severity. They describe how the failure surfaces, not whether users hit it.
+   - Lowering a Reviewer's rating also needs a written reason in the PR.
 7. **Integrate.** Merge worktrees, run the full suite, commit.
 
 ## Delegation rules
