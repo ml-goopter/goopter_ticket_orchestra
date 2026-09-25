@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, exists, inArray, sql } from "drizzle-orm";
 import { executions, taskLeases } from "../schema/executions.js";
 import { issues } from "../schema/issues.js";
 import { notifications } from "../schema/notifications.js";
@@ -66,15 +66,46 @@ export async function findExecutionByTokenHash(
 }
 
 /**
- * Re-reads an execution's state and token hash with `SELECT ... FOR UPDATE`,
- * so a tool can re-check its authorization as the first statement of its
- * transaction and hold that answer until commit: a concurrent revoke or
- * state change waits for the tool, or the tool sees it. `null` when the
- * execution does not exist.
+ * Row-lock strength for the two helpers below. `"update"` is `FOR UPDATE`.
+ * `"key share"` is `FOR KEY SHARE`, the lock a foreign-key check takes on
+ * the referenced row: it still waits behind a `FOR UPDATE` holder, so it
+ * fixes lock order for a transaction that only inserts rows referencing
+ * the task and execution, without blocking other writers.
+ */
+export type ToolRowLock = "update" | "key share";
+
+/**
+ * Locks the task row, `FOR UPDATE` unless `strength` says otherwise. A tool
+ * transaction calls this before `lockExecutionForTool`, so it takes the
+ * task lock before the execution lock, the same order as `transition()`
+ * callers that cancel a task and then its executions. Taking them the other
+ * way round deadlocks against such a caller (40P01). Returns false when the
+ * task does not exist.
+ */
+export async function lockTaskForTool(
+  tx: Tx,
+  taskId: string,
+  strength: ToolRowLock = "update",
+): Promise<boolean> {
+  const [row] = await tx
+    .select({ id: tasks.id })
+    .from(tasks)
+    .where(eq(tasks.id, taskId))
+    .for(strength);
+  return row !== undefined;
+}
+
+/**
+ * Re-reads an execution's state and token hash with `SELECT ... FOR UPDATE`
+ * (or `strength`), so a tool can re-check its authorization as the first
+ * statement of its transaction and hold that answer until commit: a
+ * concurrent revoke or state change waits for the tool, or the tool sees
+ * it. `null` when the execution does not exist.
  */
 export async function lockExecutionForTool(
   tx: Tx,
   executionId: string,
+  strength: ToolRowLock = "update",
 ): Promise<Pick<ExecutionRow, "state" | "toolsTokenHash"> | null> {
   const [row] = await tx
     .select({
@@ -83,15 +114,20 @@ export async function lockExecutionForTool(
     })
     .from(executions)
     .where(eq(executions.id, executionId))
-    .for("update");
+    .for(strength);
   return row ?? null;
 }
 
+/** Execution states whose lease may be renewed: the live ones (§6.4, §6.5). */
+const LEASE_RENEWABLE_STATES = ["ASSIGNED", "RUNNING"] as const;
+
 /**
  * Pushes the execution's lease out to `expiresAt` (design.md §6.4, §8:
- * "Every call also renews the lease"). Returns the new expiry, or `null`
- * when the execution holds no lease — a spec session has none, and that is
- * not an error.
+ * "Every call also renews the lease"), but only while the execution is
+ * `ASSIGNED` or `RUNNING`. A lease is never extended for an execution that
+ * has already ended or been cancelled. Returns the new expiry, or `null`
+ * when nothing was renewed: the execution holds no lease (a spec session
+ * has none) or is not live. Neither is an error.
  */
 export async function renewTaskLease(
   db: DbOrTx,
@@ -101,7 +137,22 @@ export async function renewTaskLease(
   const [row] = await db
     .update(taskLeases)
     .set({ expiresAt })
-    .where(eq(taskLeases.executionId, executionId))
+    .where(
+      and(
+        eq(taskLeases.executionId, executionId),
+        exists(
+          db
+            .select({ one: sql`1` })
+            .from(executions)
+            .where(
+              and(
+                eq(executions.id, taskLeases.executionId),
+                inArray(executions.state, [...LEASE_RENEWABLE_STATES]),
+              ),
+            ),
+        ),
+      ),
+    )
     .returning({ expiresAt: taskLeases.expiresAt });
 
   return row?.expiresAt ?? null;

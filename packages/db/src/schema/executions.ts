@@ -7,6 +7,7 @@ import {
   numeric,
   pgTable,
   text,
+  uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
@@ -82,6 +83,12 @@ export const executions = pgTable(
       table.createdAt,
     ),
     index("executions_state_host_idx").on(table.state, table.host),
+    // Every agent-tools call resolves its bearer by this hash (§8). Unique
+    // so one token can never resolve to two executions; partial because a
+    // revoked or never-issued token is null on many rows.
+    uniqueIndex("executions_tools_token_hash_key")
+      .on(table.toolsTokenHash)
+      .where(sql`${table.toolsTokenHash} is not null`),
   ],
 );
 

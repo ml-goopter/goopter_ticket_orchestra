@@ -10,13 +10,23 @@ import {
 import {
   agentWorkers,
   executions,
+  listActiveExecutionIds,
   projects,
   taskLeases,
   tasks,
   transition,
   type Db,
+  type Tx,
 } from "@orchestra/db";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+} from "vitest";
 import {
   ASSIGNED_TOOLS,
   authenticate,
@@ -35,7 +45,7 @@ import {
 } from "../src/agent-tools/invoke.js";
 import { TOOL_DEFINITIONS } from "../src/agent-tools/tools/index.js";
 import type { LogFields, Logger } from "../src/logger.js";
-import { startTestDb, type TestDb } from "./harness.js";
+import { startTestDb, waitFor, type TestDb } from "./harness.js";
 
 /**
  * design.md §8 agent-tools MCP server, exercised end to end: a real
@@ -281,8 +291,17 @@ function expectOk(result: CallResult): Record<string, unknown> {
   return result.data;
 }
 
-/** AC8: one agent.tool_call row per successful call, lease moved forward. */
-async function expectRecorded(s: Seeded, tool: string, before: number) {
+/**
+ * AC8: one agent.tool_call row per successful call. The lease moves
+ * forward only while the execution is still ASSIGNED or RUNNING, so a tool
+ * that ends the execution passes `leaseRenewed: false` (design.md §6.4).
+ */
+async function expectRecorded(
+  s: Seeded,
+  tool: string,
+  before: number,
+  { leaseRenewed = true }: { leaseRenewed?: boolean } = {},
+) {
   const events = (await eventsFor(s.taskId)).filter(
     (e) => e.type === "agent.tool_call",
   );
@@ -300,6 +319,10 @@ async function expectRecorded(s: Seeded, tool: string, before: number) {
   expect(JSON.stringify(payload)).not.toContain(s.token);
 
   const lease = await getLease(s.executionId);
+  if (!leaseRenewed) {
+    expect(lease!.expiresAt.getTime()).toBe(before);
+    return;
+  }
   expect(lease!.expiresAt.getTime()).toBeGreaterThan(before);
   expect(lease!.expiresAt.getTime()).toBeGreaterThan(Date.now() + LEASE_TTL_MS - 60_000);
 }
@@ -540,6 +563,388 @@ describe("re-authorisation inside the tool transaction", () => {
   }
 });
 
+// ------------------------------------------- lock order against cancel
+
+/**
+ * The api cancel route, statement for statement (apps/api/src/routes/
+ * tasks.ts `POST /tasks/:id/cancel`): task -> CANCELLED, then every active
+ * execution -> CANCELLED, in one transaction. It locks the task row first,
+ * then the execution rows. `pause` runs between the two, holding the task
+ * lock.
+ */
+async function cancelLikeApi(
+  tx: Tx,
+  taskId: string,
+  pause?: () => Promise<void>,
+): Promise<void> {
+  const actor = { kind: "user" as const };
+  await transition(tx, {
+    entity: "task",
+    id: taskId,
+    trigger: "task.cancelled",
+    actor,
+  });
+  await pause?.();
+  for (const executionId of await listActiveExecutionIds(tx, taskId)) {
+    await transition(tx, {
+      entity: "execution",
+      id: executionId,
+      trigger: "execution.cancelled",
+      actor,
+    });
+  }
+}
+
+/** Backends in this database currently blocked on a lock. */
+async function lockWaiters(): Promise<number> {
+  const [row] = await db.$client<{ n: number }[]>`
+    select count(distinct l.pid)::int as n
+    from pg_locks l
+    join pg_stat_activity a on a.pid = l.pid
+    where not l.granted and a.datname = current_database()
+  `;
+  return row!.n;
+}
+
+function untilLockWaiters(n: number): Promise<true> {
+  return waitFor(async () => ((await lockWaiters()) >= n ? true : undefined), {
+    everyMs: 10,
+    what: `${n} backend(s) blocked on a lock`,
+  });
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+/** Postgres SQLSTATE of an error, unwrapping drizzle's query error. */
+function sqlState(err: unknown): string | undefined {
+  const e = err as { code?: string; cause?: { code?: string } };
+  return e?.code ?? e?.cause?.code;
+}
+
+/**
+ * `db` for the tool side of a race: identical, except that it remembers
+ * the SQLSTATE of every transaction that throws, so a tool INTERNAL can be
+ * traced to its cause (40P01 is a deadlock).
+ */
+function recordingDb(failures: string[]): Db {
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== "transaction") return Reflect.get(target, prop, receiver);
+      return async (...args: Parameters<Db["transaction"]>) => {
+        try {
+          return await target.transaction(...args);
+        } catch (err) {
+          failures.push(sqlState(err) ?? "no sqlstate");
+          throw err;
+        }
+      };
+    },
+  });
+}
+
+/**
+ * What each side of the race ended with, in one comparable value. A
+ * deadlock shows up as `cancel: "error 40P01"` or as `tool: "INTERNAL
+ * (40P01)"`.
+ */
+function describeRace(
+  toolResult: Awaited<ReturnType<typeof invokeTool>>,
+  toolFailures: string[],
+  cancel: PromiseSettledResult<void>,
+) {
+  let tool: string;
+  if (toolResult.isError) {
+    const text = (toolResult.content as Array<{ text: string }>)[0]!.text;
+    const code = (JSON.parse(text) as { error: { code: string } }).error.code;
+    // Only Postgres SQLSTATEs (five characters), not a TransitionError's code.
+    const causes = toolFailures.filter((f) => /^[0-9A-Z]{5}$/.test(f));
+    tool = causes.length > 0 ? `${code} (${causes.join(", ")})` : code;
+  } else {
+    tool = "ok";
+  }
+  return {
+    tool,
+    cancel:
+      cancel.status === "fulfilled"
+        ? "ok"
+        : `error ${sqlState(cancel.reason) ?? String(cancel.reason)}`,
+  };
+}
+
+/**
+ * `firstInsert` is the table of the tool's first insert. The tool-first
+ * case parks the tool there, after its explicit locks and before any
+ * foreign-key check could lock the task on its behalf.
+ */
+const RACE_TOOLS: Array<{
+  tool: "note" | "report_pr_created";
+  taskState: TaskState;
+  effect: string;
+  firstInsert: "execution_events" | "pull_requests";
+}> = [
+  {
+    tool: "note",
+    taskState: "IMPLEMENTING",
+    effect: "agent.note",
+    firstInsert: "execution_events",
+  },
+  {
+    tool: "report_pr_created",
+    taskState: "REVIEWING",
+    effect: "pull_request.created",
+    firstInsert: "pull_requests",
+  },
+];
+
+describe("lock order: agent tool vs api cancel (design.md §5, §8)", () => {
+  for (const { tool, taskState, effect, firstInsert } of RACE_TOOLS) {
+    it(`${tool}: cancel holds the task lock first -> cancel commits, tool gets UNAUTHORIZED and writes nothing`, async () => {
+      const s = await seed({ taskState });
+      const def = TOOL_DEFINITIONS.find((d) => d.name === tool)!;
+      const taskLocked = deferred();
+      const release = deferred();
+      let cancel: Promise<void> | undefined;
+      const toolFailures: string[] = [];
+
+      const toolCall = invokeTool(
+        def as unknown as ErasedToolDefinition,
+        VALID_ARGS[tool]!,
+        s.token,
+        {
+          db: recordingDb(toolFailures),
+          registry,
+          logger,
+          now: () => new Date(),
+          // Authenticated while RUNNING. Before the tool's transaction
+          // opens, the cancel takes the task row lock and holds it.
+          afterAuthenticate: async () => {
+            cancel = db.transaction((tx) =>
+              cancelLikeApi(tx, s.taskId, async () => {
+                taskLocked.resolve();
+                await release.promise;
+              }),
+            );
+            await Promise.race([taskLocked.promise, cancel]);
+          },
+        },
+      );
+
+      // The tool's transaction is now blocked behind the cancel's task
+      // lock. Only then let the cancel go on to lock the execution.
+      await untilLockWaiters(1);
+      release.resolve();
+
+      const [toolResult, cancelResult] = await Promise.all([
+        toolCall,
+        Promise.allSettled([cancel!]).then(([r]) => r!),
+      ]);
+
+      expect(describeRace(toolResult, toolFailures, cancelResult)).toEqual({
+        tool: "UNAUTHORIZED",
+        cancel: "ok",
+      });
+      expect((await getTask(s.taskId))!.state).toBe("CANCELLED");
+      expect((await getExecution(s.executionId))!.state).toBe("CANCELLED");
+      const types = (await eventsFor(s.taskId)).map((e) => e.type);
+      expect(types).not.toContain(effect);
+      expect(types).not.toContain("agent.tool_call");
+      expect(
+        await db.query.pullRequests.findMany({
+          where: (t, { eq }) => eq(t.taskId, s.taskId),
+        }),
+      ).toHaveLength(0);
+      expect((await getLease(s.executionId))!.expiresAt.getTime()).toBe(
+        STALE_LEASE.getTime(),
+      );
+    });
+
+    it(`${tool}: tool holds its locks first -> tool commits, then cancel succeeds`, async () => {
+      const s = await seed({ taskState });
+      const def = TOOL_DEFINITIONS.find((d) => d.name === tool)!;
+
+      // Park the tool mid-transaction: it takes its row locks, then waits
+      // on this table lock at its first insert.
+      const held = deferred();
+      const release = deferred();
+      const blocker = db.$client.begin(async (sql) => {
+        await sql`lock table ${sql(firstInsert)} in share mode`;
+        held.resolve();
+        await release.promise;
+      });
+      await held.promise;
+      const toolFailures: string[] = [];
+
+      const toolCall = invokeTool(
+        def as unknown as ErasedToolDefinition,
+        VALID_ARGS[tool]!,
+        s.token,
+        { db: recordingDb(toolFailures), registry, logger, now: () => new Date() },
+      );
+      await untilLockWaiters(1);
+
+      const cancel = db.transaction((tx) => cancelLikeApi(tx, s.taskId));
+      await untilLockWaiters(2);
+      release.resolve();
+      await blocker;
+
+      const [toolResult, cancelResult] = await Promise.all([
+        toolCall,
+        Promise.allSettled([cancel]).then(([r]) => r!),
+      ]);
+
+      expect(describeRace(toolResult, toolFailures, cancelResult)).toEqual({
+        tool: "ok",
+        cancel: "ok",
+      });
+      expect((await getTask(s.taskId))!.state).toBe("CANCELLED");
+      expect((await getExecution(s.executionId))!.state).toBe(
+        tool === "note" ? "CANCELLED" : "COMPLETED",
+      );
+      const types = (await eventsFor(s.taskId)).map((e) => e.type);
+      expect(types).toContain(effect);
+    });
+  }
+
+  it("record() for a failed call while cancel holds the task lock -> both commit, no deadlock", async () => {
+    // record()'s event insert runs one foreign-key check per referenced
+    // row, in constraint creation order. Migration 0000 creates the task
+    // constraint first, so on the committed schema that check alone locks
+    // the task before the execution. Recreate the task constraint so its
+    // check runs last, as a later migration could, leaving record()'s
+    // explicit locks as the only thing that keeps the order.
+    await recreateEventForeignKey("task_id");
+    onTestFinished(() => recreateEventForeignKey("execution_id"));
+
+    // REVIEWING has no review.started edge, so the call fails with
+    // ILLEGAL_TRANSITION and record() runs with ok:false.
+    const s = await seed({ taskState: "REVIEWING" });
+    const def = TOOL_DEFINITIONS.find((d) => d.name === "report_review_started")!;
+    const taskLocked = deferred();
+    const release = deferred();
+    let cancel: Promise<void> | undefined;
+    const toolFailures: string[] = [];
+
+    // renewLease runs right before record()'s transaction. After renewing,
+    // the cancel takes the task row lock and holds it.
+    const base = createLiveExecution(
+      { executionId: s.executionId, taskId: s.taskId, role: "implementation" },
+      { db, now: () => new Date() },
+    );
+    const liveRegistry = createExecutionRegistry();
+    liveRegistry.set({
+      ...base,
+      renewLease: async () => {
+        await base.renewLease();
+        cancel = db.transaction((tx) =>
+          cancelLikeApi(tx, s.taskId, async () => {
+            taskLocked.resolve();
+            await release.promise;
+          }),
+        );
+        await Promise.race([taskLocked.promise, cancel]);
+      },
+    });
+
+    const toolCall = invokeTool(
+      def as unknown as ErasedToolDefinition,
+      { round: 1 },
+      s.token,
+      {
+        db: recordingDb(toolFailures),
+        registry: liveRegistry,
+        logger,
+        now: () => new Date(),
+      },
+    );
+
+    // record()'s transaction is now blocked behind the cancel's task lock.
+    // Only then let the cancel go on to lock the execution.
+    await untilLockWaiters(1);
+    release.resolve();
+
+    const [toolResult, cancelResult] = await Promise.all([
+      toolCall,
+      Promise.allSettled([cancel!]).then(([r]) => r!),
+    ]);
+
+    expect(describeRace(toolResult, toolFailures, cancelResult)).toEqual({
+      tool: "ILLEGAL_TRANSITION",
+      cancel: "ok",
+    });
+    expect((await getTask(s.taskId))!.state).toBe("CANCELLED");
+    expect((await getExecution(s.executionId))!.state).toBe("CANCELLED");
+    const calls = (await eventsFor(s.taskId)).filter(
+      (e) => e.type === "agent.tool_call",
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.payload).toMatchObject({
+      tool: "report_review_started",
+      ok: false,
+      error: "ILLEGAL_TRANSITION",
+    });
+  });
+});
+
+/**
+ * Drops and re-adds one of `execution_events`' foreign keys, unchanged.
+ * The re-added constraint gets a newer trigger, so its check now runs
+ * after the other one's on insert.
+ */
+async function recreateEventForeignKey(
+  column: "task_id" | "execution_id",
+): Promise<void> {
+  const target = column === "task_id" ? "tasks" : "executions";
+  const name = `execution_events_${column}_${target}_id_fk`;
+  await db.$client.unsafe(
+    `alter table execution_events drop constraint ${name}, ` +
+      `add constraint ${name} foreign key (${column}) references ${target}(id)`,
+  );
+}
+
+// ------------------------------------------ lease after a failed call
+
+describe("lease renewal after a failed call (design.md §6.4, §8)", () => {
+  it("a failed call on an execution cancelled before renewal leaves the lease alone and still records ok:false", async () => {
+    // REVIEWING has no review.started edge, so the call fails with
+    // ILLEGAL_TRANSITION. The cancel commits between the rollback and the
+    // lease renewal.
+    const s = await seed({ taskState: "REVIEWING" });
+    const base = createLiveExecution(
+      { executionId: s.executionId, taskId: s.taskId, role: "implementation" },
+      { db, now: () => new Date() },
+    );
+    registry.set({
+      ...base,
+      renewLease: async () => {
+        await db.transaction((tx) => cancelLikeApi(tx, s.taskId));
+        await base.renewLease();
+      },
+    });
+
+    const result = await call(s.token, "report_review_started", { round: 1 });
+
+    expect(result).toMatchObject({ isError: true, code: "ILLEGAL_TRANSITION" });
+    expect((await getExecution(s.executionId))!.state).toBe("CANCELLED");
+    expect((await getLease(s.executionId))!.expiresAt.getTime()).toBe(
+      STALE_LEASE.getTime(),
+    );
+    const calls = (await eventsFor(s.taskId)).filter(
+      (e) => e.type === "agent.tool_call",
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.payload).toMatchObject({
+      tool: "report_review_started",
+      ok: false,
+      error: "ILLEGAL_TRANSITION",
+    });
+    registry.delete(s.executionId);
+  });
+});
+
 describe("role checks write nothing (AC3)", () => {
   const wrongRole: Array<[string, "spec" | "implementation", TaskState]> = [
     ["report_review_started", "spec", "SPEC_IN_PROGRESS"],
@@ -717,6 +1122,11 @@ describe("report_review_started", () => {
       ok: false,
       error: "ILLEGAL_TRANSITION",
     });
+    // The execution is still RUNNING, so the failed call renews the lease.
+    expect((await getExecution(s.executionId))!.state).toBe("RUNNING");
+    expect((await getLease(s.executionId))!.expiresAt.getTime()).toBeGreaterThan(
+      STALE_LEASE.getTime(),
+    );
   });
 });
 
@@ -880,7 +1290,10 @@ describe("report_pr_created", () => {
     const types = (await eventsFor(s.taskId)).map((e) => e.type);
     expect(types).toContain("pull_request.created");
     expect(types).toContain("execution.completed");
-    await expectRecorded(s, "report_pr_created", before.leaseExpiresAt);
+    // The execution is COMPLETED, so the lease is not renewed.
+    await expectRecorded(s, "report_pr_created", before.leaseExpiresAt, {
+      leaseRenewed: false,
+    });
 
     // A following call fails auth, on the same client and on a new one.
     await expect(callOn(client, "note", { text: "after" })).rejects.toThrow(
@@ -932,7 +1345,10 @@ describe("report_failed", () => {
     const task = await getTask(s.taskId);
     expect(task!.state).toBe("NEEDS_HUMAN");
     expect(task!.needsHumanReason).toContain("blocked by flaky infra");
-    await expectRecorded(s, "report_failed", before.leaseExpiresAt);
+    // The execution is FAILED, so the lease is not renewed.
+    await expectRecorded(s, "report_failed", before.leaseExpiresAt, {
+      leaseRenewed: false,
+    });
   });
 
   it("also escalates from REVIEWING", async () => {

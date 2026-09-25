@@ -1,6 +1,12 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { agentTools, TransitionError, type AgentToolName } from "@orchestra/core";
-import { appendEvent, NotFoundError, type Db } from "@orchestra/db";
+import {
+  appendEvent,
+  lockExecutionForTool,
+  lockTaskForTool,
+  NotFoundError,
+  type Db,
+} from "@orchestra/db";
 import type { Logger } from "../logger.js";
 import { renewExecutionLease } from "./lease.js";
 import type { ExecutionRegistry, LiveExecution } from "./registry.js";
@@ -96,16 +102,17 @@ function classify(err: unknown): { code: ToolErrorCode; message: string } {
  *  1. authenticate the bearer for this tool (UNAUTHORIZED, writes nothing);
  *  2. check the execution's role against `agentTools[name].roles`
  *     (FORBIDDEN, writes nothing);
- *  3. run the tool's side effects in one transaction whose first statement
- *     re-checks step 1 under a row lock on the execution (UNAUTHORIZED,
- *     rolls back, writes nothing);
+ *  3. run the tool's side effects in one transaction whose first statements
+ *     lock the task row, then the execution row, and re-check step 1
+ *     (UNAUTHORIZED, rolls back, writes nothing);
  *  4. after commit: in-process follow-ups (`blockingPending`), then lease
  *     renewal, then one `agent.tool_call` event `{ tool, input, ok }`.
  *
  * Input validation against the core schema happens before this, in the
  * MCP SDK, so a malformed call also writes nothing. A call that fails in
  * step 3 rolls back its side effects but is still recorded with
- * `ok: false` and still renews the lease: the agent is demonstrably alive.
+ * `ok: false`. Lease renewal, on success and failure alike, only takes
+ * effect while the execution is still ASSIGNED or RUNNING (`renewTaskLease`).
  */
 export async function invokeTool(
   def: ErasedToolDefinition,
@@ -163,7 +170,7 @@ export async function invokeTool(
   let outcome: Awaited<ReturnType<ErasedToolDefinition["run"]>>;
   try {
     outcome = await db.transaction(async (tx) => {
-      await reauthorize(tx, executionId, bearer, tool);
+      await reauthorize(tx, auth.task.id, executionId, bearer, tool);
       return def.run(ctx(tx), input);
     });
   } catch (err) {
@@ -208,9 +215,12 @@ export async function invokeTool(
 
 /**
  * Lease renewal and the `agent.tool_call` row. Both run after the tool's
- * transaction has committed, and neither failure is surfaced to the agent:
+ * transaction has ended, and neither failure is surfaced to the agent:
  * the call's effects already stand, and the heartbeat renews the lease
- * again within 30 seconds (§6.4).
+ * again within 30 seconds (§6.4). The renewal is a no-op once the
+ * execution is no longer ASSIGNED or RUNNING, for example after this call
+ * completed or failed it, or a cancel landed after a failed call rolled
+ * back. The `agent.tool_call` row is written regardless (§8).
  */
 async function record(
   auth: AuthContext,
@@ -236,8 +246,16 @@ async function record(
   }
 
   try {
-    await deps.db.transaction((tx) =>
-      appendEvent(tx, {
+    await deps.db.transaction(async (tx) => {
+      // Task, then execution: the order of the tool transaction and the api
+      // cancel route. The insert's foreign-key checks would lock both rows
+      // anyway, but in constraint creation order, which a migration can
+      // change. KEY SHARE is the lock those checks take: it waits behind a
+      // cancel's FOR UPDATE on the task, which is what fixes the order, and
+      // adds no conflict the insert did not already have.
+      await lockTaskForTool(tx, auth.task.id, "key share");
+      await lockExecutionForTool(tx, executionId, "key share");
+      await appendEvent(tx, {
         taskId: auth.task.id,
         executionId,
         type: "agent.tool_call",
@@ -247,8 +265,8 @@ async function record(
           ok: error === undefined,
           ...(error === undefined ? {} : { error }),
         },
-      }),
-    );
+      });
+    });
   } catch (err) {
     deps.logger.error(
       { tool, executionId, err: err instanceof Error ? err.message : String(err) },

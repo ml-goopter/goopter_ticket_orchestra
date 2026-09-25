@@ -315,6 +315,59 @@ describe("transition() on an execution (AC3)", () => {
     expect(events.map((r) => r.type)).toEqual(["execution.resumed"]);
   });
 
+  const eventTypeCases: Array<{
+    key: string;
+    trigger: "execution.waiting" | "execution.completed" | "execution.cancelled";
+    to: string;
+    type: string;
+  }> = [
+    {
+      key: "TRN-12",
+      trigger: "execution.waiting",
+      to: "WAITING_FOR_USER",
+      type: "execution.waiting",
+    },
+    {
+      key: "TRN-13",
+      trigger: "execution.completed",
+      to: "COMPLETED",
+      type: "execution.completed",
+    },
+    {
+      key: "TRN-14",
+      trigger: "execution.cancelled",
+      to: "CANCELLED",
+      type: "execution.cancelled",
+    },
+  ];
+
+  for (const c of eventTypeCases) {
+    it(`maps RUNNING -> ${c.to} to ${c.type}`, async () => {
+      const taskId = await seedTask(h.db, fx, {
+        jiraKey: c.key,
+        state: "IMPLEMENTING",
+      });
+      const executionId = await seedExecution(h.db, taskId, {
+        state: "RUNNING",
+      });
+
+      await h.db.transaction(async (tx) =>
+        transition(tx, {
+          entity: "execution",
+          id: executionId,
+          trigger: c.trigger,
+          actor: { kind: "system" },
+        }),
+      );
+
+      const events = await eventRows(taskId);
+      expect(events).toHaveLength(1);
+      expect(events[0]!.type).toBe(c.type);
+      expect(events[0]!.executionId).toBe(executionId);
+      expect(events[0]!.payload).toMatchObject({ from: "RUNNING", to: c.to });
+    });
+  }
+
   it("rejects an illegal execution move and writes nothing", async () => {
     const taskId = await seedTask(h.db, fx, {
       jiraKey: "TRN-9",

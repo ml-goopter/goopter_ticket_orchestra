@@ -15,6 +15,13 @@
       "when": 1790291926889,
       "tag": "0001_sturdy_leader",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790295923000,
+      "tag": "0002_loud_slyde",
+      "breakpoints": true
     }
   ]
 }

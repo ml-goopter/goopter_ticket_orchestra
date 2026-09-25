@@ -382,6 +382,16 @@ describe("listTimeline (AC6)", () => {
     expect(clampTimelineLimit(7.9)).toBe(7);
     expect(clampTimelineLimit(50)).toBe(50);
   });
+
+  it("returns the default for a non-finite limit", () => {
+    expect(clampTimelineLimit(Number.NaN)).toBe(TIMELINE_LIMIT_DEFAULT);
+    expect(clampTimelineLimit(Number.POSITIVE_INFINITY)).toBe(
+      TIMELINE_LIMIT_DEFAULT,
+    );
+    expect(clampTimelineLimit(Number.NEGATIVE_INFINITY)).toBe(
+      TIMELINE_LIMIT_DEFAULT,
+    );
+  });
 });
 
 describe("listOpenIssues (AC6)", () => {
