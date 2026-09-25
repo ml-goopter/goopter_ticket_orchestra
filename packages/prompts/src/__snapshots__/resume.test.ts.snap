@@ -15,7 +15,7 @@ Expected true, got false
 `;
 
 exports[`buildResumePrompt (design.md §9.2, §9.5) > decision: header names the issue and states decision, clarification, and chosen option 1`] = `
-"## Answer to issue issue_784
+"## Answer to your issue issue_784
 Decision: Receipt language is device-local.
 Clarification: Reinstall resets it.
 Chosen option: device-local"
@@ -46,7 +46,7 @@ Reconcile this revision with any work you have already completed in this worktre
 `;
 
 exports[`buildResumePrompt (design.md §9.2, §9.5) > user_message: header lists conversation turns on the open issue 1`] = `
-"## Message from user
+"## Message from the user
 Issue issue_900:
 - user@example.com: Can you use the v2 endpoint instead?
 - agent: Switching to the v2 endpoint."

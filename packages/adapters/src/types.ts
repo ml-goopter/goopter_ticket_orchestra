@@ -22,6 +22,13 @@ export interface StartRequest {
   mcp: { url: string; token: string };
   env: Record<string, string>;
   maxBudgetUsd?: number;
+  /**
+   * Repository test command. Extends §7: the review role's allow list needs
+   * it to grant `Bash(<testCommand>)` (design.md §7.1), but the base request
+   * shape has no field to carry it, so an adapter has no way to satisfy that
+   * grant. Ignored by the `spec` and `implementation` policies.
+   */
+  testCommand?: string;
 }
 
 /**

@@ -49,6 +49,10 @@ describe("deriveColumn: one state maps to each column (§5.1 table)", () => {
     expect(deriveColumn(TaskState.DONE, false)).toBe("Done");
     expect(deriveColumn(TaskState.CANCELLED, false)).toBe("Done");
   });
+
+  it("FAILED -> Done (not in the §5.1 table; terminal, nothing left to act on)", () => {
+    expect(deriveColumn(TaskState.FAILED, false)).toBe("Done");
+  });
 });
 
 describe("deriveColumn: Waiting for You wins for any task state", () => {
@@ -58,5 +62,9 @@ describe("deriveColumn: Waiting for You wins for any task state", () => {
 
   it("wins even for NEEDS_HUMAN", () => {
     expect(deriveColumn(TaskState.NEEDS_HUMAN, true)).toBe("Waiting for You");
+  });
+
+  it("wins even for FAILED, which otherwise maps to Done", () => {
+    expect(deriveColumn(TaskState.FAILED, true)).toBe("Waiting for You");
   });
 });

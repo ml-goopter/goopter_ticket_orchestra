@@ -19,7 +19,7 @@ import {
   type ClaudeQueryFn,
   encodeProjectDir,
 } from "./claude.js";
-import { allowedToolsFor } from "./policies.js";
+import { allowedToolsFor, builtinToolsFor } from "./policies.js";
 import type { AgentEvent, ResumeRequest, StartRequest } from "./types.js";
 
 const SESSION_ID = "11111111-2222-3333-4444-555555555555";
@@ -436,6 +436,116 @@ describe("ClaudeAdapter query options (design.md §7.1)", () => {
       expect(options?.tools).toEqual(["Read", "Glob", "Grep", "Bash"]);
       expect(options).not.toHaveProperty("allowDangerouslySkipPermissions");
       expect(options?.allowedTools).toEqual(allowedToolsFor(policy));
+    });
+  }
+
+  it("grants Bash(<testCommand>) to a review run that carries one (design.md §7.1)", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(
+      adapter.start(
+        {
+          ...startRequest,
+          allowedTools: "review",
+          testCommand: "pnpm -r test",
+        },
+        new AbortController().signal,
+      ),
+    );
+
+    const options = fake.calls[0]?.options;
+    expect(options?.allowedTools).toContain("Bash(pnpm -r test)");
+    expect(options?.tools).toContain("Bash");
+  });
+
+  it("does not grant Bash to a review run without a testCommand", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(
+      adapter.start(
+        { ...startRequest, allowedTools: "review" },
+        new AbortController().signal,
+      ),
+    );
+
+    const options = fake.calls[0]?.options;
+    expect(options?.allowedTools).toEqual(allowedToolsFor("review"));
+    expect(options?.tools).toEqual(builtinToolsFor("review"));
+  });
+
+  // F3: an empty or whitespace-only testCommand must reach validation and be
+  // rejected the same as any other invalid value, not silently omit the
+  // grant.
+  const invalidTestCommands = ["pnpm test) Bash(rm -rf", "", "   "];
+
+  for (const testCommand of invalidTestCommands) {
+    it(`yields a single non-retriable error and never calls query for an invalid testCommand ${JSON.stringify(testCommand)} (start)`, async () => {
+      const fake = scripted([systemInit, resultSuccess()]);
+      const adapter = new ClaudeAdapter({ query: fake.fn });
+
+      const events = await collect(
+        adapter.start(
+          {
+            ...startRequest,
+            allowedTools: "review",
+            testCommand,
+          },
+          new AbortController().signal,
+        ),
+      );
+
+      expect(events).toEqual([
+        {
+          type: "error",
+          message: expect.any(String),
+          retriable: false,
+        },
+      ]);
+      expect(fake.calls).toHaveLength(0);
+    });
+
+    it(`yields a single non-retriable error and never calls query for an invalid testCommand ${JSON.stringify(testCommand)} (resume)`, async () => {
+      const fake = scripted([systemInit, resultSuccess()]);
+      const adapter = new ClaudeAdapter({ query: fake.fn });
+
+      const events = await collect(
+        adapter.resume(
+          {
+            ...resumeRequest,
+            allowedTools: "review",
+            testCommand,
+          },
+          new AbortController().signal,
+        ),
+      );
+
+      expect(events).toEqual([
+        {
+          type: "error",
+          message: expect.any(String),
+          retriable: false,
+        },
+      ]);
+      expect(fake.calls).toHaveLength(0);
+    });
+  }
+
+  for (const policy of ["spec", "implementation"] as const) {
+    it(`ignores testCommand for the ${policy} policy`, async () => {
+      const fake = scripted([systemInit, resultSuccess()]);
+      const adapter = new ClaudeAdapter({ query: fake.fn });
+
+      await collect(
+        adapter.start(
+          { ...startRequest, allowedTools: policy, testCommand: "pnpm -r test" },
+          new AbortController().signal,
+        ),
+      );
+
+      const withCommand = fake.calls[0]?.options?.allowedTools;
+      expect(withCommand).toEqual(allowedToolsFor(policy));
     });
   }
 

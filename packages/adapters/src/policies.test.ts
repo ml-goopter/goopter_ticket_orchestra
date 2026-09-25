@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  InvalidTestCommandError,
+  validateTestCommand,
   CLAUDE_BUILTIN_TOOLS,
   allowedToolsFor,
   builtinToolsFor,
@@ -58,10 +60,62 @@ describe("allowedToolsFor (design.md §7.1 tool policies)", () => {
     ]);
   });
 
-  it("ignores an empty test command", () => {
-    expect(allowedToolsFor("review", { testCommand: "" })).toEqual(
-      allowedToolsFor("review"),
+  it("does not skip the empty-string test command (F3): it reaches validation and throws", () => {
+    expect(() => allowedToolsFor("review", { testCommand: "" })).toThrow(
+      InvalidTestCommandError,
     );
+    expect(() => allowedToolsFor("review", { testCommand: "   " })).toThrow(
+      InvalidTestCommandError,
+    );
+  });
+
+  it("rejects a testCommand a crafted or careless value could widen Bash access with", () => {
+    const rejected = [
+      "",
+      "   ",
+      "*",
+      "pnpm test:*",
+      "pnpm test) Bash(rm -rf",
+      "pnpm (test)",
+      "pnpm test\nrm -rf /",
+      "pnpm test\rrm -rf /",
+      "npm run test:*",
+      // F2: the review role runs exactly one command, so shell operators
+      // that chain, substitute, or redirect into a second command are
+      // rejected too.
+      "pnpm test && x",
+      "pnpm test; x",
+      "pnpm test | x",
+      "pnpm test `x`",
+      "pnpm test $(x)",
+      "pnpm test < x",
+      "pnpm test > x",
+    ];
+    for (const testCommand of rejected) {
+      expect(() => allowedToolsFor("review", { testCommand })).toThrow(
+        InvalidTestCommandError,
+      );
+    }
+  });
+
+  it("accepts ordinary test commands and appends the exact resulting rule", () => {
+    const accepted = [
+      "pnpm test",
+      "npm run test:unit",
+      "pytest -q tests/",
+      "make check",
+      "go test ./...",
+    ];
+    for (const testCommand of accepted) {
+      expect(allowedToolsFor("review", { testCommand })).toEqual([
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash(git diff:*)",
+        "Bash(git log:*)",
+        `Bash(${testCommand})`,
+      ]);
+    }
   });
 
   it("returns every built-in plus the orchestra MCP wildcard for implementation", () => {
@@ -157,5 +211,44 @@ describe("builtinToolsFor (base set of built-ins offered to the session)", () =>
 
   it("leaves implementation on the runtime default, i.e. every built-in", () => {
     expect(builtinToolsFor("implementation")).toBeUndefined();
+  });
+});
+
+describe("validateTestCommand (guards the Bash(<testCommand>) permission rule)", () => {
+  it("rejects empty, parenthesised, wildcard, multi-line and shell-operator values", () => {
+    const rejected = [
+      "",
+      "   ",
+      "*",
+      "pnpm test:*",
+      "pnpm test) Bash(rm -rf",
+      "pnpm (test)",
+      "pnpm test\nrm -rf /",
+      "pnpm test\rrm -rf /",
+      // F2: the review role runs exactly one command.
+      "pnpm test && x",
+      "pnpm test; x",
+      "pnpm test | x",
+      "pnpm test `x`",
+      "pnpm test $(x)",
+      "pnpm test < x",
+      "pnpm test > x",
+    ];
+    for (const value of rejected) {
+      expect(() => validateTestCommand(value)).toThrow(InvalidTestCommandError);
+    }
+  });
+
+  it("accepts ordinary commands", () => {
+    const accepted = [
+      "pnpm test",
+      "npm run test:unit",
+      "pytest -q tests/",
+      "make check",
+      "go test ./...",
+    ];
+    for (const value of accepted) {
+      expect(() => validateTestCommand(value)).not.toThrow();
+    }
   });
 });

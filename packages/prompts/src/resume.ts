@@ -82,7 +82,7 @@ function truncateLog(text: string, max: number): string {
 }
 
 function renderDecisionHeader(payload: DecisionResumePayload): string {
-  const lines = [`## Answer to issue ${payload.issueId}`, `Decision: ${payload.decision}`];
+  const lines = [`## Answer to your issue ${payload.issueId}`, `Decision: ${payload.decision}`];
   if (payload.clarification) {
     lines.push(`Clarification: ${payload.clarification}`);
   }
@@ -113,7 +113,7 @@ function renderCiFailureHeader(payload: CiFailureResumePayload): string {
 
 function renderUserMessageHeader(payload: UserMessageResumePayload): string {
   const turns = payload.messages.map((turn) => `- ${turn.author}: ${turn.body}`).join("\n");
-  return [`## Message from user`, `Issue ${payload.issueId}:`, turns].join("\n");
+  return [`## Message from the user`, `Issue ${payload.issueId}:`, turns].join("\n");
 }
 
 function renderProtocolNudgeHeader(payload: ProtocolNudgePayload): string {

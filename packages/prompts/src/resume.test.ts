@@ -23,7 +23,7 @@ describe("buildResumePrompt (design.md §9.2, §9.5)", () => {
       chosenOption: "device-local",
     });
 
-    expect(prompt.startsWith("## Answer to issue issue_784")).toBe(true);
+    expect(prompt.startsWith("## Answer to your issue issue_784")).toBe(true);
     expect(prompt).toContain("Decision: Receipt language is device-local.");
     expect(prompt).toContain("Clarification: Reinstall resets it.");
     expect(prompt).toContain("Chosen option: device-local");
@@ -87,7 +87,7 @@ describe("buildResumePrompt (design.md §9.2, §9.5)", () => {
       ],
     });
 
-    expect(prompt.startsWith("## Message from user")).toBe(true);
+    expect(prompt.startsWith("## Message from the user")).toBe(true);
     expect(prompt).toContain("issue_900");
     expect(prompt).toContain("- user@example.com: Can you use the v2 endpoint instead?");
     expect(prompt).toContain("- agent: Switching to the v2 endpoint.");
@@ -111,7 +111,7 @@ describe("buildResumePrompt (design.md §9.2, §9.5)", () => {
       userPrompt: "## Ticket\nGOOP-1: Example\n",
     });
 
-    expect(prompt.startsWith("## Answer to issue issue_1")).toBe(true);
+    expect(prompt.startsWith("## Answer to your issue issue_1")).toBe(true);
     expect(prompt).toContain("## Ticket\nGOOP-1: Example");
   });
 });
