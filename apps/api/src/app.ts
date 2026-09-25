@@ -5,11 +5,13 @@ import Fastify, { type FastifyInstance } from "fastify";
 import type { Config } from "./config.js";
 import { registerErrorHandler } from "./lib/errors.js";
 import authPlugin from "./plugins/auth.js";
+import realtimePlugin, { type RealtimeOptions } from "./realtime/index.js";
 import authRoutes from "./routes/auth.js";
 import healthRoutes from "./routes/health.js";
 import tasksRoutes from "./routes/tasks.js";
 import projectsRoutes from "./routes/projects.js";
 import repositoriesRoutes from "./routes/repositories.js";
+import streamRoutes from "./routes/stream.js";
 import usersRoutes from "./routes/users.js";
 import workersRoutes from "./routes/workers.js";
 import "./types.js";
@@ -19,6 +21,8 @@ export interface AppDeps {
   config: Config;
   /** Injectable clock; defaults to the wall clock. Tests pin it. */
   now?: () => Date;
+  /** SSE hub overrides (keepalive interval, row loaders); tests only. */
+  realtime?: RealtimeOptions;
 }
 
 /**
@@ -44,10 +48,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   await app.register(rateLimit, { global: false });
 
   await app.register(authPlugin);
+  await app.register(realtimePlugin, deps.realtime ?? {});
 
   await app.register(healthRoutes, { prefix: "/api" });
   await app.register(authRoutes, { prefix: "/api/auth" });
   await app.register(tasksRoutes, { prefix: "/api" });
+  await app.register(streamRoutes, { prefix: "/api" });
   await app.register(projectsRoutes, { prefix: "/api/projects" });
   await app.register(repositoriesRoutes, { prefix: "/api/repositories" });
   await app.register(usersRoutes, { prefix: "/api/users" });
