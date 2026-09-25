@@ -44,8 +44,10 @@ export interface ClaimOptions {
  * `READY -> IMPLEMENTING` (`task.claimed`). Any failure rolls every one of
  * those back. Returns null when there is no free slot or no eligible task.
  *
- * Lock order: the candidate query locks the task row first; the execution
- * row is created and locked after it.
+ * Lock order: this worker's `agent_workers` row first, so claims by
+ * processes sharing one host run one at a time and each reads capacity
+ * after the previous claim committed; then the candidate query locks the
+ * task row; the execution row is created and locked after it.
  */
 export async function claimNextTask(
   options: ClaimOptions,
@@ -54,6 +56,7 @@ export async function claimNextTask(
   const actor = { kind: "worker" as const, id: workerId };
 
   return db.transaction(async (tx) => {
+    // Locks the worker row before any capacity read (§6.3).
     const worker = await getClaimWorker(tx, workerId);
     if (!worker) {
       throw new Error(`claim: worker not registered: ${workerId}`);

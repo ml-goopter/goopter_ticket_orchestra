@@ -1024,6 +1024,93 @@ describe("claim (design.md §6.3, §7.3)", () => {
     });
   });
 
+  describe("two processes sharing one host (§6.3 capacity)", () => {
+    /**
+     * Two worker processes with the same WORKER_HOST share one agent_workers
+     * row (host is unique). The first claim is held inside its transaction,
+     * with `slowTask` locked and its execution not yet committed, while the
+     * second claim runs on its own connection pool. Without serialisation
+     * the second reads the capacity before the first commits, skips the
+     * locked task and claims the other one.
+     */
+    async function raceSameHost(
+      workerId: string,
+      slowTask: string,
+    ): Promise<Array<ClaimedExecution | null>> {
+      await raw(`create or replace function orchestra_test_slow() returns trigger
+        language plpgsql as $$ begin perform pg_sleep(1); return new; end $$`);
+      await raw(`create trigger orchestra_test_slow before insert on executions
+        for each row when (new.task_id = '${slowTask}')
+        execute function orchestra_test_slow()`);
+      try {
+        const first = runClaim(workerId, ["claude"]);
+        const other = createDb(testDb.connectionString);
+        try {
+          await waitFor(
+            async () => {
+              const rows = (await raw(
+                "select count(*)::int as n from pg_stat_activity where query ilike '%insert into \"executions\"%' and state = 'active' and pid <> pg_backend_pid()",
+              )) as Array<{ n: number }>;
+              return rows[0]!.n > 0 ? true : undefined;
+            },
+            { what: "first claimer to be inside its execution insert", everyMs: 10 },
+          );
+          const second = claimNextTask({
+            db: other,
+            workerId,
+            runtimes: ["claude"],
+            now: NOW,
+          });
+          return await Promise.all([first, second]);
+        } finally {
+          await other.$client.end({ timeout: 5 });
+        }
+      } finally {
+        await raw("drop trigger orchestra_test_slow on executions");
+      }
+    }
+
+    const slotHolding = async (host: string) => {
+      const [row] = (await raw(
+        "select count(*)::int as n from executions where host = $1 and state in ('ASSIGNED', 'RUNNING')",
+        [host],
+      )) as Array<{ n: number }>;
+      return row!.n;
+    };
+
+    it("claims exactly one task when max_concurrent = 1", async () => {
+      const worker = await seedWorker({ host: "shared-slots", maxConcurrent: 1 });
+      const repo = await seedRepo({ maxWorktrees: 5 });
+      const first = await seedTask({ state: "READY", repositoryId: repo, priority: 1 });
+      const second = await seedTask({ state: "READY", repositoryId: repo, priority: 2 });
+
+      const results = await raceSameHost(worker.id, first);
+
+      expect(results.filter((r) => r !== null)).toEqual([
+        expect.objectContaining({ taskId: first }),
+      ]);
+      expect(await slotHolding("shared-slots")).toBe(1);
+      expect(await taskState(second)).toBe("READY");
+      expect(await executionsFor(second)).toEqual([]);
+    });
+
+    it("claims exactly one task when the repository's max_concurrent_worktrees = 1", async () => {
+      const worker = await seedWorker({ host: "shared-wt", maxConcurrent: 5 });
+      const repo = await seedRepo({ maxWorktrees: 1 });
+      const first = await seedTask({ state: "READY", repositoryId: repo, priority: 1 });
+      const second = await seedTask({ state: "READY", repositoryId: repo, priority: 2 });
+
+      const results = await raceSameHost(worker.id, first);
+
+      expect(results.filter((r) => r !== null)).toEqual([
+        expect.objectContaining({ taskId: first }),
+      ]);
+      expect(await slotHolding("shared-wt")).toBe(1);
+      expect(await taskState(second)).toBe("READY");
+      expect(await executionsFor(second)).toEqual([]);
+    });
+  });
+
   describe("onClaimed hand-off (S9, G1)", () => {
     it("is called exactly once, after commit, with the execution and task ids", async () => {
       const worker = await seedWorker();

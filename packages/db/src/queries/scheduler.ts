@@ -121,6 +121,17 @@ export interface ClaimWorker {
   maxConcurrent: number;
 }
 
+/**
+ * Reads and locks the claiming worker's `agent_workers` row `FOR UPDATE`.
+ * `host` is unique, so two processes sharing a WORKER_HOST share this row,
+ * and the lock serialises their claims: the second waits here until the
+ * first commits, then reads capacity (`max_concurrent`,
+ * `max_concurrent_worktrees`) that includes the first claim's execution
+ * (§6.3). Call it first in the claim transaction, before the capacity reads
+ * and the task row lock. Lock order: worker row, then task, then execution.
+ * Registration and heartbeat write only this row, so nothing takes a task
+ * or execution lock before it.
+ */
 export async function getClaimWorker(
   tx: Tx,
   workerId: string,
@@ -131,7 +142,8 @@ export async function getClaimWorker(
       maxConcurrent: agentWorkers.maxConcurrent,
     })
     .from(agentWorkers)
-    .where(eq(agentWorkers.id, workerId));
+    .where(eq(agentWorkers.id, workerId))
+    .for("update");
   return row ?? null;
 }
 
@@ -200,9 +212,9 @@ export interface ClaimCandidate {
  * repository this worker is capable of, whose repository is below `max_concurrent_worktrees` on
  * this host, and whose effective runtime is detected. Locks the task row
  * `FOR UPDATE OF tasks SKIP LOCKED`, so a concurrent claimer skips it and
- * takes the next one. The task lock is the first row lock of the claim
- * transaction, before any execution row, per the task-then-execution lock
- * order.
+ * takes the next one. The task lock follows the worker row lock
+ * (`getClaimWorker`) and precedes any execution row, per the
+ * worker-then-task-then-execution lock order.
  */
 export async function selectClaimCandidate(
   tx: Tx,
