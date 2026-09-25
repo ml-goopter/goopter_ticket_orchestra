@@ -9,3 +9,4 @@ export * from "./dependencies.js";
 export * from "./task-cost.js";
 export * from "./admin.js";
 export * from "./agent-tools.js";
+export * from "./jira.js";
