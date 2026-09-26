@@ -77,6 +77,34 @@ export interface RemoveResult {
   branchDeleted: boolean;
 }
 
+export interface PushIfAheadInput {
+  repositoryName: string;
+  /** Local working branch, e.g. `agent/GOOP-421-0b7c2f4e`. */
+  branch: string;
+  /**
+   * `repositories.default_branch`. Used to count commits only when the
+   * remote does not have `branch` yet.
+   */
+  defaultBranch: string;
+}
+
+/** Why `pushIfAhead` did not push. */
+export type PushSkipReason =
+  /** The remote already has every local commit. */
+  | "not_ahead"
+  /** The remote branch has commits the local branch lacks. */
+  | "diverged"
+  /** No local branch of that name. */
+  | "no_local_branch";
+
+export interface PushIfAheadResult {
+  pushed: boolean;
+  /** Local commits the remote did not have before this call. */
+  ahead: number;
+  /** Set only when `pushed` is false. */
+  reason?: PushSkipReason;
+}
+
 export interface WorktreeManagerOptions {
   /** `WorkerConfig.workspaceRoot`. */
   workspaceRoot: string;
@@ -144,6 +172,12 @@ async function exists(p: string): Promise<boolean> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw err;
   }
+}
+
+/** True when `ref` (a full ref name) exists in the repository at `gitDir`. */
+async function refExists(gitDir: string, ref: string): Promise<boolean> {
+  const out = await runGit(gitDir, ["for-each-ref", "--format=%(refname)", ref]);
+  return out.trim() === ref;
 }
 
 interface WorktreeRecord {
@@ -327,6 +361,57 @@ export class WorktreeManager {
       if (refs.trim() !== ref) return { branchDeleted: false };
       await runGit(barePath, ["branch", "-D", branch]);
       return { branchDeleted: true };
+    });
+  }
+
+  /**
+   * Design.md §6.6 rule three: before an idle worktree is evicted, push its
+   * branch so a later resume can start from `origin/<branch>`. Fetches,
+   * then pushes only when the local branch has commits the remote lacks:
+   * commits not on `origin/<branch>`, or, when the remote has no such
+   * branch, commits beyond the merge-base with `origin/<defaultBranch>`.
+   *
+   * Never force-pushes. A remote branch with commits the local branch lacks
+   * is reported as `diverged` and left alone. Runs under the same
+   * per-repository lock as `prepareImplementation` and `remove`.
+   */
+  async pushIfAhead(input: PushIfAheadInput): Promise<PushIfAheadResult> {
+    const { repositoryName, branch, defaultBranch } = input;
+    assertSafe(repositoryName, SAFE_SEGMENT, "repository name");
+    assertSafe(branch, SAFE_BRANCH, "branch");
+    assertSafe(defaultBranch, SAFE_BRANCH, "default branch");
+    const barePath = path.join(
+      this.workspaceRoot,
+      "repos",
+      `${repositoryName}.git`,
+    );
+    const local = `refs/heads/${branch}`;
+    const tracking = `refs/remotes/origin/${branch}`;
+    const count = async (range: string): Promise<number> =>
+      Number((await runGit(barePath, ["rev-list", "--count", range])).trim());
+
+    return withRepoLock(barePath, async () => {
+      if (!(await exists(barePath)) || !(await refExists(barePath, local))) {
+        return { pushed: false, ahead: 0, reason: "no_local_branch" };
+      }
+      await runGit(barePath, ["fetch", "--quiet", "--prune", "origin"]);
+
+      let ahead: number;
+      if (await refExists(barePath, tracking)) {
+        ahead = await count(`${tracking}..${local}`);
+        const behind = await count(`${local}..${tracking}`);
+        if (behind > 0 && ahead > 0) {
+          return { pushed: false, ahead, reason: "diverged" };
+        }
+      } else {
+        ahead = await count(`refs/remotes/origin/${defaultBranch}..${local}`);
+      }
+      if (ahead === 0) return { pushed: false, ahead: 0, reason: "not_ahead" };
+
+      // A plain refspec: git refuses a non-fast-forward, so a remote that
+      // moved after the fetch fails the push instead of being overwritten.
+      await runGit(barePath, ["push", "--quiet", "origin", `${local}:${local}`]);
+      return { pushed: true, ahead };
     });
   }
 

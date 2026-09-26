@@ -683,3 +683,153 @@ describe("WorktreeManager.remove (design.md §6.6)", () => {
     }
   });
 });
+
+describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
+  /** Commits one file in `worktreePath` and returns the new HEAD. */
+  function commitIn(worktreePath: string, file: string): string {
+    writeFileSyncIn(worktreePath, file, file);
+    git(worktreePath, "add", file);
+    git(worktreePath, "commit", "-q", "-m", `commit ${file}`);
+    return git(worktreePath, "rev-parse", "HEAD");
+  }
+
+  const remoteHas = (branch: string): boolean =>
+    gitOk(remote, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`);
+
+  const pushInput = () => ({
+    repositoryName: repository.name,
+    branch: BRANCH,
+    defaultBranch: repository.defaultBranch,
+  });
+
+  /** Every `git push` argument list the manager ran. */
+  function spyPushes(): { pushes: string[][]; restore: () => void } {
+    const realRunGit = runModule.runGit;
+    const pushes: string[][] = [];
+    const spy = vi.spyOn(runModule, "runGit").mockImplementation((cwd, args) => {
+      if (args[0] === "push") pushes.push([...args]);
+      return realRunGit(cwd, args);
+    });
+    return { pushes, restore: () => spy.mockRestore() };
+  }
+
+  it("P1: pushes a branch the remote lacks when it has commits beyond the default branch", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    const head = commitIn(prepared.worktreePath, "a.txt");
+    const spy = spyPushes();
+
+    try {
+      await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+        pushed: true,
+        ahead: 1,
+      });
+    } finally {
+      spy.restore();
+    }
+
+    expect(remoteTip(BRANCH)).toBe(head);
+    expect(spy.pushes).toHaveLength(1);
+    // Never a force push: no flag, and no `+` refspec.
+    for (const arg of spy.pushes[0]!) {
+      expect(arg).not.toMatch(/^(-f|--force.*|\+.*)$/);
+    }
+  });
+
+  it("P2: pushes and reports the ahead count when the remote branch is behind", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    await manager.pushIfAhead(pushInput());
+    commitIn(prepared.worktreePath, "b.txt");
+    const head = commitIn(prepared.worktreePath, "c.txt");
+
+    await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+      pushed: true,
+      ahead: 2,
+    });
+    expect(remoteTip(BRANCH)).toBe(head);
+  });
+
+  it("P3: does not push a branch with no commits beyond the default branch", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+    const spy = spyPushes();
+
+    try {
+      await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+        pushed: false,
+        ahead: 0,
+        reason: "not_ahead",
+      });
+    } finally {
+      spy.restore();
+    }
+    expect(spy.pushes).toEqual([]);
+    expect(remoteHas(BRANCH)).toBe(false);
+  });
+
+  it("P4: does not push when the remote branch already has every local commit", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    await manager.pushIfAhead(pushInput());
+    const spy = spyPushes();
+
+    try {
+      await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+        pushed: false,
+        ahead: 0,
+        reason: "not_ahead",
+      });
+    } finally {
+      spy.restore();
+    }
+    expect(spy.pushes).toEqual([]);
+  });
+
+  it("P5: reports a diverged remote without pushing or throwing", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    await manager.pushIfAhead(pushInput());
+    commitIn(prepared.worktreePath, "local.txt");
+    // Someone else advances the remote branch from its current tip.
+    git(seed, "fetch", "-q", "origin");
+    git(seed, "checkout", "-q", "-B", BRANCH, `origin/${BRANCH}`);
+    const remoteOnly = pushCommit(BRANCH, "remote.txt", "remote");
+    const spy = spyPushes();
+
+    try {
+      await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+        pushed: false,
+        ahead: 1,
+        reason: "diverged",
+      });
+    } finally {
+      spy.restore();
+    }
+    expect(spy.pushes).toEqual([]);
+    expect(remoteTip(BRANCH)).toBe(remoteOnly);
+  });
+
+  it("P6: reports a missing local branch without pushing", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+    await manager.remove("exec-1", { repositoryName: repository.name, branch: BRANCH });
+
+    await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+      pushed: false,
+      ahead: 0,
+      reason: "no_local_branch",
+    });
+    expect(remoteHas(BRANCH)).toBe(false);
+  });
+
+  it("rejects a branch that could read as a git option", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await expect(
+      manager.pushIfAhead({ ...pushInput(), branch: "--force" }),
+    ).rejects.toThrow(/invalid branch/);
+  });
+});
