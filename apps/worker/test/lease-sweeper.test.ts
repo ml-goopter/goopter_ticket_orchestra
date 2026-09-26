@@ -659,14 +659,4 @@ describe("phase registry (AC9)", () => {
     await phase.run(ctx(me.id));
     await expectSwept(ids, me.id, other.id, "IMPLEMENTING");
   });
-
-  it("leaves the worktree sweeper a stub", async () => {
-    const phase = createDefaultPhases().find(
-      (p) => p.name === "worktree_sweeper",
-    )!;
-    await phase.run({ ...ctx("w-unused"), db: {} as Db });
-    expect(records).toEqual([
-      expect.objectContaining({ msg: "phase not implemented yet" }),
-    ]);
-  });
 });

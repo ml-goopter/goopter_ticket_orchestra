@@ -121,13 +121,15 @@ async function main(): Promise<void> {
           apiToken: config.jiraApiToken,
         })
       : undefined;
+  // One manager for the runner and the §6.6 worktree sweeper.
+  const worktrees = new WorktreeManager({ workspaceRoot: config.workspaceRoot });
   const runner = createRunner({
     db,
     registry,
     logger: log.child({ component: "runner" }),
     workerId,
     host: config.host,
-    worktrees: new WorktreeManager({ workspaceRoot: config.workspaceRoot }),
+    worktrees,
     adapters: { claude: new ClaudeAdapter() },
     toolsUrl: () => toolsServer.url,
     ...(jira ? { fetchTicket: (key: string) => jira.getIssue(key) } : {}),
@@ -141,11 +143,14 @@ async function main(): Promise<void> {
     db,
     workerId,
     config,
-    phases: createDefaultPhases({
-      runtimes,
-      onClaimed: runner.onClaimed,
-      commands,
-    }),
+    phases: createDefaultPhases(
+      {
+        runtimes,
+        onClaimed: runner.onClaimed,
+        commands,
+      },
+      { worktrees },
+    ),
     logger: log,
     intervalMs: DEFAULT_TICK_INTERVAL_MS,
   });

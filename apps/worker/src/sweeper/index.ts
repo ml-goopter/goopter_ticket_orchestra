@@ -13,6 +13,7 @@ import type { Logger } from "../logger.js";
 import type { Phase } from "../tick.js";
 
 export type { ExpiredLease } from "@orchestra/db";
+export * from "./worktrees.js";
 
 /** §6.1: a host that has not heartbeated for 15 minutes is dead. */
 export const DEAD_HOST_AFTER_MS = 15 * 60 * 1000;

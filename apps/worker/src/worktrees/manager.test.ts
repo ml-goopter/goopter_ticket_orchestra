@@ -172,6 +172,7 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
     expect(result).toEqual({
       worktreePath: path.join(workspaceRoot, "work", "exec-1"),
       branch: BRANCH,
+      startPoint: "default_branch",
     });
     expect(git(bareClonePath(), "rev-parse", "--is-bare-repository")).toBe(
       "true",
@@ -292,6 +293,32 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
     expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
   });
 
+  it("resume with fallbackToDefaultBranch starts the branch from origin/<default> when origin lacks it", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+
+    const result = await manager.prepareImplementation(
+      implInput("exec-1", { resumeFromRemote: true, fallbackToDefaultBranch: true }),
+    );
+
+    expect(result.branch).toBe(BRANCH);
+    expect(result.startPoint).toBe("default_branch");
+    expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(remoteTip("main"));
+    expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
+  });
+
+  it("resume with fallbackToDefaultBranch still uses origin/<branch> when it exists", async () => {
+    const pushed = pushCommit(BRANCH, "pushed.txt", "pushed");
+    const manager = new WorktreeManager({ workspaceRoot });
+
+    const result = await manager.prepareImplementation(
+      implInput("exec-1", { resumeFromRemote: true, fallbackToDefaultBranch: true }),
+    );
+
+    expect(result.startPoint).toBe("remote_branch");
+    expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(pushed);
+    expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
+  });
+
   it("A5: resume from the remote branch when a local branch of that name exists", async () => {
     const manager = new WorktreeManager({ workspaceRoot });
     const first = await manager.prepareImplementation(implInput("exec-1"));
@@ -350,6 +377,25 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
 
     expect(git(fresh.worktreePath, "branch", "--show-current")).toBe(BRANCH);
     expect(worktreeRecords()).not.toContain(stale.worktreePath);
+  });
+
+  it("round 2 F1: clears a work/<id> a failed prepare of the same execution left, directory and record", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const failing = { ...repository, setupCommand: "touch leftover.txt; exit 3" };
+    await expect(
+      manager.prepareImplementation(implInput("exec-1", { repository: failing })),
+    ).rejects.toBeInstanceOf(SetupFailedError);
+    const worktreePath = path.join(workspaceRoot, "work", "exec-1");
+    expect(existsSync(path.join(worktreePath, "leftover.txt"))).toBe(true);
+    expect(worktreeRecords()).toContain(worktreePath);
+
+    const result = await manager.prepareImplementation(
+      implInput("exec-1", { resumeFromRemote: true, fallbackToDefaultBranch: true }),
+    );
+
+    expect(result.worktreePath).toBe(worktreePath);
+    expect(existsSync(path.join(worktreePath, "leftover.txt"))).toBe(false);
+    expect(git(worktreePath, "branch", "--show-current")).toBe(BRANCH);
   });
 
   it("A7: a passing setup command runs exactly once with the worktree as cwd", async () => {
@@ -546,6 +592,18 @@ describe("WorktreeManager.prepareSpec (design.md §9.1)", () => {
     expect(existsSync(path.join(result.worktreePath, EXECUTION_CONTEXT_PATH))).toBe(false);
     expect(existsSync(path.join(result.worktreePath, ".setup-ran"))).toBe(false);
   });
+
+  it("round 2 F1: clears a stale work/<id> of the same execution before adding", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const stale = await manager.prepareSpec({ executionId: "spec-1", repository });
+    writeFileSyncIn(stale.worktreePath, "leftover.txt", "stale");
+
+    const result = await manager.prepareSpec({ executionId: "spec-1", repository });
+
+    expect(result.worktreePath).toBe(stale.worktreePath);
+    expect(existsSync(path.join(result.worktreePath, "leftover.txt"))).toBe(false);
+    expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(remoteTip("main"));
+  });
 });
 
 describe("WorktreeManager.remove (design.md §6.6)", () => {
@@ -681,5 +739,291 @@ describe("WorktreeManager.remove (design.md §6.6)", () => {
       rmSpy.mockRestore();
       runGitSpy.mockRestore();
     }
+  });
+});
+
+describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
+  /** Commits one file in `worktreePath` and returns the new HEAD. */
+  function commitIn(worktreePath: string, file: string): string {
+    writeFileSyncIn(worktreePath, file, file);
+    git(worktreePath, "add", file);
+    git(worktreePath, "commit", "-q", "-m", `commit ${file}`);
+    return git(worktreePath, "rev-parse", "HEAD");
+  }
+
+  const remoteHas = (branch: string): boolean =>
+    gitOk(remote, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`);
+
+  const pushInput = () => ({
+    repositoryName: repository.name,
+    branch: BRANCH,
+    defaultBranch: repository.defaultBranch,
+  });
+
+  /** Every `git push` argument list the manager ran. */
+  function spyPushes(): { pushes: string[][]; restore: () => void } {
+    const realRunGit = runModule.runGit;
+    const pushes: string[][] = [];
+    const spy = vi.spyOn(runModule, "runGit").mockImplementation((cwd, args) => {
+      if (args[0] === "push") pushes.push([...args]);
+      return realRunGit(cwd, args);
+    });
+    return { pushes, restore: () => spy.mockRestore() };
+  }
+
+  it("P1: pushes a branch the remote lacks when it has commits beyond the default branch", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    const head = commitIn(prepared.worktreePath, "a.txt");
+    const spy = spyPushes();
+
+    try {
+      await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+        pushed: true,
+        ahead: 1,
+        tip: head,
+      });
+    } finally {
+      spy.restore();
+    }
+
+    expect(remoteTip(BRANCH)).toBe(head);
+    expect(spy.pushes).toHaveLength(1);
+    // Never a force push: no flag, and no `+` refspec.
+    for (const arg of spy.pushes[0]!) {
+      expect(arg).not.toMatch(/^(-f|--force.*|\+.*)$/);
+    }
+  });
+
+  it("P2: pushes and reports the ahead count when the remote branch is behind", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    await manager.pushIfAhead(pushInput());
+    commitIn(prepared.worktreePath, "b.txt");
+    const head = commitIn(prepared.worktreePath, "c.txt");
+
+    await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+      pushed: true,
+      ahead: 2,
+      tip: head,
+    });
+    expect(remoteTip(BRANCH)).toBe(head);
+  });
+
+  it("P3: does not push a branch with no commits beyond the default branch", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    const spy = spyPushes();
+
+    try {
+      await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+        pushed: false,
+        ahead: 0,
+        reason: "not_ahead",
+        tip: git(prepared.worktreePath, "rev-parse", "HEAD"),
+      });
+    } finally {
+      spy.restore();
+    }
+    expect(spy.pushes).toEqual([]);
+    expect(remoteHas(BRANCH)).toBe(false);
+  });
+
+  it("P4: does not push when the remote branch already has every local commit", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    const head = commitIn(prepared.worktreePath, "a.txt");
+    await manager.pushIfAhead(pushInput());
+    const spy = spyPushes();
+
+    try {
+      await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+        pushed: false,
+        ahead: 0,
+        reason: "not_ahead",
+        tip: head,
+      });
+    } finally {
+      spy.restore();
+    }
+    expect(spy.pushes).toEqual([]);
+  });
+
+  it("P5: reports a diverged remote without pushing or throwing", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    await manager.pushIfAhead(pushInput());
+    const localHead = commitIn(prepared.worktreePath, "local.txt");
+    // Someone else advances the remote branch from its current tip.
+    git(seed, "fetch", "-q", "origin");
+    git(seed, "checkout", "-q", "-B", BRANCH, `origin/${BRANCH}`);
+    const remoteOnly = pushCommit(BRANCH, "remote.txt", "remote");
+    const spy = spyPushes();
+
+    try {
+      await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+        pushed: false,
+        ahead: 1,
+        reason: "diverged",
+        tip: localHead,
+      });
+    } finally {
+      spy.restore();
+    }
+    expect(spy.pushes).toEqual([]);
+    expect(remoteTip(BRANCH)).toBe(remoteOnly);
+  });
+
+  it("P6: reports a missing local branch without pushing", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+    await manager.remove("exec-1", { repositoryName: repository.name, branch: BRANCH });
+
+    await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
+      pushed: false,
+      ahead: 0,
+      reason: "no_local_branch",
+      tip: null,
+    });
+    expect(remoteHas(BRANCH)).toBe(false);
+  });
+
+  it("rejects a branch that could read as a git option", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await expect(
+      manager.pushIfAhead({ ...pushInput(), branch: "--force" }),
+    ).rejects.toThrow(/invalid branch/);
+  });
+
+  it("F2: a push that exceeds networkTimeoutMs fails with GitCommandError and pushes nothing", async () => {
+    const manager = new WorktreeManager({ workspaceRoot, networkTimeoutMs: 300 });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    const hook = path.join(remote, "hooks", "pre-receive");
+    await fs.writeFile(hook, "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
+
+    const started = Date.now();
+    const err = await manager.pushIfAhead(pushInput()).catch((e: unknown) => e);
+
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(err).toBeInstanceOf(GitCommandError);
+    expect((err as GitCommandError).args[0]).toBe("push");
+    expect((err as GitCommandError).message).toMatch(/timed out after 300 ms/);
+    expect(remoteHas(BRANCH)).toBe(false);
+    // The repo lock was released: the next call on the repository runs.
+    await fs.rm(hook);
+    await expect(manager.pushIfAhead(pushInput())).resolves.toMatchObject({
+      pushed: true,
+    });
+  });
+
+  it("round 2 F3: the timeout kills git's whole process group, not only git", async () => {
+    const manager = new WorktreeManager({ workspaceRoot, networkTimeoutMs: 1_500 });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    const pidFile = path.join(tmp, "hook-child.pid");
+    // The hook's child records its pid, then sleeps past the timeout.
+    const hook = path.join(remote, "hooks", "pre-receive");
+    await fs.writeFile(
+      hook,
+      `#!/bin/sh\nsh -c 'echo $$ > "$1"; exec sleep 30' sh "${pidFile}" &\nwait\n`,
+      { mode: 0o755 },
+    );
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
+        throw err;
+      }
+    };
+
+    let pid: number | undefined;
+    try {
+      const err = await manager.pushIfAhead(pushInput()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GitCommandError);
+      expect((err as GitCommandError).message).toMatch(/timed out after 1500 ms/);
+      pid = Number((await fs.readFile(pidFile, "utf8")).trim());
+      expect(pid).toBeGreaterThan(0);
+
+      // A killed child is reaped shortly after; a surviving one sleeps 30 s.
+      const deadline = Date.now() + 3_000;
+      while (alive(pid) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(alive(pid)).toBe(false);
+    } finally {
+      await fs.rm(hook, { force: true });
+      if (pid !== undefined && alive(pid)) process.kill(pid, "SIGKILL");
+    }
+  });
+
+  it("F2: a fetch that exceeds networkTimeoutMs fails with GitCommandError", async () => {
+    const manager = new WorktreeManager({ workspaceRoot, networkTimeoutMs: 300 });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    // Local transport runs this in place of git-upload-pack.
+    git(bareClonePath(), "config", "remote.origin.uploadpack", "sleep 30; git-upload-pack");
+
+    const started = Date.now();
+    const err = await manager.pushIfAhead(pushInput()).catch((e: unknown) => e);
+
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(err).toBeInstanceOf(GitCommandError);
+    expect((err as GitCommandError).args[0]).toBe("fetch");
+    expect((err as GitCommandError).message).toMatch(/timed out after 300 ms/);
+  });
+});
+
+describe("WorktreeManager.remove with expectedTip (F2)", () => {
+  it("removes when the local branch is still at expectedTip", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    const tip = git(prepared.worktreePath, "rev-parse", "HEAD");
+
+    await expect(
+      manager.remove("exec-1", {
+        repositoryName: repository.name,
+        branch: BRANCH,
+        expectedTip: tip,
+      }),
+    ).resolves.toEqual({ branchDeleted: true });
+    expect(existsSync(prepared.worktreePath)).toBe(false);
+  });
+
+  it("keeps the worktree and branch when the tip moved", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    const tip = git(prepared.worktreePath, "rev-parse", "HEAD");
+    writeFileSyncIn(prepared.worktreePath, "late.txt", "late");
+    git(prepared.worktreePath, "add", "late.txt");
+    git(prepared.worktreePath, "commit", "-q", "-m", "late");
+
+    await expect(
+      manager.remove("exec-1", {
+        repositoryName: repository.name,
+        branch: BRANCH,
+        expectedTip: tip,
+      }),
+    ).resolves.toEqual({ branchDeleted: false, tipMoved: true });
+    expect(existsSync(prepared.worktreePath)).toBe(true);
+    expect(gitOk(bareClonePath(), "rev-parse", "--verify", `refs/heads/${BRANCH}`)).toBe(true);
+  });
+
+  it("keeps the worktree when expectedTip is null but a local branch now exists", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+
+    await expect(
+      manager.remove("exec-1", {
+        repositoryName: repository.name,
+        branch: BRANCH,
+        expectedTip: null,
+      }),
+    ).resolves.toEqual({ branchDeleted: false, tipMoved: true });
+    expect(existsSync(prepared.worktreePath)).toBe(true);
   });
 });
