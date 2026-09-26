@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `44c4e4b` plus this change.
+Status as of 2026-09-25, main at `d7d66fa` plus this change.
 
 ## Completed
 
@@ -40,6 +40,7 @@ Status as of 2026-09-25, main at `44c4e4b` plus this change.
 | W7 | GOT.44 | cost: pricing table, /costs route, costs view | #38 |
 | fill-in | GOT.27 | deploy: worker service units and operator runbook | #39 |
 | W7 | GOT.43 | worker: failure classification and retry policy | #40 |
+| fill-in | GOT.29 | web: admin views for projects, repositories, users, workers | #41 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -57,7 +58,7 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | W9 | GOT.45 | adapters: Codex implementation | GOT.14 | M9 |
 | W9 | GOT.49 | E2E: same ticket through Codex | GOT.45, 48 | M9 |
 
-Fill-in task with dependencies already met, run when a slot would otherwise sit idle: GOT.29 web admin views (GOT.20, 22).
+Both fill-in tasks (GOT.27, GOT.29) are done. GOT.29 ships without a user disable control (C40): the tracker asks for one, but commit 0167d86 removed the field from `PATCH /users/:id` because design §13 names no such route. Restoring it needs a user decision and is a small api change plus a toggle.
 
 GOT.27's units have not been loaded under launchd on this machine; that is an operator step recorded in `docs/runbook.md` and outside the review loop (PR #39). Plain-http localhost use needs `NODE_ENV=development` for the session cookie (C37).
 
