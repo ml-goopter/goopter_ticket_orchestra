@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `5662f3b` plus this change.
+Status as of 2026-09-25, main at `66dc1e7` plus this change.
 
 ## Completed
 
@@ -36,6 +36,7 @@ Status as of 2026-09-25, main at `5662f3b` plus this change.
 | W6 | GOT.35 | worker: worktree sweeper | #34 |
 | W6 | GOT.30 | worker: Jira comment write-back | #35 |
 | W7 | GOT.42 | web: issue detail view | #36 |
+| W7 | GOT.39 | worker: implementation role with review phase | #37 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -46,7 +47,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
 | W7 | GOT.37 | worker: spec role execution | GOT.31 | M5 |
-| W7 | GOT.39 | worker: implementation role with review phase | GOT.26, 31 | M6 |
 | W7 | GOT.38 | web: spec builder split pane | GOT.22, 28, 32 | M5 |
 | W7 | GOT.43 | worker: failure classification and retry policy | GOT.26, 31 | M8 |
 | W7 | GOT.44 | cost: pricing table, /costs route, costs view | GOT.22, 31 | M8 |
@@ -63,14 +63,18 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 ## Carry-forward notes
 
 - All worker tasks: lease renewal must go through the state-gated db helper; a bypass can renew a cancelled execution. Every transaction that locks both rows takes the task row before the execution row (PR #17, #31).
-- GOT.39: the worktree manager's setup command inherits the full worker environment (database URL, tokens, API keys) and has no timeout. Deferred past GOT.31 by user decision; the implementation role is the next owner (PR #22, #31).
+- GOT.48: the worktree manager's setup command inherits the full worker environment (database URL, tokens, API keys) and has no timeout. Deferred past GOT.31 and GOT.39 without a user decision to change it; the end-to-end run should decide whether to scrub the environment and bound the command (PR #22, #31, #37).
+- GOT.46: call `applyCiFailure` from `packages/db/src/queries/ci.ts` inside a transaction that locks task then execution; it returns `{ applied: false, reason }` for a stale pull request id or head sha and the poller must treat that as "already superseded", not an error. `resume_with_ci_failure` carries `{ pull_request_id, head_sha, round, checks: [{ name, url, log_excerpt }] }` (PR #37).
+- GOT.46: `report_pr_created` now updates the task's single `pull_requests` row and resets it to open; the poller should key its state on `head_sha`, not on row identity (C17, C22, PR #37).
+- GOT.43/47: command handlers return `handled`, `unclaimed` or `skipped` (C20). Only an execution pinned to another host unclaims. A CI resume for an unpinned execution (host null after a dead-host release) is skipped and completed, leaving the task IMPLEMENTING with a COMPLETED execution; the retry policy's fresh-session fallback must pick these up (C21, PR #37).
+- GOT.43: `repositories.test_command` exists (C15, migration 0003); the runner passes it as the review test command. `projects.max_budget_usd` still does not exist (Q9).
 - GOT.43/47: a `WorktreeManager.prepareImplementation` call must follow the end of any earlier session for the same task, because a stale worktree holding the task branch is detached (PR #22).
 - All tasks: run `pnpm typecheck` (or build) before `pnpm test` in a fresh checkout. Worker tests load workspace packages from `dist`, and a stale `dist` fails tests unrelated to the change.
 - GOT.43: the claim inserts the execution QUEUED and moves it to ASSIGNED but never writes the §9.6 `execution.queued` event.
 - GOT.37/46/47: command handlers register with `registerCommandHandler(type, handler)` in `apps/worker/src/runner/commands.ts`; a type with no handler is left unclaimed. The runner's `resume({ executionId, prompt, usageKind })` is the entry point for `resume_with_*` and `send_message`; it refuses when `canResume` is false, and the fresh-session fallback (D5) belongs to GOT.43 (PR #31).
 - GOT.43: a failed execution (`setup_failed`, `adapter_error`, `agent_hung`, `protocol_violation`, `process_crash`) leaves the task IMPLEMENTING with `end_reason` set; the retry policy moves the task (user decision Q10). No `max_budget_usd` column exists anywhere; add it with the policy (Q9). Core now has ASSIGNED → FAILED on `execution.failed` (O1); the §5.2 diagram does not show it (PR #31).
 - GOT.37: spec sessions hold no lease, so the runner renews only for the implementation role. A resumed session's new session id is not stored on resume (PR #31).
-- GOT.39: the runner flushes buffered deltas before every later event, but a runtime that runs tools without consumer backpressure can still write a tool's own event first, so timeline order is best-effort there (PR #31, accepted minor).
+- GOT.48: the runner flushes buffered deltas before every later event, but a runtime that runs tools without consumer backpressure can still write a tool's own event first, so timeline order is best-effort there (PR #31, accepted minor).
 - GOT.43: a lease expiry ends the execution FAILED `lease_expired` with the task left IMPLEMENTING (Q10); the retry policy must also handle a dead-host release, where a WAITING_FOR_USER or COMPLETED execution has `host` and `worker_id` null and `runner.resume` refuses it (OTHER_HOST). The fresh-session fallback (D5, §6.1) starts from that state (PR #32).
 - GOT.47: `runner.resume` re-reads the host pin under the lock and refuses when it changed; a command handler must treat OTHER_HOST as "not mine" and leave the command for another worker rather than fail the execution (PR #32).
 - All worker tasks: lock order is the repository lock, then the task row, then the execution row. Never call the worktree manager from inside a row-locking transaction; a fetch or push can hold the repository lock up to `networkTimeoutMs` (PR #34).
