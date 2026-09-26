@@ -385,7 +385,11 @@ describe("retry starter claim (C25, AC7)", () => {
     ]);
     // C31: the retry took over the failed attempt's worktree on this host.
     expect(row).toMatchObject({ worktreePath: s.previousWorktree, branch: s.branch });
-    expect((await executionRow(s.failedId)).worktreePath).toBeNull();
+    // C38: only worktree_path moves; the failed row keeps its branch.
+    const failed = await executionRow(s.failedId);
+    expect(failed.worktreePath).toBeNull();
+    expect(failed.branch).toBe(s.branch);
+    expect(failed.branch).toBe(row.branch);
   });
 
   it("leaves the worktree with the failed row when it is on another host, evicted, or gone", async () => {
@@ -470,6 +474,96 @@ describe("retry starter claim (C25, AC7)", () => {
     // With claude detected, only the IMPLEMENTING task's retry is taken.
     const taken = await runRetryStarter(starterOptions(capability, spy.runner, later));
     expect(taken.map((c) => c.executionId)).toEqual([capability.retryId]);
+  });
+
+  for (const siblingState of ["WAITING_FOR_USER", "RUNNING"] as const) {
+    it(`a ${siblingState} sibling execution of the task blocks the claim until it ends (F1)`, async () => {
+      const s = await seedRetry();
+      const otherWorker = await seedWorkerRow(db, { host: OTHER_HOST, workspaceRoot: workRoot });
+      const sibling = await seedExecutionRow(db, {
+        taskId: s.taskId,
+        state: siblingState,
+        attempt: 5,
+        host: OTHER_HOST,
+        workerId: otherWorker,
+      });
+      const spy = spyRunner();
+      const due = at(30 * SECOND);
+
+      expect(await runRetryStarter(starterOptions(s, spy.runner, due))).toEqual([]);
+      expect(spy.calls).toHaveLength(0);
+      expect(await executionRow(s.retryId)).toMatchObject({ state: "QUEUED", host: null });
+
+      await raw("update executions set state = 'CANCELLED' where id = $1", [sibling]);
+      const taken = await runRetryStarter(starterOptions(s, spy.runner, due));
+      expect(taken.map((c) => c.executionId)).toEqual([s.retryId]);
+    });
+  }
+
+  it("a repository at max_concurrent_worktrees on this host blocks the claim until a slot frees (F1)", async () => {
+    const s = await seedRetry({ maxConcurrent: 4 });
+    const [task] = await raw<{ project_id: string; repository_id: string }>(
+      "select project_id, repository_id from tasks where id = $1",
+      [s.taskId],
+    );
+    await raw("update repositories set max_concurrent_worktrees = 1 where id = $1", [
+      task!.repository_id,
+    ]);
+    const [neighbour] = await raw<{ id: string }>(
+      `insert into tasks (project_id, repository_id, jira_key, jira_summary, jira_priority,
+         jira_created_at, jira_synced_at, state)
+       values ($1, $2, $3, 'neighbour', 1, $4, $4, 'IMPLEMENTING') returning id`,
+      [task!.project_id, task!.repository_id, `${s.jiraKey}-N`, NOW.toISOString()],
+    );
+    const busy = await seedExecutionRow(db, {
+      taskId: neighbour!.id,
+      state: "RUNNING",
+      host: HOST,
+      workerId: s.workerId,
+    });
+    const spy = spyRunner();
+    const due = at(30 * SECOND);
+
+    expect(await runRetryStarter(starterOptions(s, spy.runner, due))).toEqual([]);
+    expect(spy.calls).toHaveLength(0);
+    expect((await executionRow(s.retryId)).state).toBe("QUEUED");
+
+    await raw("update executions set state = 'COMPLETED' where id = $1", [busy]);
+    const taken = await runRetryStarter(starterOptions(s, spy.runner, due));
+    expect(taken.map((c) => c.executionId)).toEqual([s.retryId]);
+  });
+
+  it("a sibling resumed to RUNNING between the select and the lock is seen by the re-check: null, row untouched (F4)", async () => {
+    const s = await seedRetry();
+    const otherWorker = await seedWorkerRow(db, { host: OTHER_HOST, workspaceRoot: workRoot });
+    const sibling = await seedExecutionRow(db, {
+      taskId: s.taskId,
+      state: "COMPLETED",
+      attempt: 5,
+      host: OTHER_HOST,
+      workerId: otherWorker,
+    });
+    const before = await executionRow(s.retryId);
+    const seen: string[] = [];
+
+    const claimed = await claimNextRetry({
+      db,
+      workerId: s.workerId,
+      runtimes: ["claude"],
+      now: at(30 * SECOND),
+      // A CI resume commits COMPLETED -> RUNNING after the select.
+      beforeLock: async (candidate) => {
+        seen.push(candidate.executionId);
+        await raw("update executions set state = 'RUNNING' where id = $1", [sibling]);
+      },
+    });
+
+    expect(seen).toEqual([s.retryId]);
+    expect(claimed).toBeNull();
+    expect(await executionRow(s.retryId)).toEqual(before);
+    expect(await eventTypes(s.retryId)).toEqual(["execution.queued"]);
+    expect((await executionRow(s.failedId)).worktreePath).toBe(s.previousWorktree);
+    expect(await leaseOf(s.taskId)).toBeUndefined();
   });
 
   it("takes a REVIEWING task's retry", async () => {
@@ -641,6 +735,40 @@ describe("retry start in the runner (C25, C27, AC7, AC8)", () => {
     expect(row.sessionId).toBe("sess-new");
     expect((await executionRow(s.failedId)).worktreePath).toBeNull();
     expect(await eventTypes(s.retryId)).not.toContain("worktree.prepared");
+  });
+
+  for (const where of ["canResume false in the local worktree", "another host"] as const) {
+    it(`a protocol retry started fresh (${where}) keeps the nudge naming the missing call (F3)`, async () => {
+      const s = await seedRetry({
+        endReason: "protocol_violation",
+        ...(where === "another host" ? { previousHost: OTHER_HOST } : {}),
+      });
+      const h = makeRealRunner(s);
+      h.adapter.canResumeResult = false;
+
+      await runRetryStarter(starterOptions(s, h.runner, NOW));
+      await waitFor(async () => (h.adapter.starts.length > 0 ? true : undefined));
+
+      expect(h.adapter.resumes).toHaveLength(0);
+      const prompt = h.adapter.starts[0]!.prompt;
+      expect(prompt.startsWith("## Retry of attempt 1")).toBe(true);
+      expect(prompt).toContain("## Protocol reminder");
+      expect(prompt).toContain(
+        "Your last turn ended without calling report_pr_created, report_failed, or a blocking raise_issue",
+      );
+      expect(prompt).toContain("## Approved specification (revision 2)");
+    });
+  }
+
+  it("an infrastructure retry started fresh carries no protocol nudge", async () => {
+    const s = await seedRetry();
+    const h = makeRealRunner(s);
+    h.adapter.canResumeResult = false;
+
+    await runRetryStarter(starterOptions(s, h.runner, at(30 * SECOND)));
+    await waitFor(async () => (h.adapter.starts.length > 0 ? true : undefined));
+
+    expect(h.adapter.starts[0]!.prompt).not.toContain("## Protocol reminder");
   });
 
   it("a failed attempt from another host: no push, fresh from the remote branch", async () => {

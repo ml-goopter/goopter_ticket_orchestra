@@ -3,6 +3,7 @@ import type { Runtime } from "@orchestra/core";
 import {
   countSlotHoldingExecutions,
   getClaimWorker,
+  hasOtherLiveExecution,
   lockPreviousWorktree,
   lockQueuedRetry,
   pinRetryExecution,
@@ -11,6 +12,7 @@ import {
   transferRetryWorktree,
   transition,
   type Db,
+  type RetryCandidate,
 } from "@orchestra/db";
 import { LEASE_TTL_MS } from "../agent-tools/lease.js";
 import type { Logger } from "../logger.js";
@@ -51,6 +53,12 @@ export interface ClaimNextRetryOptions {
   /** Runtimes detected on PATH at startup (§7.3). */
   runtimes: readonly Runtime[];
   now: Date;
+  /**
+   * Called after the candidate select (which holds the task row lock) and
+   * before the execution row lock. Tests use it to commit a concurrent
+   * change; production passes nothing.
+   */
+  beforeLock?: (candidate: RetryCandidate) => Promise<void>;
 }
 
 /**
@@ -61,8 +69,12 @@ export interface ClaimNextRetryOptions {
  * task's lease. When the failed attempt's worktree is on this host, not
  * evicted, and still on disk, the retry takes it over in the same
  * transaction (C31, C32): the retry row gets its path and branch and the
- * failed row's `worktree_path` is cleared. Null when there is no free slot
- * or no due retry. Lock order: worker, task, retry execution, failed
+ * failed row's `worktree_path` is cleared. The select's "no other live
+ * execution" filter is re-checked in a fresh statement once the task and
+ * execution rows are locked, so a sibling that went live after the
+ * select's snapshot (a CI resume, F4) leaves the row QUEUED with no
+ * writes. Null when there is no free slot, no due retry, or that re-check
+ * finds a live sibling. Lock order: worker, task, retry execution, failed
  * execution. The worktree manager is never called here; the only file
  * system access is one `stat` of the old worktree path.
  */
@@ -93,7 +105,11 @@ export async function claimNextRetry(
         `retry starter: execution ${candidate.executionId} has a malformed execution.queued payload`,
       );
     }
+    await options.beforeLock?.(candidate);
     if (!(await lockQueuedRetry(tx, candidate.executionId))) return null;
+    if (await hasOtherLiveExecution(tx, candidate.taskId, candidate.executionId)) {
+      return null;
+    }
 
     await pinRetryExecution(tx, candidate.executionId, { workerId, host: worker.host });
 

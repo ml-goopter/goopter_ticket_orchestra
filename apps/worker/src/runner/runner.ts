@@ -218,20 +218,26 @@ export function infraRetryResumePrompt(previousAttempt: number, endReason: strin
 /**
  * Header put before the normal start prompt when a retry starts a fresh
  * session: in the failed attempt's own worktree (C32), or in a new one
- * from the remote branch (C27).
+ * from the remote branch (C27). A protocol retry (C26) also carries the
+ * `protocol_nudge` text naming the missing call, so the nudge survives a
+ * fresh start.
  */
 export function freshRetryHeader(
   previousAttempt: number,
   endReason: string,
   sameWorktree: boolean,
+  nudge?: { missingToolCall: string },
 ): string {
   const where = sameWorktree
     ? "It runs in the same worktree, so that attempt's changes, committed or not, are still here"
     : "The working branch starts from what that attempt pushed, if anything";
-  return [
+  const header = [
     `## Retry of attempt ${previousAttempt}`,
     `The previous attempt (${previousAttempt}) ended with ${endReason}. This is a new session. ${where}; check its state before continuing.`,
   ].join("\n");
+  return nudge
+    ? `${header}\n\n${buildResumePrompt("protocol_nudge", { missingToolCall: nudge.missingToolCall })}`
+    : header;
 }
 
 export interface Runner {
@@ -877,10 +883,10 @@ export function createRunner(deps: RunnerDeps): Runner {
           await resumeRetry(state, ctx, previous, session, retry, log);
           return;
         }
-        await prepareAndRun(state, ctx, log, previous, reused);
+        await prepareAndRun(state, ctx, log, previous, reused, retry.nudge);
         return;
       }
-      await prepareAndRun(state, ctx, log, previous);
+      await prepareAndRun(state, ctx, log, previous, null, retry.nudge);
     });
   }
 
@@ -1011,7 +1017,8 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   /**
    * Prepares a worktree and starts a new session. `retryOf` is the failed
-   * attempt of a fresh retry, and the prompt names it. With `reuse` (C32)
+   * attempt of a fresh retry, and the prompt names it, with the protocol
+   * `nudge` when the retry is a protocol one (C26, F3). With `reuse` (C32)
    * the session starts in the failed attempt's worktree the retry took
    * over, and nothing is pushed or prepared. Without it, a retry pushes the
    * failed attempt's branch first when it ran on this host (C27) and
@@ -1024,6 +1031,7 @@ export function createRunner(deps: RunnerDeps): Runner {
     log: Logger,
     retryOf: RunnerContext["execution"] | null = null,
     reuse: { worktreePath: string; branch: string | null } | null = null,
+    nudge?: { missingToolCall: string },
   ): Promise<void> {
     await setExecutionPlacement(db, ctx.execution.id, { workerId, host });
 
@@ -1128,7 +1136,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       },
     });
     const prompt = retryOf
-      ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure", reuse !== null)}\n\n${startPrompt}`
+      ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure", reuse !== null, nudge)}\n\n${startPrompt}`
       : startPrompt;
 
     if (state.stopReason !== null) return;

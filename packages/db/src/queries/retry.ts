@@ -340,3 +340,28 @@ export async function transferRetryWorktree(
     .set({ worktreePath: null })
     .where(eq(executions.id, input.fromExecutionId));
 }
+
+/**
+ * Whether the task has a live execution (`QUEUED`, `ASSIGNED`, `RUNNING`,
+ * `WAITING_FOR_USER`) other than `executionId`. The retry claim runs it as
+ * its own statement after the task and execution locks, so it reads a
+ * snapshot newer than the candidate select's (F4).
+ */
+export async function hasOtherLiveExecution(
+  tx: Tx,
+  taskId: string,
+  executionId: string,
+): Promise<boolean> {
+  const [row] = await tx
+    .select({ id: executions.id })
+    .from(executions)
+    .where(
+      and(
+        eq(executions.taskId, taskId),
+        ne(executions.id, executionId),
+        inArray(executions.state, [...LIVE_STATES]),
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
+}
