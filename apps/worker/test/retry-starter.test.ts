@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -39,6 +40,7 @@ import {
   type StartOptions,
 } from "../src/runner/index.js";
 import type { ClaimedExecution } from "../src/scheduler/index.js";
+import { sweepWorktrees, type WorktreeOps } from "../src/sweeper/index.js";
 import type { PrepareImplementationInput } from "../src/worktrees/index.js";
 import type { PushIfAheadInput } from "../src/worktrees/manager.js";
 import {
@@ -381,6 +383,28 @@ describe("retry starter claim (C25, AC7)", () => {
         options: { retry: { previousExecutionId: s.failedId } },
       },
     ]);
+    // C31: the retry took over the failed attempt's worktree on this host.
+    expect(row).toMatchObject({ worktreePath: s.previousWorktree, branch: s.branch });
+    expect((await executionRow(s.failedId)).worktreePath).toBeNull();
+  });
+
+  it("leaves the worktree with the failed row when it is on another host, evicted, or gone", async () => {
+    const remote = await seedRetry({ previousHost: OTHER_HOST, maxConcurrent: 4 });
+    const gone = await seedRetry({ createWorktree: false });
+    const evicted = await seedRetry();
+    await raw("update executions set worktree_evicted_at = $1 where id = $2", [
+      NOW.toISOString(),
+      evicted.failedId,
+    ]);
+    const spy = spyRunner();
+
+    const taken = await runRetryStarter(starterOptions(remote, spy.runner, at(30 * SECOND)));
+
+    expect(taken).toHaveLength(3);
+    for (const s of [remote, gone, evicted]) {
+      expect((await executionRow(s.retryId)).worktreePath).toBeNull();
+      expect((await executionRow(s.failedId)).worktreePath).toBe(s.previousWorktree);
+    }
   });
 
   it("replaces a lease the failed attempt left behind", async () => {
@@ -537,6 +561,34 @@ describe("retry start in the runner (C25, C27, AC7, AC8)", () => {
     expect(row.worktreePath).toBe(s.previousWorktree);
     expect(row.branch).toBe(s.branch);
     expect(row.startedAt).not.toBeNull();
+    const failed = await executionRow(s.failedId);
+    expect(failed.worktreePath).toBeNull();
+
+    // C31: sweeper rule two on the failed row, aged 25 h, removes nothing.
+    const removed: string[] = [];
+    const ops: WorktreeOps = {
+      withRepositoryLock: (_name, fn) =>
+        fn({
+          remove: async (worktreePath) => {
+            removed.push(worktreePath);
+            return { branchDeleted: false };
+          },
+        }),
+      pushIfAhead: async () => ({ pushed: false, ahead: 0, reason: "not_ahead", tip: null }),
+    };
+    await sweepWorktrees(
+      {
+        db,
+        host: HOST,
+        workspaceRoot: workRoot,
+        diskHighWaterPct: 101,
+        now: new Date(failed.endedAt!.getTime() + 25 * 60 * 60 * 1000),
+        logger,
+      },
+      { worktrees: ops, diskUsage: async () => 0 },
+    );
+    expect(removed).toEqual([]);
+    await expect(fs.stat(s.previousWorktree)).resolves.toBeTruthy();
     expect(await eventTypes(s.retryId)).toEqual(
       expect.arrayContaining(["execution.queued", "execution.assigned", "execution.started", "execution.completed"]),
     );
@@ -554,8 +606,15 @@ describe("retry start in the runner (C25, C27, AC7, AC8)", () => {
     expect(prompt).toContain("report_pr_created, report_failed, or a blocking raise_issue");
   });
 
-  it("canResume false: pushes the old branch, then prepares from the remote branch and starts fresh with the header", async () => {
+  it("canResume false with a local worktree holding an unpushed commit: fresh session in that worktree, commit kept, nothing prepared (C32)", async () => {
     const s = await seedRetry();
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: s.previousWorktree, encoding: "utf8" }).trim();
+    git("init", "--quiet", "-b", "work");
+    await fs.writeFile(path.join(s.previousWorktree, "receipt.txt"), "locale\n");
+    git("add", "receipt.txt");
+    git("-c", "user.name=agent", "-c", "user.email=agent@example.com", "commit", "--quiet", "-m", "unpushed work");
+    const tip = git("rev-parse", "HEAD");
     const h = makeRealRunner(s);
     h.adapter.canResumeResult = false;
 
@@ -564,23 +623,24 @@ describe("retry start in the runner (C25, C27, AC7, AC8)", () => {
       (await executionRow(s.retryId)).state === "COMPLETED" ? true : undefined,
     );
 
-    expect(h.calls).toEqual(["pushIfAhead", "prepareImplementation"]);
-    expect(h.pushed).toEqual([
-      { repositoryName: s.repositoryName, branch: s.branch, defaultBranch: "main" },
-    ]);
-    expect(h.prepared[0]).toMatchObject({
-      executionId: s.retryId,
-      resumeFromRemote: true,
-      fallbackToDefaultBranch: true,
-    });
+    expect(h.adapter.canResumeCalls).toEqual([{ sessionId: "sess-prev", cwd: s.previousWorktree }]);
+    expect(h.calls).toEqual([]);
     expect(h.adapter.resumes).toHaveLength(0);
     const req = h.adapter.starts[0]!;
+    expect(req.cwd).toBe(s.previousWorktree);
     expect(req.prompt.startsWith("## Retry of attempt 1")).toBe(true);
     expect(req.prompt).toContain("process_crash");
+    expect(req.prompt).toContain("same worktree");
     expect(req.prompt).toContain("## Approved specification (revision 2)");
+    expect(git("rev-parse", "HEAD")).toBe(tip);
+    expect(git("log", "-1", "--format=%s")).toBe("unpushed work");
+
     const row = await executionRow(s.retryId);
-    expect(row.worktreePath).toBe(path.join(workRoot, "work", s.retryId));
+    expect(row.worktreePath).toBe(s.previousWorktree);
+    expect(row.branch).toBe(s.branch);
     expect(row.sessionId).toBe("sess-new");
+    expect((await executionRow(s.failedId)).worktreePath).toBeNull();
+    expect(await eventTypes(s.retryId)).not.toContain("worktree.prepared");
   });
 
   it("a failed attempt from another host: no push, fresh from the remote branch", async () => {
@@ -592,7 +652,12 @@ describe("retry start in the runner (C25, C27, AC7, AC8)", () => {
 
     expect(h.adapter.canResumeCalls).toHaveLength(0);
     expect(h.calls).toEqual(["prepareImplementation"]);
-    expect(h.prepared[0]!.resumeFromRemote).toBe(true);
+    expect(h.prepared[0]).toMatchObject({
+      executionId: s.retryId,
+      resumeFromRemote: true,
+      fallbackToDefaultBranch: true,
+    });
+    expect(h.adapter.starts[0]!.prompt).toContain("what that attempt pushed");
   });
 
   it("a worktree that is gone on this host: fresh start after the push", async () => {
@@ -604,6 +669,11 @@ describe("retry start in the runner (C25, C27, AC7, AC8)", () => {
 
     expect(h.adapter.canResumeCalls).toHaveLength(0);
     expect(h.calls).toEqual(["pushIfAhead", "prepareImplementation"]);
+    expect(h.pushed).toEqual([
+      { repositoryName: s.repositoryName, branch: s.branch, defaultBranch: "main" },
+    ]);
+    expect(h.prepared[0]).toMatchObject({ resumeFromRemote: true, fallbackToDefaultBranch: true });
+    expect((await executionRow(s.retryId)).worktreePath).toBe(path.join(workRoot, "work", s.retryId));
   });
 });
 

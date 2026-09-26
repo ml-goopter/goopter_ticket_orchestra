@@ -279,3 +279,64 @@ export async function pinRetryExecution(
     .set({ workerId: placement.workerId, host: placement.host })
     .where(eq(executions.id, executionId));
 }
+
+/** Where a failed attempt's worktree is, read under its row lock (C31). */
+export interface RetryPreviousWorktree {
+  host: string | null;
+  worktreePath: string | null;
+  branch: string | null;
+  worktreeEvictedAt: Date | null;
+}
+
+/**
+ * Locks the failed attempt's execution row `FOR UPDATE` and returns where
+ * its worktree is. Call after the task row and the retry's own row, in the
+ * retry claim transaction. Null when the row is gone or not `FAILED`.
+ */
+export async function lockPreviousWorktree(
+  tx: Tx,
+  input: { executionId: string; taskId: string },
+): Promise<RetryPreviousWorktree | null> {
+  const [row] = await tx
+    .select({
+      host: executions.host,
+      worktreePath: executions.worktreePath,
+      branch: executions.branch,
+      worktreeEvictedAt: executions.worktreeEvictedAt,
+    })
+    .from(executions)
+    .where(
+      and(
+        eq(executions.id, input.executionId),
+        eq(executions.taskId, input.taskId),
+        eq(executions.state, "FAILED"),
+      ),
+    )
+    .for("update");
+  return row ?? null;
+}
+
+/**
+ * C31: the retry takes over the failed attempt's worktree. Sets the
+ * retry's `worktree_path` and `branch`, and clears the failed row's
+ * `worktree_path`, so the worktree sweeper never treats the directory as
+ * the failed row's. Both rows are locked by the caller.
+ */
+export async function transferRetryWorktree(
+  tx: Tx,
+  input: {
+    fromExecutionId: string;
+    toExecutionId: string;
+    worktreePath: string;
+    branch: string | null;
+  },
+): Promise<void> {
+  await tx
+    .update(executions)
+    .set({ worktreePath: input.worktreePath, branch: input.branch })
+    .where(eq(executions.id, input.toExecutionId));
+  await tx
+    .update(executions)
+    .set({ worktreePath: null })
+    .where(eq(executions.id, input.fromExecutionId));
+}

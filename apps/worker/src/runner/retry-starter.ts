@@ -1,11 +1,14 @@
+import fs from "node:fs/promises";
 import type { Runtime } from "@orchestra/core";
 import {
   countSlotHoldingExecutions,
   getClaimWorker,
+  lockPreviousWorktree,
   lockQueuedRetry,
   pinRetryExecution,
   replaceTaskLease,
   selectRetryCandidate,
+  transferRetryWorktree,
   transition,
   type Db,
 } from "@orchestra/db";
@@ -24,6 +27,12 @@ import type { RetryStart, Runner } from "./runner.js";
  * where the policy writes it together with the protocol nudge the starter
  * also needs. It is not derived from `created_at`, because a protocol
  * retry has no backoff and does not use an infrastructure retry.
+ *
+ * Out of scope here (GOT.47): executions released from a dead host with
+ * `host` null that are WAITING_FOR_USER, or COMPLETED with a skipped CI
+ * resume (C21). They are not FAILED, have no retry row, and are never
+ * taken by this starter; their fresh-session fallback (D5, §6.1) belongs
+ * to the resume commands in GOT.47.
  */
 
 export const DEFAULT_RETRY_STARTER_INTERVAL_MS = 5_000;
@@ -49,8 +58,13 @@ export interface ClaimNextRetryOptions {
  * (the claim's capacity helper, §6.3), lock the oldest due retry's task row
  * `SKIP LOCKED`, then its execution row, pin the execution to this worker,
  * move it `QUEUED -> ASSIGNED` (`execution.assigned`) and replace the
- * task's lease. Null when there is no free slot or no due retry. Lock
- * order: worker, task, execution. Nothing here touches a worktree.
+ * task's lease. When the failed attempt's worktree is on this host, not
+ * evicted, and still on disk, the retry takes it over in the same
+ * transaction (C31, C32): the retry row gets its path and branch and the
+ * failed row's `worktree_path` is cleared. Null when there is no free slot
+ * or no due retry. Lock order: worker, task, retry execution, failed
+ * execution. The worktree manager is never called here; the only file
+ * system access is one `stat` of the old worktree path.
  */
 export async function claimNextRetry(
   options: ClaimNextRetryOptions,
@@ -82,6 +96,24 @@ export async function claimNextRetry(
     if (!(await lockQueuedRetry(tx, candidate.executionId))) return null;
 
     await pinRetryExecution(tx, candidate.executionId, { workerId, host: worker.host });
+
+    const previous = await lockPreviousWorktree(tx, {
+      executionId: queued.retry_of,
+      taskId: candidate.taskId,
+    });
+    if (
+      previous?.worktreePath &&
+      previous.host === worker.host &&
+      previous.worktreeEvictedAt === null &&
+      (await directoryExists(previous.worktreePath))
+    ) {
+      await transferRetryWorktree(tx, {
+        fromExecutionId: queued.retry_of,
+        toExecutionId: candidate.executionId,
+        worktreePath: previous.worktreePath,
+        branch: previous.branch,
+      });
+    }
     await transition(tx, {
       entity: "execution",
       id: candidate.executionId,
@@ -100,6 +132,14 @@ export async function claimNextRetry(
     if (queued.nudge) retry.nudge = { missingToolCall: queued.nudge.missing_tool_call };
     return { executionId: candidate.executionId, taskId: candidate.taskId, retry };
   });
+}
+
+async function directoryExists(p: string): Promise<boolean> {
+  try {
+    return (await fs.stat(p)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 export interface RetryStarterOptions {

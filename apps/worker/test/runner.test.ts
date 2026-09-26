@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -293,7 +294,10 @@ class FakeAdapter implements AgentAdapter {
     return this.script({ token: req.mcp.token, signal, executionId: this.executionIdFor(req.cwd) });
   }
 
-  async canResume(): Promise<boolean> {
+  readonly canResumeCalls: Array<{ sessionId: string; cwd: string }> = [];
+
+  async canResume(sessionId: string, cwd: string): Promise<boolean> {
+    this.canResumeCalls.push({ sessionId, cwd });
     await this.onCanResume?.();
     return this.canResumeResult;
   }
@@ -1271,7 +1275,7 @@ describe("resume after eviction (§6.6, F3)", () => {
     const repositoryName = repo!.name;
     const push = await manager.pushIfAhead({ repositoryName, branch, defaultBranch: "main" });
     expect(push.pushed).toBe(options.committed);
-    await manager.remove(s.executionId, { repositoryName, branch });
+    await manager.remove(worktreePath, { repositoryName, branch });
     await db.$client.unsafe(
       "update executions set worktree_evicted_at = now() where id = $1",
       [s.executionId],
@@ -1322,6 +1326,36 @@ describe("resume after eviction (§6.6, F3)", () => {
       start_point: "remote_branch",
     });
     expect(records.filter((r) => r.level === "warn")).toEqual([]);
+  });
+
+  it("GOT.43 C33: recreates a retry's evicted worktree at its recorded work/<failed id>, where canResume looks", async () => {
+    const { s, h, branch, head } = await evictedExecution({ committed: true });
+    // The retry took over the failed attempt's worktree (C31), so the row
+    // records work/<failed attempt id>, not work/<its own id>.
+    const recorded = path.join(workspaceRoot, "work", "0f0f0f0f-1111-4222-8333-444455556666");
+    await db.$client.unsafe("update executions set worktree_path = $1 where id = $2", [
+      recorded,
+      s.executionId,
+    ]);
+    let during: string | undefined;
+    h.adapter.script = async function* () {
+      during = git(recorded, "rev-parse", "HEAD");
+      await completeViaTool(s.executionId);
+      yield { type: "turn_done", finalText: "done" };
+    };
+
+    const { done } = await h.runner.resume({ executionId: s.executionId, prompt: "answer" });
+    await done;
+
+    expect(h.prepared.at(-1)!.worktreePath).toBe(recorded);
+    expect(h.adapter.canResumeCalls.at(-1)).toEqual({ sessionId: "sess-ev", cwd: recorded });
+    expect(h.adapter.resumes.at(-1)!.cwd).toBe(recorded);
+    expect(during).toBe(head);
+    expect(git(recorded, "branch", "--show-current")).toBe(branch);
+    expect(existsSync(path.join(workspaceRoot, "work", s.executionId))).toBe(false);
+    const row = await execution(s.executionId);
+    expect(row.worktreePath).toBe(recorded);
+    expect(row.worktreeEvictedAt).toBeNull();
   });
 
   it("recreates a never-committed branch from origin/<default_branch> when origin lacks it, and resumes", async () => {

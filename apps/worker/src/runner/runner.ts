@@ -124,8 +124,11 @@ export interface RunnerDeps {
     ): Promise<PreparedWorktree>;
     /** Resume of an evicted spec execution recreates its worktree (§6.6). */
     prepareSpec(input: PrepareSpecInput): Promise<PreparedWorktree>;
-    /** Resume removes a worktree whose recreation failed part way (§6.6). */
-    remove(executionId: string, options: RemoveOptions): Promise<RemoveResult>;
+    /**
+     * Resume removes a worktree whose recreation failed part way (§6.6), at
+     * the row's recorded `worktree_path` (C33).
+     */
+    remove(worktreePath: string, options: RemoveOptions): Promise<RemoveResult>;
     /**
      * A fresh retry pushes the failed attempt's local branch first when it
      * ran on this host (C27). Without it nothing is pushed.
@@ -214,12 +217,20 @@ export function infraRetryResumePrompt(previousAttempt: number, endReason: strin
 
 /**
  * Header put before the normal start prompt when a retry starts a fresh
- * session (C27).
+ * session: in the failed attempt's own worktree (C32), or in a new one
+ * from the remote branch (C27).
  */
-export function freshRetryHeader(previousAttempt: number, endReason: string): string {
+export function freshRetryHeader(
+  previousAttempt: number,
+  endReason: string,
+  sameWorktree: boolean,
+): string {
+  const where = sameWorktree
+    ? "It runs in the same worktree, so that attempt's changes, committed or not, are still here"
+    : "The working branch starts from what that attempt pushed, if anything";
   return [
     `## Retry of attempt ${previousAttempt}`,
-    `The previous attempt (${previousAttempt}) ended with ${endReason}. This is a new session. The working branch starts from what that attempt pushed, if anything; check its state before continuing.`,
+    `The previous attempt (${previousAttempt}) ended with ${endReason}. This is a new session. ${where}; check its state before continuing.`,
   ].join("\n");
 }
 
@@ -850,10 +861,23 @@ export function createRunner(deps: RunnerDeps): Runner {
       return;
     }
     const previous = (await loadRunnerContext(db, retry.previousExecutionId))?.execution ?? null;
+    // C31, C32: the starter's claim gave this retry the failed attempt's
+    // worktree when it was on this host. A retry never prepares a new
+    // worktree while that one exists, so no unpushed commit is lost.
+    const reused =
+      ctx.execution.worktreePath !== null && (await pathExists(ctx.execution.worktreePath))
+        ? { worktreePath: ctx.execution.worktreePath, branch: ctx.execution.branch }
+        : null;
     await withLease(state, ctx, log, true, async () => {
-      const resumable = previous ? await resumableSession(ctx, previous, log) : null;
-      if (resumable && previous) {
-        await resumeRetry(state, ctx, previous, resumable, retry, log);
+      if (reused) {
+        const session = previous
+          ? await resumableSession(ctx, previous, reused.worktreePath, log)
+          : null;
+        if (session && previous) {
+          await resumeRetry(state, ctx, previous, session, retry, log);
+          return;
+        }
+        await prepareAndRun(state, ctx, log, previous, reused);
         return;
       }
       await prepareAndRun(state, ctx, log, previous);
@@ -861,27 +885,19 @@ export function createRunner(deps: RunnerDeps): Runner {
   }
 
   /**
-   * §9.5 "resume session if canResume": the failed attempt ran on this
-   * host, its worktree is still there and not evicted, and the adapter can
-   * resume its session in it. Returns the session and worktree, else null.
+   * §9.5 "resume session if canResume": the adapter can resume the failed
+   * attempt's session in the worktree this retry took over. Returns the
+   * session and worktree, else null.
    */
   async function resumableSession(
     ctx: RunnerContext,
     previous: RunnerContext["execution"],
+    worktreePath: string,
     log: Logger,
   ): Promise<{ sessionId: string; worktreePath: string } | null> {
     const adapter = deps.adapters[ctx.execution.runtime];
-    const { sessionId, worktreePath } = previous;
-    if (
-      !adapter ||
-      previous.host !== host ||
-      !sessionId ||
-      !worktreePath ||
-      previous.worktreeEvictedAt !== null ||
-      !(await pathExists(worktreePath))
-    ) {
-      return null;
-    }
+    const { sessionId } = previous;
+    if (!adapter || !sessionId) return null;
     try {
       return (await adapter.canResume(sessionId, worktreePath))
         ? { sessionId, worktreePath }
@@ -894,9 +910,9 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   /**
    * A retry that resumes the failed session in the failed attempt's
-   * worktree: records that worktree and branch on the retry, moves it
-   * ASSIGNED -> RUNNING, then resumes with the protocol nudge (C26) or the
-   * infrastructure header.
+   * worktree, which the starter already recorded on the retry (C31): moves
+   * it ASSIGNED -> RUNNING, then resumes with the protocol nudge (C26) or
+   * the infrastructure header.
    */
   async function resumeRetry(
     state: RunState,
@@ -912,10 +928,6 @@ export function createRunner(deps: RunnerDeps): Runner {
       await lockTaskForTool(tx, ctx.task.id);
       const row = await lockExecutionForTool(tx, ctx.execution.id);
       if (row?.state !== "ASSIGNED") return false;
-      await setExecutionWorktree(tx, ctx.execution.id, {
-        worktreePath: session.worktreePath,
-        branch: previous.branch,
-      });
       await transition(tx, {
         entity: "execution",
         id: ctx.execution.id,
@@ -999,15 +1011,19 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   /**
    * Prepares a worktree and starts a new session. `retryOf` is the failed
-   * attempt of a fresh retry: its branch is pushed first (C27), the
-   * worktree starts from the remote branch (the default branch when the
-   * remote has none), and the prompt names the failed attempt.
+   * attempt of a fresh retry, and the prompt names it. With `reuse` (C32)
+   * the session starts in the failed attempt's worktree the retry took
+   * over, and nothing is pushed or prepared. Without it, a retry pushes the
+   * failed attempt's branch first when it ran on this host (C27) and
+   * prepares a new worktree from the remote branch (the default branch
+   * when the remote has none).
    */
   async function prepareAndRun(
     state: RunState,
     ctx: RunnerContext,
     log: Logger,
     retryOf: RunnerContext["execution"] | null = null,
+    reuse: { worktreePath: string; branch: string | null } | null = null,
   ): Promise<void> {
     await setExecutionPlacement(db, ctx.execution.id, { workerId, host });
 
@@ -1031,33 +1047,37 @@ export function createRunner(deps: RunnerDeps): Runner {
         version: ctx.revision.version,
         content: SpecContentSchema.parse(ctx.revision.content),
       };
-      if (retryOf) await pushPreviousBranch(ctx, retryOf, log);
-      prepared = await deps.worktrees.prepareImplementation({
-        executionId: ctx.execution.id,
-        repository: {
-          name: ctx.repository.name,
-          gitUrl: ctx.repository.gitUrl,
-          defaultBranch: ctx.repository.defaultBranch,
-          setupCommand: ctx.repository.setupCommand,
-        },
-        task: {
-          id: ctx.task.id,
-          jiraKey: ctx.task.jiraKey,
-          jiraSummary: ctx.task.jiraSummary,
-        },
-        spec,
-        decisions: ctx.decisions.map((d) => ({
-          issue_id: d.issueId,
-          decision: d.decision,
-          clarification: d.clarification,
-          chosen_option: d.chosenOption,
-          decided_by: d.decidedBy,
-          decided_at: d.decidedAt.toISOString(),
-        })),
-        reviewCommand: testCommand,
-        runtime: ctx.execution.runtime,
-        ...(retryOf ? { resumeFromRemote: true, fallbackToDefaultBranch: true } : {}),
-      });
+      if (reuse) {
+        prepared = { worktreePath: reuse.worktreePath, branch: reuse.branch };
+      } else {
+        if (retryOf) await pushPreviousBranch(ctx, retryOf, log);
+        prepared = await deps.worktrees.prepareImplementation({
+          executionId: ctx.execution.id,
+          repository: {
+            name: ctx.repository.name,
+            gitUrl: ctx.repository.gitUrl,
+            defaultBranch: ctx.repository.defaultBranch,
+            setupCommand: ctx.repository.setupCommand,
+          },
+          task: {
+            id: ctx.task.id,
+            jiraKey: ctx.task.jiraKey,
+            jiraSummary: ctx.task.jiraSummary,
+          },
+          spec,
+          decisions: ctx.decisions.map((d) => ({
+            issue_id: d.issueId,
+            decision: d.decision,
+            clarification: d.clarification,
+            chosen_option: d.chosenOption,
+            decided_by: d.decidedBy,
+            decided_at: d.decidedAt.toISOString(),
+          })),
+          reviewCommand: testCommand,
+          runtime: ctx.execution.runtime,
+          ...(retryOf ? { resumeFromRemote: true, fallbackToDefaultBranch: true } : {}),
+        });
+      }
     } catch (err) {
       log.warn({ err: errMessage(err) }, "worktree preparation failed");
       await endFailed(ctx, "setup_failed", setupDetail(err));
@@ -1065,20 +1085,23 @@ export function createRunner(deps: RunnerDeps): Runner {
     }
     if (state.stopReason !== null) return;
 
-    await db.transaction(async (tx) => {
-      await lockTaskForTool(tx, ctx.task.id, "key share");
-      await setExecutionWorktree(tx, ctx.execution.id, prepared);
-      await appendEvent(tx, {
-        taskId: ctx.task.id,
-        executionId: ctx.execution.id,
-        type: "worktree.prepared",
-        payload: {
-          worktree_path: prepared.worktreePath,
-          branch: prepared.branch,
-          ...(retryOf && prepared.startPoint ? { start_point: prepared.startPoint } : {}),
-        },
+    // A reused worktree is already recorded on the row by the starter.
+    if (!reuse) {
+      await db.transaction(async (tx) => {
+        await lockTaskForTool(tx, ctx.task.id, "key share");
+        await setExecutionWorktree(tx, ctx.execution.id, prepared);
+        await appendEvent(tx, {
+          taskId: ctx.task.id,
+          executionId: ctx.execution.id,
+          type: "worktree.prepared",
+          payload: {
+            worktree_path: prepared.worktreePath,
+            branch: prepared.branch,
+            ...(retryOf && prepared.startPoint ? { start_point: prepared.startPoint } : {}),
+          },
+        });
       });
-    });
+    }
 
     const noMistakes = await pathExists(
       path.join(prepared.worktreePath, NO_MISTAKES_MARKER),
@@ -1105,7 +1128,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       },
     });
     const prompt = retryOf
-      ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure")}\n\n${startPrompt}`
+      ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure", reuse !== null)}\n\n${startPrompt}`
       : startPrompt;
 
     if (state.stopReason !== null) return;
@@ -1148,7 +1171,10 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   /**
    * §6.6: the sweeper evicted this execution's worktree. Recreates it at the
-   * same `work/<executionId>` path: a spec worktree detached at
+   * row's recorded `worktree_path` (C33), which is `work/<executionId>` or,
+   * for a retry that took over a failed attempt's worktree, that attempt's
+   * `work/<id>`, so the adapter's session store, keyed by cwd, still
+   * matches: a spec worktree detached at
    * `origin/<default_branch>` (§9.1); an implementation worktree from
    * `origin/<branch>`, or from `origin/<default_branch>` on the same branch
    * name when the remote lacks it (the sweeper pushes a branch that is
@@ -1156,11 +1182,12 @@ export function createRunner(deps: RunnerDeps): Runner {
    * warning. Then records the path, clears `worktree_evicted_at` and appends
    * `worktree.prepared` with `start_point` for an implementation worktree.
    * Returns the worktree path. Any failure before the write removes what the
-   * recreation left at `work/<executionId>`, so the next resume starts
-   * clean, then refuses with `WORKTREE_UNAVAILABLE` and writes nothing.
+   * recreation left at the recorded path, so the next resume starts clean,
+   * then refuses with `WORKTREE_UNAVAILABLE` and writes nothing.
    */
   async function restoreEvictedWorktree(
     ctx: RunnerContext,
+    recordedPath: string,
     refuse: (code: ResumeErrorCode, message: string) => never,
     log: Logger,
   ): Promise<string> {
@@ -1177,6 +1204,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         prepared = await deps.worktrees.prepareSpec({
           executionId: ctx.execution.id,
           repository,
+          worktreePath: recordedPath,
         });
       } else {
         if (ctx.execution.role !== "implementation" || !ctx.execution.branch) {
@@ -1207,6 +1235,7 @@ export function createRunner(deps: RunnerDeps): Runner {
           runtime: ctx.execution.runtime,
           resumeFromRemote: true,
           fallbackToDefaultBranch: true,
+          worktreePath: recordedPath,
         });
       }
     } catch (err) {
@@ -1214,7 +1243,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         // The row keeps `worktree_evicted_at`; the local branch goes too,
         // as eviction left it.
         try {
-          await deps.worktrees.remove(ctx.execution.id, {
+          await deps.worktrees.remove(recordedPath, {
             repositoryName: ctx.repository.name,
             branch: ctx.execution.role === "implementation" ? ctx.execution.branch : null,
           });
@@ -1288,7 +1317,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       if (!found) return refuse("NO_ADAPTER", `${execution.runtime} adapter not available`);
       adapter = found;
       if (execution.worktreeEvictedAt !== null) {
-        worktreePath = await restoreEvictedWorktree(ctx, refuse, log);
+        worktreePath = await restoreEvictedWorktree(ctx, worktreePath, refuse, log);
       }
       if (!(await adapter.canResume(sessionId, worktreePath))) {
         refuse("CANNOT_RESUME", "session cannot be resumed");

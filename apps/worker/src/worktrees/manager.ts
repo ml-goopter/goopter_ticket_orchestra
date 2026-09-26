@@ -12,10 +12,13 @@ import { runGit, runShell } from "./run.js";
 
 /**
  * Worktree manager (design.md §9.1). Keeps one bare clone per repository at
- * `<workspaceRoot>/repos/<name>.git` and one worktree per execution at
- * `<workspaceRoot>/work/<executionId>`. No database access (GOT.25 D3): the
- * caller persists `worktree_path`, `branch`, and the `worktree.prepared`
- * event.
+ * `<workspaceRoot>/repos/<name>.git` and creates each worktree at
+ * `<workspaceRoot>/work/<executionId>`. After creation every operation is
+ * keyed on the path the execution row recorded (GOT.43 C33): a retry may
+ * own a worktree another execution created, so `remove` takes that path and
+ * a recreation after eviction takes it as an explicit target. No database
+ * access (GOT.25 D3): the caller persists `worktree_path`, `branch`, and the
+ * `worktree.prepared` event.
  *
  * The bare clone is created with `git init --bare` plus an `origin` remote,
  * not `git clone --mirror`, so fetched branches land in `refs/remotes/origin/*`
@@ -53,6 +56,12 @@ export interface PrepareImplementationInput {
    */
   resumeFromRemote?: boolean;
   /**
+   * Create the worktree here instead of `work/<executionId>`: the row's
+   * recorded `worktree_path` when recreating after eviction (C33). Must be
+   * `<workspaceRoot>/work/<one safe segment>`.
+   */
+  worktreePath?: string;
+  /**
    * With `resumeFromRemote`: when `origin` has no such branch after the
    * fetch, start it from `origin/<default_branch>` as a fresh start does.
    * Resume after eviction uses it: the sweeper pushes a branch that is
@@ -64,6 +73,8 @@ export interface PrepareImplementationInput {
 export interface PrepareSpecInput {
   executionId: string;
   repository: WorktreeRepository;
+  /** As `PrepareImplementationInput.worktreePath` (C33). */
+  worktreePath?: string;
 }
 
 /**
@@ -105,7 +116,7 @@ export interface RemoveResult {
 export interface LockedRepository {
   /** `remove` on the locked repository, without taking the lock again. */
   remove(
-    executionId: string,
+    worktreePath: string,
     options: Omit<RemoveOptions, "repositoryName">,
   ): Promise<RemoveResult>;
 }
@@ -303,7 +314,10 @@ export class WorktreeManager {
     input: PrepareImplementationInput,
   ): Promise<PreparedWorktree> {
     const { executionId, repository } = input;
-    const worktreePath = this.worktreePath(executionId);
+    const worktreePath =
+      input.worktreePath !== undefined
+        ? this.recordedWorktreePath(input.worktreePath)
+        : this.worktreePath(executionId);
     const branch = workingBranchName(input.task.jiraKey, input.task.id);
     const barePath = this.barePath(repository);
     const remoteBranch = `refs/remotes/origin/${branch}`;
@@ -378,7 +392,10 @@ export class WorktreeManager {
    */
   async prepareSpec(input: PrepareSpecInput): Promise<PreparedWorktree> {
     const { executionId, repository } = input;
-    const worktreePath = this.worktreePath(executionId);
+    const worktreePath =
+      input.worktreePath !== undefined
+        ? this.recordedWorktreePath(input.worktreePath)
+        : this.worktreePath(executionId);
     const barePath = this.barePath(repository);
 
     await withRepoLock(barePath, async () => {
@@ -398,7 +415,8 @@ export class WorktreeManager {
   }
 
   /**
-   * Deletes `work/<executionId>` and prunes git's record of it. When
+   * Deletes the worktree at `worktreePath`, the execution row's recorded
+   * `worktree_path` (C33), and prunes git's record of it. When
    * `options.branch` is set, also deletes that local branch unless another
    * worktree has it checked out.
    *
@@ -411,12 +429,13 @@ export class WorktreeManager {
    * repository through `withRepoLock` closes that window.
    */
   async remove(
-    executionId: string,
+    worktreePath: string,
     options: RemoveOptions,
   ): Promise<RemoveResult> {
+    const target = this.recordedWorktreePath(worktreePath);
     const barePath = this.barePathByName(options.repositoryName);
     return withRepoLock(barePath, () =>
-      this.removeLocked(barePath, executionId, options),
+      this.removeLocked(barePath, target, options),
     );
   }
 
@@ -438,19 +457,24 @@ export class WorktreeManager {
     const barePath = this.barePathByName(repositoryName);
     return withRepoLock(barePath, () =>
       fn({
-        remove: (executionId, options) =>
-          this.removeLocked(barePath, executionId, { ...options, repositoryName }),
+        remove: (worktreePath, options) =>
+          this.removeLocked(barePath, this.recordedWorktreePath(worktreePath), {
+            ...options,
+            repositoryName,
+          }),
       }),
     );
   }
 
-  /** `remove`'s body. The caller holds the lock on `barePath`. */
+  /**
+   * `remove`'s body. The caller holds the lock on `barePath` and has
+   * checked `worktreePath` with `recordedWorktreePath`.
+   */
   private async removeLocked(
     barePath: string,
-    executionId: string,
+    worktreePath: string,
     options: RemoveOptions,
   ): Promise<RemoveResult> {
-    const worktreePath = this.worktreePath(executionId);
     const branch = options.branch ?? null;
     if (branch !== null) assertSafe(branch, SAFE_BRANCH, "branch");
     if (options.expectedTip !== undefined && branch === null) {
@@ -541,6 +565,25 @@ export class WorktreeManager {
       );
       return { pushed: true, ahead, tip };
     });
+  }
+
+  /**
+   * A recorded `worktree_path` (C33), checked as strictly as a path built
+   * from an execution id: absolute, exactly `<workspaceRoot>/work/<segment>`
+   * with one safe segment, no traversal. Throws otherwise.
+   */
+  private recordedWorktreePath(worktreePath: string): string {
+    const workRoot = path.join(this.workspaceRoot, "work");
+    const segment = path.basename(worktreePath);
+    if (
+      !path.isAbsolute(worktreePath) ||
+      path.normalize(worktreePath) !== worktreePath ||
+      path.dirname(worktreePath) !== workRoot ||
+      !SAFE_SEGMENT.test(segment)
+    ) {
+      throw new Error(`invalid worktree path: ${JSON.stringify(worktreePath)}`);
+    }
+    return path.join(workRoot, segment);
   }
 
   private worktreePath(executionId: string): string {
