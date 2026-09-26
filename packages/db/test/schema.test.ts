@@ -27,6 +27,8 @@ const EXPECTED_TABLES: Record<string, string[]> = {
     "max_protocol_retries",
     "max_ci_rounds",
     "max_review_rounds",
+    // design.md build-order Q9; no enforcement yet, only the column.
+    "max_budget_usd",
     "created_at",
   ],
   repositories: [

@@ -107,7 +107,12 @@ export const executionUsage = pgTable("execution_usage", {
     mode: "number",
   }).notNull(),
   outputTokens: bigint("output_tokens", { mode: "number" }).notNull(),
-  costUsd: numeric("cost_usd", { precision: 12, scale: 6 }).notNull(),
+  /**
+   * Nullable (design.md §9.7): a model missing from `config/pricing.json`
+   * records its tokens with `cost_usd = NULL` rather than failing the
+   * execution.
+   */
+  costUsd: numeric("cost_usd", { precision: 12, scale: 6 }),
   recordedAt: timestamptz("recorded_at").notNull().defaultNow(),
 });
 

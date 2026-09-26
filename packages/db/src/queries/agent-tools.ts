@@ -202,8 +202,12 @@ export interface ExecutionUsageTotalsDelta {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
-  /** Decimal string, as `numeric` columns take it. */
-  costUsd: string;
+  /**
+   * Decimal string, as `numeric` columns take it, or `null` for an
+   * unpriced (unknown-model) row (design.md §9.7). A `null` delta adds 0 to
+   * the execution's running total rather than nulling it out.
+   */
+  costUsd: string | null;
 }
 
 /**
@@ -222,7 +226,7 @@ export async function addExecutionUsageTotals(
       inputTokens: sql`${executions.inputTokens} + ${delta.inputTokens}`,
       cachedInputTokens: sql`${executions.cachedInputTokens} + ${delta.cachedInputTokens}`,
       outputTokens: sql`${executions.outputTokens} + ${delta.outputTokens}`,
-      costUsd: sql`${executions.costUsd} + ${delta.costUsd}::numeric`,
+      costUsd: sql`${executions.costUsd} + coalesce(${delta.costUsd}::numeric, 0)`,
     })
     .where(eq(executions.id, executionId))
     .returning({ id: executions.id });
