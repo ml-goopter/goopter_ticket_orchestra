@@ -32,6 +32,7 @@ import {
   type RunnerContext,
 } from "@orchestra/db";
 import {
+  buildResumePrompt,
   buildUserPrompt,
   systemPromptFor,
   type TicketContext,
@@ -54,6 +55,12 @@ import {
   type RemoveOptions,
   type RemoveResult,
 } from "../worktrees/index.js";
+// Not re-exported by the worktrees index, which this task does not own.
+import type {
+  PushIfAheadInput,
+  PushIfAheadResult,
+} from "../worktrees/manager.js";
+import { runFailurePolicy } from "./retry.js";
 
 /**
  * The execution runner (design.md §9.1-§9.4, §8 blocking handling). One
@@ -119,6 +126,11 @@ export interface RunnerDeps {
     prepareSpec(input: PrepareSpecInput): Promise<PreparedWorktree>;
     /** Resume removes a worktree whose recreation failed part way (§6.6). */
     remove(executionId: string, options: RemoveOptions): Promise<RemoveResult>;
+    /**
+     * A fresh retry pushes the failed attempt's local branch first when it
+     * ran on this host (C27). Without it nothing is pushed.
+     */
+    pushIfAhead?(input: PushIfAheadInput): Promise<PushIfAheadResult>;
   };
   /** One adapter per runtime (§7.3). A missing runtime fails the execution. */
   adapters: Partial<Record<Runtime, AgentAdapter>>;
@@ -174,11 +186,52 @@ export interface ResumeInput {
   usageKind?: Extract<UsageKind, "resume">;
 }
 
+/**
+ * What the retry starter hands over with a retry execution (§9.5, C25):
+ * the failed execution it retries, and the protocol nudge (C26) when the
+ * retry is a protocol one.
+ */
+export interface RetryStart {
+  previousExecutionId: string;
+  nudge?: { missingToolCall: string };
+}
+
+export interface StartOptions {
+  /** Start a retry: resume the failed session if possible, else fresh. */
+  retry?: RetryStart;
+}
+
+/**
+ * Resume header for an infrastructure retry that resumes the failed
+ * session. No `buildResumePrompt` kind fits an infrastructure retry.
+ */
+export function infraRetryResumePrompt(previousAttempt: number, endReason: string): string {
+  return [
+    "## Retry after an infrastructure failure",
+    `The previous attempt (${previousAttempt}) ended with ${endReason}, an infrastructure failure rather than a problem with your work. Continue from where you left off.`,
+  ].join("\n");
+}
+
+/**
+ * Header put before the normal start prompt when a retry starts a fresh
+ * session (C27).
+ */
+export function freshRetryHeader(previousAttempt: number, endReason: string): string {
+  return [
+    `## Retry of attempt ${previousAttempt}`,
+    `The previous attempt (${previousAttempt}) ended with ${endReason}. This is a new session. The working branch starts from what that attempt pushed, if anything; check its state before continuing.`,
+  ].join("\n");
+}
+
 export interface Runner {
   /** Scheduler hand-off (§6.3). Never blocks the tick. */
   readonly onClaimed: OnClaimed;
-  /** Runs a claimed execution. Resolves when the run ends; never rejects. */
-  start(claim: ClaimedExecution): Promise<void>;
+  /**
+   * Runs an ASSIGNED implementation execution: a claimed one, or with
+   * `options.retry` a retry the starter pinned here. Resolves when the run
+   * ends; never rejects.
+   */
+  start(claim: ClaimedExecution, options?: StartOptions): Promise<void>;
   /**
    * Resumes a WAITING_FOR_USER or COMPLETED execution on this host. Resolves
    * once it is RUNNING; `done` resolves when the turn has been handled.
@@ -297,9 +350,9 @@ export function createRunner(deps: RunnerDeps): Runner {
   }
 
   /**
-   * Ends the execution FAILED (`ASSIGNED` or `RUNNING` only). Any other
-   * state was set by a tool or the api and is left alone. The task is not
-   * touched (Q10); the retry policy is GOT.43's.
+   * Ends the execution FAILED (`ASSIGNED` or `RUNNING` only), then applies
+   * the §9.5 retry policy in the same transaction. Any other state was set
+   * by a tool or the api and is left alone.
    */
   async function endFailed(
     ctx: RunnerContext,
@@ -310,12 +363,21 @@ export function createRunner(deps: RunnerDeps): Runner {
       await lockTaskForTool(tx, ctx.task.id);
       const row = await lockExecutionForTool(tx, ctx.execution.id);
       if (!row || (row.state !== "ASSIGNED" && row.state !== "RUNNING")) return;
+      const endedAt = now();
       await transition(tx, {
         entity: "execution",
         id: ctx.execution.id,
         trigger: "execution.failed",
         actor: worker,
-        set: { endReason, endDetail, endedAt: now() },
+        set: { endReason, endDetail, endedAt },
+      });
+      await runFailurePolicy(tx, {
+        executionId: ctx.execution.id,
+        endReason,
+        endDetail,
+        actor: worker,
+        now: endedAt,
+        logger,
       });
     });
   }
@@ -719,6 +781,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       if (ENDED_STATES.has(row.state)) return "ended";
       if (ctx.execution.role === "spec") return "spec";
       if (row.state !== "RUNNING" && row.state !== "ASSIGNED") return "other";
+      const endedAt = now();
       await transition(tx, {
         entity: "execution",
         id: ctx.execution.id,
@@ -727,8 +790,16 @@ export function createRunner(deps: RunnerDeps): Runner {
         set: {
           endReason: "protocol_violation",
           endDetail: PROTOCOL_VIOLATION_DETAIL,
-          endedAt: now(),
+          endedAt,
         },
+      });
+      await runFailurePolicy(tx, {
+        executionId: ctx.execution.id,
+        endReason: "protocol_violation",
+        endDetail: PROTOCOL_VIOLATION_DETAIL,
+        actor: worker,
+        now: endedAt,
+        logger: log,
       });
       return "protocol_violation";
     });
@@ -756,6 +827,7 @@ export function createRunner(deps: RunnerDeps): Runner {
   async function startBody(
     state: RunState,
     claim: ClaimedExecution,
+    options: StartOptions,
     log: Logger,
   ): Promise<void> {
     const ctx = await loadRunnerContext(db, claim.executionId);
@@ -770,15 +842,172 @@ export function createRunner(deps: RunnerDeps): Runner {
       );
       return;
     }
-    // Renewal covers worktree preparation too: a slow fetch or setup_command
-    // must not let the lease expire (§6.4, §6.5).
-    await withLease(state, ctx, log, true, () => prepareAndRun(state, ctx, log));
+    const retry = options.retry;
+    if (!retry) {
+      // Renewal covers worktree preparation too: a slow fetch or
+      // setup_command must not let the lease expire (§6.4, §6.5).
+      await withLease(state, ctx, log, true, () => prepareAndRun(state, ctx, log));
+      return;
+    }
+    const previous = (await loadRunnerContext(db, retry.previousExecutionId))?.execution ?? null;
+    await withLease(state, ctx, log, true, async () => {
+      const resumable = previous ? await resumableSession(ctx, previous, log) : null;
+      if (resumable && previous) {
+        await resumeRetry(state, ctx, previous, resumable, retry, log);
+        return;
+      }
+      await prepareAndRun(state, ctx, log, previous);
+    });
   }
 
+  /**
+   * §9.5 "resume session if canResume": the failed attempt ran on this
+   * host, its worktree is still there and not evicted, and the adapter can
+   * resume its session in it. Returns the session and worktree, else null.
+   */
+  async function resumableSession(
+    ctx: RunnerContext,
+    previous: RunnerContext["execution"],
+    log: Logger,
+  ): Promise<{ sessionId: string; worktreePath: string } | null> {
+    const adapter = deps.adapters[ctx.execution.runtime];
+    const { sessionId, worktreePath } = previous;
+    if (
+      !adapter ||
+      previous.host !== host ||
+      !sessionId ||
+      !worktreePath ||
+      previous.worktreeEvictedAt !== null ||
+      !(await pathExists(worktreePath))
+    ) {
+      return null;
+    }
+    try {
+      return (await adapter.canResume(sessionId, worktreePath))
+        ? { sessionId, worktreePath }
+        : null;
+    } catch (err) {
+      log.warn({ err: errMessage(err) }, "canResume failed; starting the retry fresh");
+      return null;
+    }
+  }
+
+  /**
+   * A retry that resumes the failed session in the failed attempt's
+   * worktree: records that worktree and branch on the retry, moves it
+   * ASSIGNED -> RUNNING, then resumes with the protocol nudge (C26) or the
+   * infrastructure header.
+   */
+  async function resumeRetry(
+    state: RunState,
+    ctx: RunnerContext,
+    previous: RunnerContext["execution"],
+    session: { sessionId: string; worktreePath: string },
+    retry: RetryStart,
+    log: Logger,
+  ): Promise<void> {
+    const adapter = deps.adapters[ctx.execution.runtime]!;
+    await setExecutionPlacement(db, ctx.execution.id, { workerId, host });
+    const started = await db.transaction(async (tx) => {
+      await lockTaskForTool(tx, ctx.task.id);
+      const row = await lockExecutionForTool(tx, ctx.execution.id);
+      if (row?.state !== "ASSIGNED") return false;
+      await setExecutionWorktree(tx, ctx.execution.id, {
+        worktreePath: session.worktreePath,
+        branch: previous.branch,
+      });
+      await transition(tx, {
+        entity: "execution",
+        id: ctx.execution.id,
+        trigger: "execution.started",
+        actor: worker,
+        set: { sessionId: session.sessionId, startedAt: now() },
+      });
+      return true;
+    });
+    if (!started || state.stopReason !== null) {
+      log.info({}, "retry is no longer ASSIGNED, not resuming");
+      return;
+    }
+
+    // The runtime reports session totals, so the baseline is what the
+    // failed attempt's session already reported (§9.7).
+    const baseline: UsageBaseline = {};
+    for (const row of await sumSessionUsageByModel(db, previous.id)) {
+      baseline[row.model] = {
+        input: row.inputTokens,
+        cached: row.cachedInputTokens,
+        output: row.outputTokens,
+        costUsd: row.costUsd,
+      };
+    }
+    const prompt = retry.nudge
+      ? buildResumePrompt("protocol_nudge", { missingToolCall: retry.nudge.missingToolCall })
+      : infraRetryResumePrompt(previous.attempt, previous.endReason ?? "an unknown failure");
+    const testCommand = testCommandFor(ctx);
+    log.info(
+      { previousExecutionId: previous.id, sessionId: session.sessionId },
+      "retry resumes the failed session",
+    );
+    await runSession(state, ctx, "resume", log, (token, signal) =>
+      adapter.resume(
+        {
+          cwd: session.worktreePath,
+          prompt,
+          model: modelFor(ctx),
+          allowedTools: "implementation",
+          mcp: { url: deps.toolsUrl(), token },
+          env: agentEnv(token),
+          sessionId: session.sessionId,
+          usageBaseline: baseline,
+          ...(testCommand ? { testCommand } : {}),
+        },
+        signal,
+      ),
+    );
+  }
+
+  /**
+   * C27: before a fresh retry, push the failed attempt's local branch when
+   * it ran on this host, so the new worktree starts from its commits. Runs
+   * outside any transaction. A failure is logged and the retry goes on.
+   */
+  async function pushPreviousBranch(
+    ctx: RunnerContext,
+    previous: RunnerContext["execution"],
+    log: Logger,
+  ): Promise<void> {
+    if (previous.host !== host || !previous.branch || !ctx.repository) return;
+    if (!deps.worktrees.pushIfAhead) return;
+    try {
+      const result = await deps.worktrees.pushIfAhead({
+        repositoryName: ctx.repository.name,
+        branch: previous.branch,
+        defaultBranch: ctx.repository.defaultBranch,
+      });
+      log.info(
+        { branch: previous.branch, pushed: result.pushed, ahead: result.ahead, reason: result.reason },
+        "pushed the failed attempt's branch before a fresh retry",
+      );
+    } catch (err) {
+      log.warn(
+        { branch: previous.branch, err: errMessage(err) },
+        "could not push the failed attempt's branch; the retry starts from the remote",
+      );
+    }
+  }
+
+  /**
+   * Prepares a worktree and starts a new session. `retryOf` is the failed
+   * attempt of a fresh retry: its branch is pushed first (C27), the
+   * worktree starts from the remote branch (the default branch when the
+   * remote has none), and the prompt names the failed attempt.
+   */
   async function prepareAndRun(
     state: RunState,
     ctx: RunnerContext,
     log: Logger,
+    retryOf: RunnerContext["execution"] | null = null,
   ): Promise<void> {
     await setExecutionPlacement(db, ctx.execution.id, { workerId, host });
 
@@ -802,6 +1031,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         version: ctx.revision.version,
         content: SpecContentSchema.parse(ctx.revision.content),
       };
+      if (retryOf) await pushPreviousBranch(ctx, retryOf, log);
       prepared = await deps.worktrees.prepareImplementation({
         executionId: ctx.execution.id,
         repository: {
@@ -826,6 +1056,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         })),
         reviewCommand: testCommand,
         runtime: ctx.execution.runtime,
+        ...(retryOf ? { resumeFromRemote: true, fallbackToDefaultBranch: true } : {}),
       });
     } catch (err) {
       log.warn({ err: errMessage(err) }, "worktree preparation failed");
@@ -841,7 +1072,11 @@ export function createRunner(deps: RunnerDeps): Runner {
         taskId: ctx.task.id,
         executionId: ctx.execution.id,
         type: "worktree.prepared",
-        payload: { worktree_path: prepared.worktreePath, branch: prepared.branch },
+        payload: {
+          worktree_path: prepared.worktreePath,
+          branch: prepared.branch,
+          ...(retryOf && prepared.startPoint ? { start_point: prepared.startPoint } : {}),
+        },
       });
     });
 
@@ -849,7 +1084,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       path.join(prepared.worktreePath, NO_MISTAKES_MARKER),
     );
     const systemPrompt = systemPromptFor("implementation", { noMistakes });
-    const prompt = buildUserPrompt({
+    const startPrompt = buildUserPrompt({
       role: "implementation",
       ticket: await loadTicket(ctx, log),
       approvedSpec: spec,
@@ -869,8 +1104,14 @@ export function createRunner(deps: RunnerDeps): Runner {
         testCommand,
       },
     });
+    const prompt = retryOf
+      ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure")}\n\n${startPrompt}`
+      : startPrompt;
 
     if (state.stopReason !== null) return;
+    // TODO(GOT.44/GOT.45): pass `maxBudgetUsd` once `projects.max_budget_usd`
+    // exists (GOT.44) and the adapters honour it (GOT.45). Until then
+    // `budget_exceeded` is classified in retry.ts but never produced (C29).
     await runSession(state, ctx, "main", log, (token, signal) =>
       adapter.start(
         {
@@ -888,7 +1129,7 @@ export function createRunner(deps: RunnerDeps): Runner {
     );
   }
 
-  function start(claim: ClaimedExecution): Promise<void> {
+  function start(claim: ClaimedExecution, options: StartOptions = {}): Promise<void> {
     const log = logger.child({ executionId: claim.executionId, taskId: claim.taskId });
     if (closed) {
       log.warn({}, "runner is shutting down, not starting execution");
@@ -900,7 +1141,7 @@ export function createRunner(deps: RunnerDeps): Runner {
     }
     const state = new RunState(claim.executionId);
     live.set(claim.executionId, state);
-    return track(state, log, () => startBody(state, claim, log));
+    return track(state, log, () => startBody(state, claim, options, log));
   }
 
   // ---------------------------------------------------------------- resume

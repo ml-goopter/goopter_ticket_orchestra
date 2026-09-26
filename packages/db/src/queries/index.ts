@@ -17,3 +17,4 @@ export * from "./spec.js";
 export * from "./runner.js";
 export * from "./sweeper.js";
 export * from "./ci.js";
+export * from "./retry.js";
