@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `849dcea` plus this change.
+Status as of 2026-09-25, main at `edc9dd8` plus this change.
 
 ## Completed
 
@@ -31,6 +31,7 @@ Status as of 2026-09-25, main at `849dcea` plus this change.
 | W5 | GOT.40 | review-wrapper: orchestra-review binary | #29 |
 | W6 | GOT.36 | web: board view and attention drawer | #30 |
 | W6 | GOT.31 | worker: execution runner loop and command consumer | #31 |
+| W6 | GOT.34 | worker: lease sweeper and dead-host release | #32 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -41,7 +42,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
 | W6 | GOT.41 | web: task detail timeline and side panel | GOT.21, 22, 28 | M6 |
-| W6 | GOT.34 | worker: lease sweeper and dead-host release | GOT.26 | M8 |
 | W6 | GOT.35 | worker: worktree sweeper | GOT.25 | M8 |
 | W6 | GOT.30 | worker: Jira comment write-back | GOT.23 | M4 |
 | W7 | GOT.37 | worker: spec role execution | GOT.31 | M5 |
@@ -71,8 +71,9 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.43: a failed execution (`setup_failed`, `adapter_error`, `agent_hung`, `protocol_violation`, `process_crash`) leaves the task IMPLEMENTING with `end_reason` set; the retry policy moves the task (user decision Q10). No `max_budget_usd` column exists anywhere; add it with the policy (Q9). Core now has ASSIGNED → FAILED on `execution.failed` (O1); the §5.2 diagram does not show it (PR #31).
 - GOT.37: spec sessions hold no lease, so the runner renews only for the implementation role. A resumed session's new session id is not stored on resume (PR #31).
 - GOT.39: the runner flushes buffered deltas before every later event, but a runtime that runs tools without consumer backpressure can still write a tool's own event first, so timeline order is best-effort there (PR #31, accepted minor).
-- GOT.34: ASSIGNED → FAILED now exists in core, so the lease sweeper can fail an ASSIGNED execution per §6.5 (PR #31).
-- GOT.34: leases of ended executions stay in `task_leases` until the task is claimed again (the claim replaces them). The sweeper must act only on leases whose execution is ASSIGNED or RUNNING, as §6.5 states (PR #24).
+- GOT.43: a lease expiry ends the execution FAILED `lease_expired` with the task left IMPLEMENTING (Q10); the retry policy must also handle a dead-host release, where a WAITING_FOR_USER or COMPLETED execution has `host` and `worker_id` null and `runner.resume` refuses it (OTHER_HOST). The fresh-session fallback (D5, §6.1) starts from that state (PR #32).
+- GOT.47: `runner.resume` re-reads the host pin under the lock and refuses when it changed; a command handler must treat OTHER_HOST as "not mine" and leave the command for another worker rather than fail the execution (PR #32).
+- GOT.35: the lease sweeper owns the `lease_sweeper` phase slot and `apps/worker/src/sweeper/index.ts`; put the worktree sweeper beside it and replace only the `worktree_sweeper` stub and its stub test entry in `apps/worker/src/phases/index.test.ts` (PR #32).
 - GOT.43: `POST /tasks/:id/retry` moves NEEDS_HUMAN to READY even while the execution is still RUNNING (after a review-limit escalation). The claim skips READY tasks with a live execution, so the task waits, but the retry route should refuse or the escalation should end the execution (PR #24).
 - GOT.34/35: `BLOCKED → READY` (`dependency.resolved`) is not implemented; the user left it out of GOT.26 because §6.2 does not specify it.
 - GOT.37: request-review marks the spec execution COMPLETED in the database only; the worker must end the live spec session when it sees that. Send-back does not resume the session; the worker must (PR #27).
