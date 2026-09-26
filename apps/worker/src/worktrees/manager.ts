@@ -358,7 +358,7 @@ export class WorktreeManager {
       }
     }
 
-    const context = ExecutionContextSchema.parse({
+    await this.writeContextFile(worktreePath, {
       task: {
         id: input.task.id,
         jira_key: input.task.jiraKey,
@@ -373,10 +373,7 @@ export class WorktreeManager {
       },
       runtime: input.runtime,
       review_command: input.reviewCommand ?? null,
-    } satisfies ExecutionContext);
-    const contextFile = path.join(worktreePath, EXECUTION_CONTEXT_PATH);
-    await fs.mkdir(path.dirname(contextFile), { recursive: true });
-    await fs.writeFile(contextFile, `${JSON.stringify(context, null, 2)}\n`);
+    });
 
     return {
       worktreePath,
@@ -394,9 +391,20 @@ export class WorktreeManager {
    * path.
    */
   async writeContext(worktreePath: string, context: ExecutionContext): Promise<void> {
-    const target = this.recordedWorktreePath(worktreePath);
+    await this.writeContextFile(this.recordedWorktreePath(worktreePath), context);
+  }
+
+  /**
+   * Validates `context` and writes it to `.orchestra/context.json` under
+   * `worktreePath`: the one context writer behind `prepareImplementation`
+   * and `writeContext`.
+   */
+  private async writeContextFile(
+    worktreePath: string,
+    context: ExecutionContext,
+  ): Promise<void> {
     const parsed = ExecutionContextSchema.parse(context);
-    const contextFile = path.join(target, EXECUTION_CONTEXT_PATH);
+    const contextFile = path.join(worktreePath, EXECUTION_CONTEXT_PATH);
     await fs.mkdir(path.dirname(contextFile), { recursive: true });
     await fs.writeFile(contextFile, `${JSON.stringify(parsed, null, 2)}\n`);
   }

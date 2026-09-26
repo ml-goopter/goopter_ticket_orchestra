@@ -219,6 +219,11 @@ async function resumeExecution(
       case "NOT_FOUND":
       case "NOT_RESUMABLE_STATE":
         return { outcome: "skipped", reason: err.message };
+      // F1: resolved between the handler's read and the resume lock; the
+      // resolution's own command resumes the execution.
+      case "ISSUE_NOT_OPEN":
+        log.info({ reason: err.message }, `${command.type}: issue closed before the resume`);
+        return { outcome: "skipped", reason: err.message };
       // The session or its worktree is gone for good, even after the
       // fallback. Retrying would never succeed (GOT.37 F3).
       case "NO_SESSION":
@@ -314,6 +319,7 @@ export function createIssueMessageHandler(runner: IssueRunner): CommandHandler {
       resumedPayload: { command: "send_message", issue_id: issueId },
       freshPrompt: (userPrompt) => issueMessagePrompt(issueId, author, text, userPrompt),
       conversationTurn: captureReply(checked.loaded, issueId, log),
+      openIssueId: issueId,
     }, checked.loaded.execution.role);
   };
 }

@@ -347,6 +347,7 @@ class FakeAdapter implements AgentAdapter {
   readonly starts: StartRequest[] = [];
   readonly resumes: ResumeRequest[] = [];
   resumable = true;
+  onCanResume?: () => Promise<void>;
   script: Script = async function* () {
     yield { type: "turn_done", finalText: "" };
   };
@@ -362,6 +363,7 @@ class FakeAdapter implements AgentAdapter {
   }
 
   async canResume(): Promise<boolean> {
+    await this.onCanResume?.();
     return this.resumable;
   }
 }
@@ -375,6 +377,7 @@ function makeRunner(
   workerId: string,
   adapter: FakeAdapter,
   prepared: Prepared = { calls: [] },
+  hooks?: RunnerDeps["hooks"],
 ): Runner {
   const runner = createRunner({
     db,
@@ -400,6 +403,7 @@ function makeRunner(
     quietTimeoutMs: 10_000,
     basePath: "/usr/bin:/bin",
     timings: { leaseRenewMs: 60_000, blockingPollMs: 50 },
+    ...(hooks ? { hooks } : {}),
   });
   runners.push(runner);
   return runner;
@@ -916,6 +920,85 @@ describe("fresh-session fallback (C21, D5, §6.1, AC4)", () => {
     expect(row.host).toBe(OTHER_HOST);
     expect(row.state).toBe("WAITING_FOR_USER");
     expect(adapter.starts).toHaveLength(0);
+  });
+});
+
+describe("review round 1 (F1, F2)", () => {
+  it("F1: a send_message whose issue is resolved before the resume lock is skipped, and the resolution's resume_with_decision runs", async () => {
+    const s = await seedWaiting();
+    const adapter = new FakeAdapter();
+    const runner = makeRunner(HOST, s.workerId, adapter);
+    const sendId = await enqueue(s, "send_message", { issue_id: s.issueId, text: "still unsure" });
+    let decisionCommandId: string | undefined;
+    // The api resolves the issue after the handler read it OPEN and before
+    // the resume transaction: canResume runs between the two.
+    adapter.onCanResume = async () => {
+      if (decisionCommandId !== undefined) return;
+      const decisionId = await resolveAsClarification(s, s.issueId, { decision: "Device." });
+      decisionCommandId = await enqueue(s, "resume_with_decision", {
+        issue_id: s.issueId,
+        decision_id: decisionId,
+      });
+    };
+    adapter.script = async function* () {
+      await completeExecution(s.executionId);
+      yield { type: "turn_done", finalText: "done" };
+    };
+
+    await consume(HOST, s.workerId, runner);
+
+    expect(decisionCommandId).toBeDefined();
+    expect((await command(sendId)).completedAt).not.toBeNull();
+    expect(adapter.resumes).toHaveLength(0);
+    let row = await execution(s.executionId);
+    expect(row.state).toBe("WAITING_FOR_USER");
+    expect(row.endReason).toBeNull();
+    expect(await eventsOf(s.taskId, "execution.resumed")).toEqual([]);
+    expect(
+      records.some((r) => r.msg === "command skipped" && String(r.fields.reason).includes("not OPEN")),
+    ).toBe(true);
+
+    await consume(HOST, s.workerId, runner);
+    expect((await command(decisionCommandId!)).completedAt).not.toBeNull();
+    await turnEnded(runner, s.executionId);
+
+    expect(adapter.resumes).toHaveLength(1);
+    expect(adapter.resumes[0]!.prompt.startsWith(`## Answer to your issue ${s.issueId}`)).toBe(true);
+    row = await execution(s.executionId);
+    expect(row.state).toBe("COMPLETED");
+    expect(await eventsOf(s.taskId, "execution.failed")).toEqual([]);
+  });
+
+  it("F2: a released execution pinned to another host before the fallback pin is refused OTHER_HOST and unclaimed", async () => {
+    const s = await seedWaiting({ host: null });
+    const adapter = new FakeAdapter();
+    const runner = makeRunner(HOST, s.workerId, adapter, { calls: [] }, {
+      beforeFallbackPin: async (executionId) => {
+        await db.$client.unsafe(
+          "update executions set host = $2, worker_id = $3 where id = $1",
+          [executionId, OTHER_HOST, s.otherWorkerId],
+        );
+      },
+    });
+    const decisionId = await resolveAsClarification(s, s.issueId, { decision: "Device." });
+    const id = await enqueue(s, "resume_with_decision", { issue_id: s.issueId, decision_id: decisionId });
+
+    await consume(HOST, s.workerId, runner);
+
+    const cmd = await command(id);
+    expect(cmd.claimedAt).toBeNull();
+    expect(cmd.completedAt).toBeNull();
+    expect(adapter.starts).toHaveLength(0);
+    expect(adapter.resumes).toHaveLength(0);
+    const row = await execution(s.executionId);
+    expect(row.host).toBe(OTHER_HOST);
+    expect(row.workerId).toBe(s.otherWorkerId);
+    expect(row.state).toBe("WAITING_FOR_USER");
+    expect(
+      records.some(
+        (r) => String(r.fields.reason).includes("pinned to a host since the context loaded"),
+      ),
+    ).toBe(true);
   });
 });
 

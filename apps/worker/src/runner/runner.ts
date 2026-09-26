@@ -28,6 +28,7 @@ import {
   insertExecutionUsage,
   loadRunnerContext,
   lockExecutionForTool,
+  lockIssue,
   lockTaskForTool,
   markExecutionEnded,
   mergeExecutionEventPayload,
@@ -179,6 +180,12 @@ export interface RunnerDeps {
      * token is issued. Tests use it to interleave a state move.
      */
     beforeTokenIssue?: (executionId: string) => Promise<void>;
+    /**
+     * Runs after the fresh-session fallback decided to pin a released
+     * execution and before its pin transaction (C21). Tests use it to pin
+     * the execution elsewhere in between.
+     */
+    beforeFallbackPin?: (executionId: string) => Promise<void>;
   };
 }
 
@@ -191,6 +198,7 @@ export type ResumeErrorCode =
   | "NO_ADAPTER"
   | "CANNOT_RESUME"
   | "WORKTREE_UNAVAILABLE"
+  | "ISSUE_NOT_OPEN"
   | "SHUT_DOWN";
 
 /**
@@ -246,6 +254,12 @@ export interface ResumeInput {
    * turn, redacted. Returning true ends the turn in WAITING_FOR_USER instead
    * of a protocol violation.
    */
+  /**
+   * GOT.47 F1: the issue a conversation turn answers. The resume transaction
+   * locks it after the task and execution rows and refuses
+   * `ISSUE_NOT_OPEN` when a resolve has closed it since the handler read it.
+   */
+  openIssueId?: string;
   conversationTurn?: (tx: Tx, turn: { finalText: string }) => Promise<boolean>;
 }
 
@@ -1715,6 +1729,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       let expectedWorkerId = execution.workerId;
       if (fresh !== null) {
         freshSpec = freshContext(ctx);
+        await deps.hooks?.beforeFallbackPin?.(executionId);
         // C21: pin here before touching the worktree, so two workers
         // handling commands for the same released execution never both
         // take it over. No adapter or git call under the lock.
@@ -1819,6 +1834,14 @@ export function createRunner(deps: RunnerDeps): Runner {
         // §6.6: the worktree sweeper may have evicted it since then.
         if (pinned?.worktreeEvictedAt != null) {
           refuse("WORKTREE_UNAVAILABLE", "worktree was evicted after the context loaded");
+        }
+        // F1: an api resolve may have closed the issue since the handler
+        // read it. Issue last, after task and execution (the api's order).
+        if (input.openIssueId !== undefined) {
+          const issue = await lockIssue(tx, input.openIssueId);
+          if (issue?.status !== "OPEN") {
+            refuse("ISSUE_NOT_OPEN", `issue is ${issue?.status ?? "gone"}, not OPEN`);
+          }
         }
         // GOT.37: a spec chat turn or a send-back only while the user is
         // drafting. Request-review or cancel may have moved the task since.
