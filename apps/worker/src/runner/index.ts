@@ -15,7 +15,15 @@ export {
   registerSpecHandlers,
   specMessagePrompt,
   specSentBackPrompt,
+  type SpecHandlerOptions,
 } from "./spec.js";
+export {
+  createIssueMessageHandler,
+  decisionResumePrompt,
+  issueMessagePrompt,
+  registerIssueHandlers,
+  revisionResumePrompt,
+} from "./issues.js";
 export {
   DEFAULT_REVIEW_WRAPPER_BIN,
   DEFAULT_RUNNER_SHUTDOWN_TIMEOUT_MS,
@@ -28,6 +36,7 @@ export {
   createRunner,
   freshRetryHeader,
   infraRetryResumePrompt,
+  type FreshSessionReason,
   type ResumeErrorCode,
   type ResumeInput,
   type RetryStart,

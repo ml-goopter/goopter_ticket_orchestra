@@ -17,7 +17,7 @@ import {
 import { renderSpecMarkdown } from "@orchestra/prompts";
 import { z } from "zod";
 import type { Logger } from "../logger.js";
-import type { CommandHandlers, CommandOutcome } from "./commands.js";
+import type { CommandHandler, CommandHandlers, CommandOutcome } from "./commands.js";
 import { ResumeError, type Runner } from "./runner.js";
 
 /**
@@ -122,9 +122,19 @@ async function createSpecExecution(
   });
 }
 
+export interface SpecHandlerOptions {
+  /**
+   * GOT.47: handles a `send_message` whose execution is not a spec
+   * execution (the issue conversation, §9.3). Without it such a command is
+   * skipped.
+   */
+  implementationSendMessage?: CommandHandler;
+}
+
 export function registerSpecHandlers(
   handlers: CommandHandlers,
   runner: Pick<Runner, "startSpec" | "resume" | "isLive">,
+  options: SpecHandlerOptions = {},
 ): void {
   handlers.registerCommandHandler("start_spec_session", async (command, ctx) => {
     const log = ctx.logger.child({ commandId: command.id, taskId: command.taskId });
@@ -155,8 +165,11 @@ export function registerSpecHandlers(
     }
     const loaded = await loadRunnerContext(ctx.db, executionId);
     if (!loaded) return { outcome: "skipped", reason: "execution not found" };
-    // Issue conversation on an implementation execution is GOT.47's.
+    // Issue conversation on an implementation execution (GOT.47).
     if (loaded.execution.role !== "spec") {
+      if (options.implementationSendMessage) {
+        return options.implementationSendMessage(command, ctx);
+      }
       return { outcome: "skipped", reason: "not a spec execution" };
     }
     const parsed = SendMessagePayloadSchema.safeParse(command.payload);
