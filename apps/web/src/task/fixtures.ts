@@ -1,3 +1,5 @@
+import { vi } from "vitest";
+import type { BoardApiClient } from "../api/client.js";
 import type {
   Execution,
   Issue,
@@ -255,6 +257,30 @@ export function makeTimelineEvent(overrides: Partial<TimelineEvent>): TimelineEv
     type: "agent.note",
     payload: {},
     createdAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+/**
+ * A fully-typed `BoardApiClient` double with every method a no-op
+ * `vi.fn()`, so a test only has to override the handful of methods it
+ * exercises rather than restate the whole interface (GOT.41-fix0).
+ */
+export function makeFakeClient(overrides: Partial<BoardApiClient> = {}): BoardApiClient {
+  return {
+    request: vi.fn(),
+    login: vi.fn(),
+    logout: vi.fn(),
+    me: vi.fn(),
+    health: vi.fn(),
+    listTasks: vi.fn().mockResolvedValue([]),
+    listIssues: vi.fn().mockResolvedValue([]),
+    listNotifications: vi.fn().mockResolvedValue([]),
+    markNotificationRead: vi.fn(),
+    getTask: vi.fn().mockResolvedValue(makeTaskAggregate()),
+    getTimeline: vi.fn().mockResolvedValue({ events: [], nextAfter: 0 }),
+    cancelTask: vi.fn(),
+    retryTask: vi.fn(),
     ...overrides,
   };
 }

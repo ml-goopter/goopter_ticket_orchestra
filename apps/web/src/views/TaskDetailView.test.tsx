@@ -93,7 +93,9 @@ function renderDetail(client: BoardApiClient, taskId = "task-1") {
 
 describe("TaskDetailView", () => {
   it("shows a loading state before the aggregate resolves", () => {
-    const client = makeClient({ getTask: vi.fn(() => new Promise(() => {})) });
+    const client = makeClient({
+      getTask: vi.fn(() => new Promise<never>(() => {})),
+    });
     renderDetail(client);
 
     expect(screen.getByText("Loading...")).toBeTruthy();
