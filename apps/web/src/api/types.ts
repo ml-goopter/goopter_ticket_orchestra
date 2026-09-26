@@ -290,3 +290,62 @@ export const TaskTransitionResultSchema = z.object({
   to: TaskStateSchema,
 });
 export type TaskTransitionResult = z.infer<typeof TaskTransitionResultSchema>;
+
+/**
+ * `POST /tasks/:id/spec/messages` result (design.md §12.3,
+ * apps/api/src/routes/spec.ts): the enqueued `send_message` command.
+ */
+export const SpecMessageResultSchema = z.object({
+  commandId: z.string(),
+  executionId: z.string(),
+});
+export type SpecMessageResult = z.infer<typeof SpecMessageResultSchema>;
+
+/**
+ * `PUT /tasks/:id/spec/draft` result (design.md §12.3): `packages/db`'s bare
+ * `SpecRevisionRow`, not the full `SpecificationRevision` -- it has no
+ * `taskId`/`createdBy`/timestamps.
+ */
+export const SpecDraftResultSchema = z.object({
+  id: z.string(),
+  version: z.number(),
+  status: RevisionStatusSchema,
+  content: SpecContentSchema,
+});
+export type SpecDraftResult = z.infer<typeof SpecDraftResultSchema>;
+
+/**
+ * `POST /tasks/:id/spec/approve` and `.../spec/revise` result (design.md
+ * §12.3): the transition plus the revision id they acted on.
+ */
+export const SpecRevisionTransitionResultSchema = z.object({
+  from: TaskStateSchema,
+  to: TaskStateSchema,
+  revisionId: z.string(),
+});
+export type SpecRevisionTransitionResult = z.infer<
+  typeof SpecRevisionTransitionResultSchema
+>;
+
+/**
+ * `GET /repositories?project=` row shape (`toResponse` in
+ * apps/api/src/routes/repositories.ts, design.md §12.5) -- snake_case admin
+ * shape, distinct from the aggregate's drizzle-cased `RepositorySchema|
+ * above. Used by the spec builder's repository-exists check (design.md
+ * §4.3 approval rule): the aggregate carries only the task's own assigned
+ * repository (null before approval), never the project's full list.
+ */
+export const AdminRepositorySchema = z.object({
+  id: z.string(),
+  project_id: z.string(),
+  name: z.string(),
+  git_url: z.string(),
+  default_branch: z.string(),
+  default_runtime: RuntimeSchema,
+  default_model: z.string().nullable(),
+  max_concurrent_worktrees: z.number(),
+  required_capability: z.string().nullable(),
+  setup_command: z.string().nullable(),
+  created_at: z.string(),
+});
+export type AdminRepository = z.infer<typeof AdminRepositorySchema>;
