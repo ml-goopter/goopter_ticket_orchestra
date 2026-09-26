@@ -115,6 +115,56 @@ describe("buildTimelineItems", () => {
     expect(items[0]!.to).toBe("IMPLEMENTING");
   });
 
+  it("renders an agent.message with no prior deltas for that execution as a complete message item (F2)", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        executionId: "exec-1",
+        type: "agent.message",
+        payload: { text: "Hi there" },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]!.kind).toBe("message");
+    expect(items[0]!.final).toBe(true);
+    expect(items[0]!.text).toBe("Hi there");
+  });
+
+  it("keeps deltas from two interleaved executions as separate in-progress items, each collapsed by its own final message (F2)", () => {
+    const deltaEvents = [
+      makeTimelineEvent({ id: 1, executionId: "exec-a", type: "agent.message.delta", payload: { text: "A1" } }),
+      makeTimelineEvent({ id: 2, executionId: "exec-b", type: "agent.message.delta", payload: { text: "B1" } }),
+      makeTimelineEvent({ id: 3, executionId: "exec-a", type: "agent.message.delta", payload: { text: "A2" } }),
+      makeTimelineEvent({ id: 4, executionId: "exec-b", type: "agent.message.delta", payload: { text: "B2" } }),
+    ];
+
+    const inProgress = buildTimelineItems(deltaEvents);
+
+    expect(inProgress).toHaveLength(2);
+    expect(inProgress.every((item) => item.final === false)).toBe(true);
+    expect(inProgress.find((item) => item.executionId === "exec-a")!.text).toBe("A1A2");
+    expect(inProgress.find((item) => item.executionId === "exec-b")!.text).toBe("B1B2");
+
+    const finalEvents = [
+      ...deltaEvents,
+      makeTimelineEvent({ id: 5, executionId: "exec-a", type: "agent.message", payload: { text: "A1A2!" } }),
+      makeTimelineEvent({ id: 6, executionId: "exec-b", type: "agent.message", payload: { text: "B1B2!" } }),
+    ];
+
+    const items = buildTimelineItems(finalEvents);
+
+    expect(items).toHaveLength(2);
+    const a = items.find((item) => item.executionId === "exec-a")!;
+    const b = items.find((item) => item.executionId === "exec-b")!;
+    expect(a.final).toBe(true);
+    expect(a.text).toBe("A1A2!");
+    expect(b.final).toBe(true);
+    expect(b.text).toBe("B1B2!");
+  });
+
   it("renders any other event type with a compact payload summary", () => {
     const events = [
       makeTimelineEvent({ id: 1, type: "issue.created", payload: { issueId: "i1" } }),

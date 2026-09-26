@@ -42,7 +42,6 @@ export function TaskDetailView({ client, createEventSource }: TaskDetailViewProp
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [streamAfter, setStreamAfter] = useState<number | null>(null);
   const [selectedFamilies, setSelectedFamilies] = useState<ReadonlySet<EventFamily>>(
     () => new Set(EVENT_FAMILIES),
   );
@@ -63,18 +62,22 @@ export function TaskDetailView({ client, createEventSource }: TaskDetailViewProp
 
       let merged: TimelineEvent[] = [];
       let after: number | undefined;
+      let cursor = 0;
       for (;;) {
         const page = await apiClient.getTimeline(id, { after, limit: TIMELINE_PAGE_LIMIT });
         if (!isCurrent(generation)) return;
         merged = mergeTimelineEvents(merged, page.events);
+        cursor = page.nextAfter;
         if (page.events.length < TIMELINE_PAGE_LIMIT) {
           break;
         }
         after = page.nextAfter;
       }
-      setEvents(merged);
-      lastEventIdRef.current = merged.length > 0 ? merged[merged.length - 1]!.id : 0;
-      setStreamAfter(lastEventIdRef.current);
+      // Merge with (rather than replace) whatever is already in `events`: the
+      // stream subscribes before this backlog page lands (see below), so a
+      // live event can already be in state here and must not be dropped.
+      setEvents((prev) => mergeTimelineEvents(prev, merged));
+      lastEventIdRef.current = Math.max(lastEventIdRef.current, cursor);
       setLoadState("loaded");
     } catch (err) {
       if (!isCurrent(generation)) return;
@@ -121,12 +124,19 @@ export function TaskDetailView({ client, createEventSource }: TaskDetailViewProp
 
   const eventSourceAvailable = createEventSource !== undefined || typeof EventSource !== "undefined";
 
+  // Bare URL: the hook owns the `after=` param itself once it has seen a
+  // live event (Last-Event-ID resume on reconnect). Passing our own
+  // `after=` here as well would duplicate the param on reconnect and the
+  // api rejects that with 400 (F1). Subscribing unconditionally, rather
+  // than waiting on the backlog load, means no live event between page
+  // load and stream open is lost: `mergeTimelineEvents` dedupes and orders
+  // whichever of the two arrives first.
   const { status } = useEventStream(
-    `/api/tasks/${id}/stream${streamAfter !== null ? `?after=${streamAfter}` : ""}`,
+    `/api/tasks/${id}/stream`,
     {
       types: EXECUTION_EVENT_TYPES,
       createEventSource,
-      enabled: streamAfter !== null && eventSourceAvailable,
+      enabled: Boolean(id) && eventSourceAvailable,
       onEvent: (event) => {
         const parsed = TimelineEventSchema.safeParse(event.data);
         if (!parsed.success) {

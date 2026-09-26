@@ -309,4 +309,77 @@ describe("TaskDetailView", () => {
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
     expect(getTimeline.mock.calls.length).toBeGreaterThanOrEqual(2);
   }, 10000);
+
+  it("reconnects with exactly one after param once a live event has been seen, and comes back open with a catch-up fetch (F1)", async () => {
+    const getTask = vi.fn().mockResolvedValue(makeTaskAggregate());
+    const getTimeline = vi.fn().mockResolvedValue(emptyPage());
+    const client = makeClient({ getTask, getTimeline });
+    renderDetail(client);
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+    expect(currentSource().url).toBe("/api/tasks/task-1/stream");
+
+    await act(async () => {
+      currentSource().onopen?.();
+    });
+
+    const liveEvent = makeTimelineEvent({ id: 999, type: "issue.created", payload: { issueId: "i-live" } });
+    await act(async () => {
+      currentSource().emit("issue.created", liveEvent, "999");
+    });
+
+    await act(async () => {
+      currentSource().onerror?.(new Event("error"));
+    });
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(1), { timeout: 3000 });
+
+    const reconnectUrl = currentSource().url;
+    const afterParams = [...new URL(reconnectUrl, "http://localhost").searchParams.entries()].filter(
+      ([key]) => key === "after",
+    );
+    expect(afterParams).toHaveLength(1);
+    expect(afterParams[0]![1]).toBe("999");
+
+    await act(async () => {
+      currentSource().onopen?.();
+    });
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+    expect(getTimeline.mock.calls.length).toBeGreaterThanOrEqual(2);
+  }, 10000);
+
+  it("keeps a live event delivered before the first timeline page lands, merged once and in id order (F1)", async () => {
+    let resolveTimeline!: (page: TimelinePage) => void;
+    const timelinePromise = new Promise<TimelinePage>((resolve) => {
+      resolveTimeline = resolve;
+    });
+    const getTimeline = vi.fn().mockReturnValue(timelinePromise);
+    const client = makeClient({ getTimeline });
+    renderDetail(client);
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    const liveEvent = makeTimelineEvent({ id: 50, type: "issue.created", payload: { issueId: "i-live" } });
+    await act(async () => {
+      currentSource().emit("issue.created", liveEvent, "50");
+    });
+
+    await waitFor(() => expect(screen.queryByText(/i-live/)).toBeTruthy());
+
+    const backlogEvent = makeTimelineEvent({ id: 10, type: "issue.created", payload: { issueId: "i-backlog" } });
+    await act(async () => {
+      resolveTimeline({ events: [backlogEvent], nextAfter: 10 });
+    });
+
+    await waitFor(() => {
+      const items = within(screen.getByTestId("timeline")).getAllByTestId("timeline-item");
+      expect(items).toHaveLength(2);
+    });
+
+    const items = within(screen.getByTestId("timeline")).getAllByTestId("timeline-item");
+    expect(items[0]!.textContent).toContain("i-backlog");
+    expect(items[1]!.textContent).toContain("i-live");
+  });
 });
