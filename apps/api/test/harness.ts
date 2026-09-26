@@ -13,6 +13,7 @@ import type {
 import {
   createDb,
   executions,
+  executionUsage,
   issues,
   notifications,
   projects,
@@ -322,6 +323,44 @@ export async function seedExecution(
     })
     .returning({ id: executions.id });
   return row!.id;
+}
+
+export interface SeedExecutionUsageOptions {
+  kind?: "main" | "review" | "resume";
+  round?: number | null;
+  runtime?: Runtime;
+  model?: string;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  /** Decimal string; `null` for an unpriced (unknown-model) row (design.md §9.7). */
+  costUsd?: string | null;
+  recordedAt?: Date;
+}
+
+/** Inserts one `execution_usage` row directly (design.md §4.2, §9.7). */
+export async function seedExecutionUsage(
+  db: Db,
+  executionId: string,
+  options: SeedExecutionUsageOptions = {},
+): Promise<string> {
+  const [row] = await db
+    .insert(executionUsage)
+    .values({
+      executionId,
+      kind: options.kind ?? "main",
+      round: options.round ?? null,
+      runtime: options.runtime ?? "claude",
+      model: options.model ?? "claude-sonnet-5",
+      inputTokens: options.inputTokens ?? 0,
+      cachedInputTokens: options.cachedInputTokens ?? 0,
+      outputTokens: options.outputTokens ?? 0,
+      costUsd: options.costUsd === undefined ? "0" : options.costUsd,
+      ...(options.recordedAt ? { recordedAt: options.recordedAt } : {}),
+    })
+    .returning({ id: executionUsage.id });
+  if (!row) throw new Error("seedExecutionUsage: insert returned no row");
+  return row.id;
 }
 
 /** Inserts one `task_dependencies` row directly. */

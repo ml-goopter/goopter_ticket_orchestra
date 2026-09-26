@@ -171,7 +171,9 @@ export async function sweepWorktrees(
             return "gone" as const;
           }
 
-          const removed = await repo.remove(row.executionId, {
+          // C33: the recorded path, which a retry may have taken over from
+          // the execution that created it.
+          const removed = await repo.remove(row.worktreePath, {
             branch: row.branch,
             ...(expectedTip !== undefined ? { expectedTip } : {}),
           });

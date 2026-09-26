@@ -325,7 +325,7 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
     writeFileSyncIn(first.worktreePath, "local.txt", "diverged");
     git(first.worktreePath, "add", "local.txt");
     git(first.worktreePath, "commit", "-q", "-m", "diverged");
-    await manager.remove("exec-1", { repositoryName: repository.name });
+    await manager.remove(first.worktreePath, { repositoryName: repository.name });
     expect(gitOk(bareClonePath(), "rev-parse", "--verify", `refs/heads/${BRANCH}`)).toBe(true);
 
     const pushed = pushCommit(BRANCH, "pushed.txt", "pushed");
@@ -612,7 +612,7 @@ describe("WorktreeManager.remove (design.md §6.6)", () => {
     const result = await manager.prepareImplementation(implInput("exec-1"));
     writeFileSyncIn(result.worktreePath, "dirty.txt", "uncommitted");
 
-    const removed = await manager.remove("exec-1", {
+    const removed = await manager.remove(result.worktreePath, {
       repositoryName: repository.name,
       branch: BRANCH,
     });
@@ -627,7 +627,7 @@ describe("WorktreeManager.remove (design.md §6.6)", () => {
     const manager = new WorktreeManager({ workspaceRoot });
     const result = await manager.prepareImplementation(implInput("exec-1"));
 
-    const removed = await manager.remove("exec-1", {
+    const removed = await manager.remove(result.worktreePath, {
       repositoryName: repository.name,
     });
 
@@ -641,7 +641,7 @@ describe("WorktreeManager.remove (design.md §6.6)", () => {
     const stale = await manager.prepareImplementation(implInput("exec-1"));
     const fresh = await manager.prepareImplementation(implInput("exec-2"));
 
-    const removed = await manager.remove("exec-1", {
+    const removed = await manager.remove(stale.worktreePath, {
       repositoryName: repository.name,
       branch: BRANCH,
     });
@@ -661,7 +661,7 @@ describe("WorktreeManager.remove (design.md §6.6)", () => {
     await fs.rm(result.worktreePath, { recursive: true, force: true });
 
     await expect(
-      manager.remove("exec-1", { repositoryName: repository.name, branch: BRANCH }),
+      manager.remove(result.worktreePath, { repositoryName: repository.name, branch: BRANCH }),
     ).resolves.toEqual({ branchDeleted: true });
     expect(worktreeRecords()).not.toContain(result.worktreePath);
   });
@@ -725,7 +725,7 @@ describe("WorktreeManager.remove (design.md §6.6)", () => {
       // whole locked sequence (including `releaseBranch`) has finished.
       const preparePromise = manager.prepareImplementation(implInput("exec-2"));
       const removePromise = manager
-        .remove("exec-1", { repositoryName: repository.name, branch: BRANCH })
+        .remove(stale.worktreePath, { repositoryName: repository.name, branch: BRANCH })
         .catch(() => undefined);
 
       const fresh = await preparePromise;
@@ -878,8 +878,8 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
 
   it("P6: reports a missing local branch without pushing", async () => {
     const manager = new WorktreeManager({ workspaceRoot });
-    await manager.prepareImplementation(implInput("exec-1"));
-    await manager.remove("exec-1", { repositoryName: repository.name, branch: BRANCH });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    await manager.remove(prepared.worktreePath, { repositoryName: repository.name, branch: BRANCH });
 
     await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
       pushed: false,
@@ -985,7 +985,7 @@ describe("WorktreeManager.remove with expectedTip (F2)", () => {
     const tip = git(prepared.worktreePath, "rev-parse", "HEAD");
 
     await expect(
-      manager.remove("exec-1", {
+      manager.remove(prepared.worktreePath, {
         repositoryName: repository.name,
         branch: BRANCH,
         expectedTip: tip,
@@ -1003,7 +1003,7 @@ describe("WorktreeManager.remove with expectedTip (F2)", () => {
     git(prepared.worktreePath, "commit", "-q", "-m", "late");
 
     await expect(
-      manager.remove("exec-1", {
+      manager.remove(prepared.worktreePath, {
         repositoryName: repository.name,
         branch: BRANCH,
         expectedTip: tip,
@@ -1018,7 +1018,7 @@ describe("WorktreeManager.remove with expectedTip (F2)", () => {
     const prepared = await manager.prepareImplementation(implInput("exec-1"));
 
     await expect(
-      manager.remove("exec-1", {
+      manager.remove(prepared.worktreePath, {
         repositoryName: repository.name,
         branch: BRANCH,
         expectedTip: null,
@@ -1026,4 +1026,87 @@ describe("WorktreeManager.remove with expectedTip (F2)", () => {
     ).resolves.toEqual({ branchDeleted: false, tipMoved: true });
     expect(existsSync(prepared.worktreePath)).toBe(true);
   });
+});
+
+describe("WorktreeManager recorded worktree paths (C33)", () => {
+  const workDir = (name: string) => path.join(workspaceRoot, "work", name);
+
+  it("prepareImplementation creates the worktree at an explicit recorded path, not work/<executionId>", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+
+    const result = await manager.prepareImplementation(
+      implInput("exec-2", { worktreePath: workDir("exec-1") }),
+    );
+
+    expect(result.worktreePath).toBe(workDir("exec-1"));
+    expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
+    expect(existsSync(path.join(result.worktreePath, EXECUTION_CONTEXT_PATH))).toBe(true);
+    expect(existsSync(workDir("exec-2"))).toBe(false);
+  });
+
+  it("prepareSpec creates the worktree at an explicit recorded path", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+
+    const result = await manager.prepareSpec({
+      executionId: "spec-2",
+      repository,
+      worktreePath: workDir("spec-1"),
+    });
+
+    expect(result).toEqual({ worktreePath: workDir("spec-1"), branch: null });
+    expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(remoteTip("main"));
+    expect(existsSync(workDir("spec-2"))).toBe(false);
+  });
+
+  it("remove deletes the recorded path and leaves every other worktree alone", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const owned = await manager.prepareImplementation(
+      implInput("exec-2", { worktreePath: workDir("exec-1") }),
+    );
+    const other = await manager.prepareSpec({ executionId: "exec-2", repository });
+    writeFileSyncIn(other.worktreePath, "keep.txt", "keep");
+
+    const removed = await manager.remove(owned.worktreePath, {
+      repositoryName: repository.name,
+      branch: BRANCH,
+    });
+
+    expect(removed).toEqual({ branchDeleted: true });
+    expect(existsSync(owned.worktreePath)).toBe(false);
+    expect(worktreeRecords()).not.toContain(owned.worktreePath);
+    expect(existsSync(path.join(other.worktreePath, "keep.txt"))).toBe(true);
+  });
+
+  const unsafe = [
+    ["a relative path", "work/exec-1"],
+    ["the work directory itself", "WORK"],
+    ["a traversal out of work", "WORK/../escape"],
+    ["a nested path", "WORK/a/b"],
+    ["a path outside the workspace", "/tmp/orchestra-elsewhere"],
+    ["a segment that reads as an option", "WORK/-rf"],
+  ] as const;
+
+  for (const [what, raw] of unsafe) {
+    it(`rejects ${what} for prepare and remove, creating and deleting nothing`, async () => {
+      const manager = new WorktreeManager({ workspaceRoot });
+      const target = raw.startsWith("WORK")
+        ? path.join(workspaceRoot, "work") + raw.slice(4)
+        : raw;
+      const bystander = await manager.prepareSpec({ executionId: "bystander", repository });
+
+      await expect(
+        manager.prepareImplementation(implInput("exec-1", { worktreePath: target })),
+      ).rejects.toThrow(/worktree path/);
+      await expect(
+        manager.prepareSpec({ executionId: "exec-1", repository, worktreePath: target }),
+      ).rejects.toThrow(/worktree path/);
+      await expect(
+        manager.remove(target, { repositoryName: repository.name }),
+      ).rejects.toThrow(/worktree path/);
+
+      expect(existsSync(path.join(workspaceRoot, "escape"))).toBe(false);
+      expect(existsSync(workDir("exec-1"))).toBe(false);
+      expect(existsSync(bystander.worktreePath)).toBe(true);
+    });
+  }
 });

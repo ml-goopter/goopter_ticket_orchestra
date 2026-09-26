@@ -8,6 +8,7 @@ import {
 import {
   ZERO_TASK_COST,
   getTaskAggregate,
+  getTaskCostBreakdown,
   listActiveExecutionIds,
   listAttention,
   listBoard,
@@ -28,6 +29,9 @@ import {
   type DependencyRow,
   type TaskAggregate,
   type TaskCost,
+  type TaskCostBreakdown,
+  type TaskCostUsageRow,
+  type TaskExecutionCostBreakdown,
   type TransitionResult,
 } from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
@@ -118,6 +122,54 @@ function serializeAggregate(
   cost: TaskCost,
 ) {
   return { ...aggregate, dependencies, cost };
+}
+
+function serializeUsageRow(row: TaskCostUsageRow) {
+  return {
+    id: row.id,
+    kind: row.kind,
+    round: row.round,
+    runtime: row.runtime,
+    model: row.model,
+    input_tokens: row.inputTokens,
+    cached_input_tokens: row.cachedInputTokens,
+    output_tokens: row.outputTokens,
+    cost_usd: row.costUsd,
+    recorded_at: row.recordedAt,
+    estimated: row.estimated,
+  };
+}
+
+function serializeExecutionCost(execution: TaskExecutionCostBreakdown) {
+  return {
+    execution_id: execution.executionId,
+    role: execution.role,
+    attempt: execution.attempt,
+    runtime: execution.runtime,
+    estimated: execution.estimated,
+    usage: execution.usage.map(serializeUsageRow),
+    total: {
+      cost_usd: execution.total.costUsd,
+      input_tokens: execution.total.inputTokens,
+      cached_input_tokens: execution.total.cachedInputTokens,
+      output_tokens: execution.total.outputTokens,
+      unpriced_rows: execution.total.unpricedRows,
+    },
+  };
+}
+
+function serializeTaskCostBreakdown(breakdown: TaskCostBreakdown) {
+  return {
+    task_id: breakdown.taskId,
+    executions: breakdown.executions.map(serializeExecutionCost),
+    total: {
+      cost_usd: breakdown.total.costUsd,
+      input_tokens: breakdown.total.inputTokens,
+      cached_input_tokens: breakdown.total.cachedInputTokens,
+      output_tokens: breakdown.total.outputTokens,
+      unpriced_rows: breakdown.total.unpricedRows,
+    },
+  };
 }
 
 /**
@@ -225,6 +277,16 @@ export default async function tasksRoutes(app: FastifyInstance): Promise<void> {
       events: rows.map((row) => ({ ...row, id: Number(row.id) })),
       nextAfter,
     };
+  });
+
+  /** design.md §12.5/§14 task detail cost breakdown; §9.7. */
+  app.get("/tasks/:id/costs", async (request) => {
+    const id = parseTaskId(request.params);
+    const breakdown = await getTaskCostBreakdown(app.db, id);
+    if (!breakdown) {
+      throw new AppError(404, "NOT_FOUND", `task not found: ${id}`);
+    }
+    return serializeTaskCostBreakdown(breakdown);
   });
 
   app.patch("/tasks/:id", async (request, reply) => {

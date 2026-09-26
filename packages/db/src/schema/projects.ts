@@ -1,4 +1,11 @@
-import { integer, pgTable, text, unique, uuid } from "drizzle-orm/pg-core";
+import {
+  integer,
+  numeric,
+  pgTable,
+  text,
+  unique,
+  uuid,
+} from "drizzle-orm/pg-core";
 import { timestamptz } from "./columns.js";
 import { runtimeEnum } from "./enums.js";
 
@@ -12,6 +19,11 @@ export const projects = pgTable("projects", {
   maxProtocolRetries: integer("max_protocol_retries").notNull().default(2),
   maxCiRounds: integer("max_ci_rounds").notNull().default(3),
   maxReviewRounds: integer("max_review_rounds").notNull().default(3),
+  /**
+   * Nullable (design.md build-order Q9): no enforcement lives here yet,
+   * only the column the budget policy will read.
+   */
+  maxBudgetUsd: numeric("max_budget_usd", { precision: 12, scale: 6 }),
   createdAt: timestamptz("created_at").notNull().defaultNow(),
 });
 

@@ -7,6 +7,7 @@ import { registerErrorHandler } from "./lib/errors.js";
 import authPlugin from "./plugins/auth.js";
 import realtimePlugin, { type RealtimeOptions } from "./realtime/index.js";
 import authRoutes from "./routes/auth.js";
+import costsRoutes from "./routes/costs.js";
 import healthRoutes from "./routes/health.js";
 import issuesRoutes from "./routes/issues.js";
 import notificationsRoutes from "./routes/notifications.js";
@@ -64,6 +65,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   await app.register(repositoriesRoutes, { prefix: "/api/repositories" });
   await app.register(usersRoutes, { prefix: "/api/users" });
   await app.register(workersRoutes, { prefix: "/api/workers" });
+  await app.register(costsRoutes, { prefix: "/api" });
 
   return app;
 }

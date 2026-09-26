@@ -20,6 +20,7 @@ import {
   createRunner,
   registerCancelHandler,
   registerCiFailureHandler,
+  startRetryStarter,
 } from "./runner/index.js";
 import { WorktreeManager } from "./worktrees/index.js";
 import { detectRuntimes } from "./scheduler/index.js";
@@ -167,6 +168,16 @@ async function main(): Promise<void> {
   });
   loop.start();
 
+  // design.md §9.5, §6.5: independent loop that starts QUEUED retries once
+  // their backoff has passed, while this worker has a free slot (C25).
+  const stopRetryStarter = startRetryStarter({
+    db,
+    runner,
+    workerId,
+    runtimes,
+    logger: log.child({ component: "retry-starter" }),
+  });
+
   log.info(
     {
       tickIntervalMs: DEFAULT_TICK_INTERVAL_MS,
@@ -180,6 +191,8 @@ async function main(): Promise<void> {
     logger: log,
     stop: async () => {
       await loop.stop();
+      // No retry may be handed to a runner that is shutting down.
+      await stopRetryStarter();
       // Abort live sessions and let their finally blocks revoke tokens
       // before the tools server and the db go away.
       await runner.shutdown();
