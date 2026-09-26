@@ -1,5 +1,5 @@
 import os from "node:os";
-import { ClaudeAdapter } from "@orchestra/adapters";
+import { ClaudeAdapter, CodexAdapter } from "@orchestra/adapters";
 import { createDb, type Db } from "@orchestra/db";
 import {
   DEFAULT_AGENT_TOOLS_HOST,
@@ -122,7 +122,8 @@ async function main(): Promise<void> {
   log.info({ runtimes }, "detected agent runtimes");
 
   // design.md §9: the execution runner, fed by the claim phase (§6.3) and
-  // the command consumer (§6.1). Codex has no adapter yet (build step 9).
+  // the command consumer (§6.1). A runtime is claimable when its binary is
+  // on PATH (`runtimes` above) and it has an adapter here.
   const jira =
     config.jiraBaseUrl && config.jiraEmail && config.jiraApiToken
       ? createJiraClient({
@@ -140,7 +141,15 @@ async function main(): Promise<void> {
     workerId,
     host: config.host,
     worktrees,
-    adapters: { claude: new ClaudeAdapter() },
+    adapters: {
+      claude: new ClaudeAdapter(),
+      // Codex usage carries no cost; pricing it (§9.7, C47) needs a runner
+      // hook that does not exist yet.
+      codex: new CodexAdapter({
+        debug: (reason, line) =>
+          log.debug({ component: "codex-adapter", reason, line }, "ignored codex output"),
+      }),
+    },
     toolsUrl: () => toolsServer.url,
     ...(jira ? { fetchTicket: (key: string) => jira.getIssue(key) } : {}),
     ...(config.githubToken ? { githubToken: config.githubToken } : {}),

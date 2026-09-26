@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `6fe66d5` plus this change.
+Status as of 2026-09-25, main at `9aae37d` plus this change.
 
 ## Completed
 
@@ -42,6 +42,7 @@ Status as of 2026-09-25, main at `6fe66d5` plus this change.
 | W7 | GOT.43 | worker: failure classification and retry policy | #40 |
 | fill-in | GOT.29 | web: admin views for projects, repositories, users, workers | #41 |
 | W7 | GOT.38 | web: spec builder split pane | #42 |
+| W9 | GOT.45 | adapters: Codex implementation | #43 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -55,7 +56,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | W8 | GOT.46 | worker: GitHub poller | GOT.39 | M6 |
 | W8 | GOT.47 | worker: issue conversation and resume commands | GOT.33, 39 | M7 |
 | W9 | GOT.48 | E2E: sandbox ticket to merged PR through Claude | GOT.38 to 42, 46, 47 | M6 |
-| W9 | GOT.45 | adapters: Codex implementation | GOT.14 | M9 |
 | W9 | GOT.49 | E2E: same ticket through Codex | GOT.45, 48 | M9 |
 
 Both fill-in tasks (GOT.27, GOT.29) are done. GOT.29 ships without a user disable control (C40): the tracker asks for one, but commit 0167d86 removed the field from `PATCH /users/:id` because design §13 names no such route. Restoring it needs a user decision and is a small api change plus a toggle.
@@ -64,7 +64,7 @@ GOT.27's units have not been loaded under launchd on this machine; that is an op
 
 GOT.38 took five review rounds (cap 3, extended twice): rounds 1-3 each found one new major and round 4 a pre-existing recovery gap; round 5 was clean (PR #42).
 
-GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `codex` installed on the worker host (design OI1).
+GOT.45 was built early against synthesized `codex exec --json` fixtures because `codex` is not installed on this host (design OI1). The adapter is registered in the worker but is unverified against a real Codex run; see the GOT.49 notes (PR #43).
 
 ## Carry-forward notes
 
@@ -74,7 +74,10 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.46: `report_pr_created` now updates the task's single `pull_requests` row and resets it to open; the poller should key its state on `head_sha`, not on row identity (C17, C22, PR #37).
 - GOT.47: command handlers return `handled`, `unclaimed` or `skipped` (C20). Only an execution pinned to another host unclaims. A CI resume for an unpinned execution (host null after a dead-host release) is skipped and completed, leaving the task IMPLEMENTING with a COMPLETED execution. The retry starter (GOT.43) handles only QUEUED retry rows, so the fresh-session fallback for released WAITING_FOR_USER and COMPLETED executions (D5, §6.1) is GOT.47's: on OTHER_HOST with `host` null, pin the execution to this host and start a fresh session seeded with the spec, decisions and the pending prompt (C21, PR #37, #40).
 - GOT.37/47: the retry policy (PR #40) runs inside the FAILED transaction in the runner and the lease sweeper; a spec-role infrastructure failure only notifies (no task edge from SPEC_IN_PROGRESS) and the starter runs implementation rows only, so a failed spec session needs the user to start a new one. Retry rows copy `session_id`; the starter reuses a local worktree (resume when `canResume`, else a fresh session there, C31, C32) and every worktree operation after creation is keyed on the row's recorded `worktree_path` (C33). The failed row keeps `branch` and loses `worktree_path` after a takeover (C38).
-- GOT.45: `projects.max_budget_usd` exists (migration 0004, C29) but nothing reads it: the runner does not pass `maxBudgetUsd` to the adapter and no path produces `budget_exceeded`. Wire both with the Codex adapter, together with `apps/worker/src/pricing` for Codex usage; `execution_usage.cost_usd` is nullable for an unknown model (PR #38, C30).
+- GOT.47: `projects.max_budget_usd` exists (migration 0004, C29) but nothing reads it: the runner does not pass `maxBudgetUsd` to the adapter and no path produces `budget_exceeded`; `codex exec` has no budget flag, so the check belongs in the runner (PR #38, #43, C30).
+- GOT.47: Codex usage events carry no `costUsd` (C47) and the runner has no pricing hook: `runner.ts` records `costUsd ?? 0`, so Codex cost lands as 0 rather than NULL, and `modelFor` returns undefined for the default model so the usage row says `unknown`. Wire `apps/worker/src/pricing` into the runner's usage path and record the Codex model name (PR #43).
+- GOT.49: the Codex adapter's assumptions need one real run to verify: `-c` keys `mcp_servers.orchestra.url`, `mcp_servers.orchestra.bearer_token_env_var` and `sandbox_workspace_write.network_access` (all in `CODEX_CONFIG_KEYS`); whether Codex's default `shell_environment_policy` strips `*TOKEN*` variables, which would hide `ORCHESTRA_TOKEN` and `GITHUB_TOKEN` from `orchestra-review` and `gh`; whether `turn.completed` usage is cumulative across `exec resume` (the baseline subtraction assumes it is) and whether `input_tokens` includes `cached_input_tokens`; the flag order `exec <flags> resume <id> -` with `-` for stdin; item type names (`agent_message`, `command_execution`, `mcp_tool_call`, `file_change`, `web_search`); the session store at `$CODEX_HOME/sessions`; and whether older versions need `experimental_use_rmcp_client=true` for HTTP MCP (PR #43).
+- Later: the runner maps a Codex adapter `error` event to `adapter_error`, so a Codex process crash is not recorded as `process_crash`; and no test covers the adapter's kill-once guard (PR #43, accepted minor).
 - GOT.48: the UI labels every Claude cost "estimated" (C28, design OI2) because the api cannot tell an API-key login from a subscription login. Revisit if the host reports it.
 - GOT.47: a `WorktreeManager.prepareImplementation` call must follow the end of any earlier session for the same task, because a stale worktree holding the task branch is detached (PR #22).
 - All tasks: run `pnpm typecheck` (or build) before `pnpm test` in a fresh checkout. Worker tests load workspace packages from `dist`, and a stale `dist` fails tests unrelated to the change.
