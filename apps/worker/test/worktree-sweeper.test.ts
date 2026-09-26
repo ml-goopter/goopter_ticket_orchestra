@@ -334,7 +334,9 @@ async function expectEvicted(s: Seeded, pushed: boolean): Promise<void> {
 
 /**
  * Wraps the real manager, recording every removal in order and letting a
- * test fail one or react to it.
+ * test fail one or react to it. Removals are recorded by the worktree's
+ * directory name, which is the id of the execution that created it (C33:
+ * the sweeper passes the recorded `worktree_path`).
  */
 function recordingOps(
   hooks: {
@@ -354,9 +356,10 @@ function recordingOps(
     withRepositoryLock(repositoryName, fn) {
       return target.withRepositoryLock(repositoryName, (repo) =>
         fn({
-          async remove(executionId, options) {
+          async remove(worktreePath, options) {
+            const executionId = path.basename(worktreePath);
             hooks.onRemove?.(executionId);
-            const result = await repo.remove(executionId, options);
+            const result = await repo.remove(worktreePath, options);
             if (result.tipMoved !== true) removed.push(executionId);
             return result;
           },
@@ -401,7 +404,86 @@ async function sweep(options: WorktreeSweeperOptions = {}): Promise<void> {
   }).run(ctx());
 }
 
+/**
+ * GOT.43 C31/C33: a retry execution that took over the failed attempt's
+ * worktree, so its `worktree_path` is `work/<failed id>`. The failed row's
+ * path is cleared. `work/<retry id>` holds an unrelated decoy directory.
+ */
+async function seedReusedWorktree(options: {
+  taskState: TaskState;
+  state: ExecutionState;
+  endedAt?: Date | null;
+  lastEventAt?: Date;
+}): Promise<Seeded & { failedId: string; decoy: string }> {
+  const original = await seedWithWorktree({
+    taskState: options.taskState,
+    state: "FAILED",
+    endedAt: at(-40 * DAY),
+  });
+  const retryId = await insertExecution({
+    taskId: original.taskId,
+    state: options.state,
+    endedAt: options.endedAt ?? null,
+  });
+  await raw("update executions set worktree_path = null where id = $1", [original.executionId]);
+  await raw("update executions set worktree_path = $1, branch = $2 where id = $3", [
+    original.worktreePath,
+    original.branch,
+    retryId,
+  ]);
+  if (options.lastEventAt) {
+    await db.insert(executionEvents).values({
+      taskId: original.taskId,
+      executionId: retryId,
+      type: "execution.waiting",
+      payload: {},
+      createdAt: options.lastEventAt,
+    });
+  }
+  const decoy = path.join(workspaceRoot, "work", retryId);
+  await fs.mkdir(decoy, { recursive: true });
+  await fs.writeFile(path.join(decoy, "keep.txt"), "not a worktree");
+  return {
+    taskId: original.taskId,
+    executionId: retryId,
+    branch: original.branch,
+    worktreePath: original.worktreePath,
+    failedId: original.executionId,
+    decoy,
+  };
+}
+
 // ------------------------------------------------------------------ tests
+
+describe("recorded worktree_path (GOT.43 C33)", () => {
+  it("rule one removes a retry's worktree at its recorded work/<failed id>, never work/<retry id>", async () => {
+    const s = await seedReusedWorktree({
+      taskState: "DONE",
+      state: "COMPLETED",
+      endedAt: at(-25 * HOUR),
+    });
+    expect(path.basename(s.worktreePath)).toBe(s.failedId);
+
+    await sweep();
+
+    await expectRemoved(s);
+    expect(existsSync(path.join(s.decoy, "keep.txt"))).toBe(true);
+    expect((await execution(s.failedId)).worktreePath).toBeNull();
+  });
+
+  it("rule three evicts a retry's worktree at its recorded work/<failed id>, never work/<retry id>", async () => {
+    const s = await seedReusedWorktree({
+      taskState: "IMPLEMENTING",
+      state: "WAITING_FOR_USER",
+      lastEventAt: at(-15 * DAY),
+    });
+
+    await sweep();
+
+    await expectEvicted(s, false);
+    expect(existsSync(path.join(s.decoy, "keep.txt"))).toBe(true);
+  });
+});
 
 describe("rule one: task DONE or CANCELLED, ended over 24 h ago (§6.6)", () => {
   it("AC1: removes the worktree and local branch and clears worktree_path", async () => {
