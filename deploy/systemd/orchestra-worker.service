@@ -1,0 +1,23 @@
+# systemd user unit for the orchestra worker (docs/design.md §15.2).
+# Installed by deploy/systemd/install.sh, which substitutes the three
+# placeholders below (__CHECKOUT_DIR__, __NODE_BIN__, __PATH__) before
+# copying this file to ~/.config/systemd/user. Do not install this template
+# as-is; run install.sh.
+[Unit]
+Description=Orchestra worker (docs/design.md §15.2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__CHECKOUT_DIR__
+EnvironmentFile=__CHECKOUT_DIR__/.env.worker
+Environment=PATH=__PATH__
+ExecStart=__NODE_BIN__ apps/worker/dist/index.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

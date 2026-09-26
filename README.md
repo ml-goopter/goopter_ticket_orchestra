@@ -22,6 +22,10 @@ how it is built.
    openssl rand -base64 48
    ```
 
+   `NODE_ENV` defaults to `production`, which marks the session cookie
+   `Secure`; set it to `development` in `.env` if you are logging in over
+   plain `http://localhost` rather than TLS.
+
 2. Build and start Postgres, the migration job, the api, and the web UI:
 
    ```sh
@@ -35,9 +39,9 @@ how it is built.
    ```
 
    `db` should show `healthy`, `migrate` should show `Exited (0)` (it runs
-   once and stops), and `api`/`web` should be running. `api` is currently a
-   placeholder (design.md build order step 3 / GOT.18) and also exits
-   immediately until it has a real Fastify server.
+   once and stops), and `api`/`web` should be running — `api` is a real
+   Fastify server (`apps/api/src/index.ts`) that listens and serves auth,
+   projects, repositories, tasks, and the other routes under `/api`.
 
    Web is served at <http://localhost:8080>, proxying `/api/*` (including
    SSE streams) to the api container (`apps/web/nginx.conf`).
@@ -45,11 +49,23 @@ how it is built.
    If you only changed `apps/web` and want a fresh image without rebuilding
    everything else, run `docker compose build web` before `up`.
 
-4. Tear down:
+4. Create the first user (there is no signup route, design D9):
+
+   ```sh
+   set -a; source .env; set +a
+   corepack pnpm --filter @orchestra/api users:add jane@example.com --name "Jane Doe"
+   ```
+
+5. Tear down:
 
    ```sh
    docker compose down -v
    ```
+
+For registering a project and a repository, and everything below, see
+**`docs/runbook.md`** — the full operator runbook, including first-time
+host setup, the worker as a service, token rotation, and worktree
+maintenance.
 
 ### Worker
 
@@ -59,15 +75,13 @@ CLIs:
 
 ```sh
 corepack pnpm --filter @orchestra/worker build
-corepack pnpm --filter @orchestra/worker start
 ```
 
-It needs `DATABASE_URL` pointed at the published Postgres port
-(`postgres://<user>:<password>@localhost:5432/<db>` — see `.env.example`
-for the container-vs-host distinction), plus the other worker variables
-from `.env.example`. Run it under launchd (macOS) or systemd (Linux) with
-restart on failure; requires `git`, `gh` (authenticated), `node` 22+,
-`claude`, and `codex` (for Codex repositories) on `PATH`.
+Run it under launchd (macOS) or systemd (Linux) with restart on failure
+using the units and install scripts in `deploy/` — see `deploy/README.md`
+for what each installer does and `docs/runbook.md` §6 for the full
+walkthrough, including every environment variable the worker reads and
+what a clean start logs.
 
 ### Smoke test
 

@@ -227,3 +227,26 @@ export function builtinToolsFor(
   }
   return builtins;
 }
+
+/** `codex exec --sandbox` values this layer uses (design.md §7.2). */
+export type CodexSandboxMode = "read-only" | "workspace-write";
+
+export interface CodexSandboxPolicy {
+  sandbox: CodexSandboxMode;
+  /**
+   * Whether the workspace-write sandbox also permits network access, which
+   * `gh` and `git push` need (design.md §7.2).
+   */
+  networkAccess: boolean;
+}
+
+/**
+ * Codex sandbox per execution role (design.md §7.2). Codex has no per-tool
+ * allow list, so the sandbox is the whole boundary: `spec` and `review` run
+ * read-only, `implementation` runs workspace-write with network access.
+ */
+export function codexSandboxFor(policy: ToolPolicy): CodexSandboxPolicy {
+  return policy === "implementation"
+    ? { sandbox: "workspace-write", networkAccess: true }
+    : { sandbox: "read-only", networkAccess: false };
+}

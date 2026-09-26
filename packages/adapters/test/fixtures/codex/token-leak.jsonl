@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"The token is codex-fixture-token-5ecret."}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"curl -H 'Authorization: Bearer codex-fixture-token-5ecret' http://127.0.0.1:4599/mcp","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"orchestra","tool":"note","arguments":{"text":"leaked codex-fixture-token-5ecret"},"status":"completed"}}
+{"type":"turn.failed","error":{"message":"request rejected for token codex-fixture-token-5ecret"}}
