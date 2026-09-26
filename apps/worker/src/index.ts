@@ -1,4 +1,6 @@
 import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { ClaudeAdapter, CodexAdapter } from "@orchestra/adapters";
 import { createDb, type Db } from "@orchestra/db";
 import {
@@ -15,6 +17,7 @@ import { startGitHubPoller } from "./github/index.js";
 import { createJiraClient, startJiraPoller, startJiraWriteback } from "./jira/index.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PHASE_ORDER, createDefaultPhases } from "./phases/index.js";
+import { loadPricing, PricingFileError } from "./pricing/index.js";
 import { registerWorker } from "./registration.js";
 import {
   createCommandHandlers,
@@ -42,6 +45,14 @@ import { DEFAULT_TICK_INTERVAL_MS, createTickLoop } from "./tick.js";
  * row to attribute work to, and signal handlers go on last so a shutdown
  * always has something coherent to shut down.
  */
+
+/**
+ * `apps/worker` in the repo, resolved from this module rather than the
+ * process's cwd (matching `DEFAULT_REVIEW_WRAPPER_BIN` in runner.ts), so
+ * `PRICING_FILE`'s default of `config/pricing.json` (design.md §15.3) finds
+ * the repo-root file however the worker was launched.
+ */
+const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
 const closeDb = async (db: Db): Promise<void> => {
   await db.$client.end({ timeout: 5 });
@@ -81,6 +92,26 @@ async function main(): Promise<void> {
 
   const log = logger.child({ workerId });
   log.info({ config: redactConfig(config) }, "worker registered");
+
+  // design.md §9.7: `config/pricing.json`, loaded once and passed to the
+  // runner. A bad or missing file fails startup rather than silently
+  // pricing every Codex usage event as unknown. A relative `PRICING_FILE`
+  // (including the default) is resolved against the repo root, not the
+  // process's cwd, so it is found however the worker was launched.
+  const pricingPath = path.isAbsolute(config.pricingFile)
+    ? config.pricingFile
+    : path.join(REPO_ROOT, config.pricingFile);
+  let pricing;
+  try {
+    pricing = await loadPricing(pricingPath);
+  } catch (err) {
+    if (err instanceof PricingFileError) {
+      log.error({ path: err.path, err: err.message }, "pricing file failed to load");
+      await closeDb(db).catch(() => {});
+      process.exit(1);
+    }
+    throw err;
+  }
 
   // design.md §8: one agent-tools MCP server per worker, on loopback. The
   // registry is shared with the runner (GOT.31).
@@ -156,13 +187,12 @@ async function main(): Promise<void> {
     worktrees,
     adapters: {
       claude: new ClaudeAdapter(),
-      // Codex usage carries no cost; pricing it (§9.7, C47) needs a runner
-      // hook that does not exist yet.
       codex: new CodexAdapter({
         debug: (reason, line) =>
           log.debug({ component: "codex-adapter", reason, line }, "ignored codex output"),
       }),
     },
+    pricing,
     toolsUrl: () => toolsServer.url,
     ...(jira ? { fetchTicket: (key: string) => jira.getIssue(key) } : {}),
     ...(config.githubToken ? { githubToken: config.githubToken } : {}),

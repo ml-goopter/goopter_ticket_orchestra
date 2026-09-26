@@ -202,6 +202,23 @@ export async function loadRunnerContext(
 }
 
 /**
+ * Reads `executions.cost_usd`, the running total `addExecutionUsageTotals`
+ * maintains (design.md §9.7, GOT.50 item 4: "the execution's cumulative
+ * cost_usd"). Null when the execution is gone.
+ */
+export async function getExecutionCostUsd(
+  db: DbOrTx,
+  executionId: string,
+): Promise<string | null> {
+  const [row] = await db
+    .select({ costUsd: executions.costUsd })
+    .from(executions)
+    .where(eq(executions.id, executionId))
+    .limit(1);
+  return row?.costUsd ?? null;
+}
+
+/**
  * Sets `worker_id` and `host` where the claim left them null (§9.1). An
  * existing value is kept.
  */
