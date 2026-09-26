@@ -369,6 +369,119 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
   });
 
+  it("resets the debounce after a failed reconciling refetch, so a later event for the same unknown id retries and eventually renders both buffered messages (F1, review round 3)", async () => {
+    const initialAggregate = aggregateInProgress();
+    const newSpecExecution = { ...initialAggregate.executions[0]!, id: "exec-spec-2" };
+    const refreshedAggregate: TaskAggregate = {
+      ...initialAggregate,
+      executions: [...initialAggregate.executions, newSpecExecution],
+      latestExecutions: { ...initialAggregate.latestExecutions, spec: newSpecExecution },
+    };
+    const getTask = vi
+      .fn()
+      .mockResolvedValueOnce(initialAggregate)
+      .mockRejectedValueOnce(new Error("network blip"))
+      .mockResolvedValueOnce(refreshedAggregate)
+      .mockResolvedValue(refreshedAggregate);
+    const client = makeFakeClient({ getTask });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    // Unknown execution id: buffered, and triggers the debounced refetch,
+    // which rejects.
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({ id: 1, executionId: "exec-spec-2", type: "agent.message", payload: { text: "First try" } }),
+        "1",
+      );
+    });
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    // The failed refetch must not leave the debounce stuck: no chat is
+    // rendered yet (the buffered message is still unresolved), but nothing
+    // permanently drops it.
+    expect(screen.queryByTestId("chat-message")).toBeNull();
+
+    // A later event for the same still-unknown id must trigger another
+    // refetch rather than being silently buffered forever.
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({
+          id: 2,
+          executionId: "exec-spec-2",
+          type: "agent.message",
+          payload: { text: "Retry success" },
+        }),
+        "2",
+      );
+    });
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getAllByTestId("chat-message")).toHaveLength(2));
+    const rendered = screen.getAllByTestId("chat-message").map((node) => node.textContent);
+    expect(rendered).toEqual(["First try", "Retry success"]);
+  });
+
+  it("caps the pending chat event buffer, dropping the oldest events and warning once (F2, review round 3)", async () => {
+    const initialAggregate = aggregateInProgress();
+    const newSpecExecution = { ...initialAggregate.executions[0]!, id: "exec-unknown" };
+    const refreshedAggregate: TaskAggregate = {
+      ...initialAggregate,
+      executions: [...initialAggregate.executions, newSpecExecution],
+      latestExecutions: { ...initialAggregate.latestExecutions, spec: newSpecExecution },
+    };
+    let resolveSecondFetch!: (aggregate: TaskAggregate) => void;
+    const secondFetch = new Promise<TaskAggregate>((resolve) => {
+      resolveSecondFetch = resolve;
+    });
+    const getTask = vi.fn().mockResolvedValueOnce(initialAggregate).mockReturnValueOnce(secondFetch);
+    const client = makeFakeClient({ getTask });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    renderSpecBuilder(client);
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    const TOTAL_EVENTS = 510;
+    const MAX_PENDING_CHAT_EVENTS = 500;
+    await act(async () => {
+      for (let i = 0; i < TOTAL_EVENTS; i += 1) {
+        currentSource().emit(
+          "agent.message",
+          makeTimelineEvent({
+            id: i + 1,
+            executionId: "exec-unknown",
+            type: "agent.message",
+            payload: { text: `msg-${i}` },
+          }),
+          String(i + 1),
+        );
+      }
+    });
+
+    // Only the first buffered event debounces a refetch; the deferred
+    // promise above keeps that refetch pending while the rest buffer.
+    expect(getTask).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveSecondFetch(refreshedAggregate);
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId("chat-message")).toHaveLength(MAX_PENDING_CHAT_EVENTS));
+    const rendered = screen.getAllByTestId("chat-message").map((node) => node.textContent);
+    // The oldest (TOTAL_EVENTS - MAX_PENDING_CHAT_EVENTS) events were
+    // dropped, so the surviving window starts right after them.
+    expect(rendered[0]).toBe(`msg-${TOTAL_EVENTS - MAX_PENDING_CHAT_EVENTS}`);
+    expect(rendered[rendered.length - 1]).toBe(`msg-${TOTAL_EVENTS - 1}`);
+
+    warnSpy.mockRestore();
+  });
+
   it("loads the chat backlog from GET /tasks/:id/timeline on mount, and a live event with an overlapping id is not duplicated", async () => {
     const backlogEvent = makeTimelineEvent({
       id: 7,

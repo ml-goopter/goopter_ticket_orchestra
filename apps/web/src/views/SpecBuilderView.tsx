@@ -41,6 +41,14 @@ const HIGHLIGHT_DURATION_MS = 5000;
 /** Matches `TaskDetailView`'s backlog page size for `GET /tasks/:id/timeline`. */
 const TIMELINE_PAGE_LIMIT = 200;
 
+/**
+ * Cap on the live chat events buffered while their execution id isn't yet
+ * known to belong to the spec role (F2, GOT.38 review round 3): a stalled or
+ * repeatedly-failing reconciling refetch must not grow this buffer without
+ * bound. Oldest events are dropped first.
+ */
+const MAX_PENDING_CHAT_EVENTS = 500;
+
 /** Every api error is shown with its code (contract AC5), never just the message alone. */
 function describeError(err: unknown): string {
   if (err instanceof ApiError) {
@@ -126,6 +134,10 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const pendingChatEventsRef = useRef<TimelineEvent[]>([]);
   const pendingRefetchRef = useRef(false);
   const foreignExecutionIdsRef = useRef<Set<string>>(new Set());
+  // F2, GOT.38 review round 3: guards against an unbounded buffer if the
+  // reconciling refetch never arrives (e.g. a wedged connection); oldest
+  // events are dropped first and the drop is logged exactly once.
+  const bufferCapWarnedRef = useRef(false);
 
   useEffect(() => {
     formContentRef.current = formContent;
@@ -253,6 +265,15 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
       if (!isCurrent(generation)) return;
       applyAggregate(next, promptIfDirty);
     } catch (err) {
+      // F1, GOT.38 review round 3: a failed refetch must not leave
+      // `pendingRefetchRef` stuck true — that would permanently stop a later
+      // unknown-execution chat event from ever retrying reconciliation.
+      // Buffered events are left in place; the next unknown-id event (or the
+      // next successful refetch, including a reconnect's) retries them.
+      // Reset unconditionally, even if a newer refetch has since superseded
+      // this one, since either the newer one already reset it or is still
+      // in flight and will settle it itself.
+      pendingRefetchRef.current = false;
       if (!isCurrent(generation)) return;
       setActionError(describeError(err));
     }
@@ -323,7 +344,17 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
             // re-checks it once the aggregate refreshes. Debounced to one
             // refetch at a time, and only once the set is known at all —
             // the initial load already covers the F1 case.
-            pendingChatEventsRef.current = [...pendingChatEventsRef.current, parsed.data];
+            const nextPending = [...pendingChatEventsRef.current, parsed.data];
+            if (nextPending.length > MAX_PENDING_CHAT_EVENTS) {
+              nextPending.splice(0, nextPending.length - MAX_PENDING_CHAT_EVENTS);
+              if (!bufferCapWarnedRef.current) {
+                bufferCapWarnedRef.current = true;
+                console.warn(
+                  `SpecBuilderView: pending chat event buffer exceeded ${MAX_PENDING_CHAT_EVENTS} events; dropping oldest`,
+                );
+              }
+            }
+            pendingChatEventsRef.current = nextPending;
             if (specExecutionIds !== null && !pendingRefetchRef.current) {
               pendingRefetchRef.current = true;
               void refetch(true);
