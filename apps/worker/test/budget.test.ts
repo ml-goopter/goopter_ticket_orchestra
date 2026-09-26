@@ -5,6 +5,7 @@ import type { AgentAdapter, AgentEvent, ResumeRequest, StartRequest } from "@orc
 import type { Runtime } from "@orchestra/core";
 import {
   agentWorkers,
+  executions,
   projects,
   repositories,
   specificationRevisions,
@@ -155,6 +156,115 @@ async function seedClaimed(
   });
   if (!claim) throw new Error("claim returned nothing");
   return { workerId, taskId: claim.taskId, executionId: claim.executionId };
+}
+
+/**
+ * A FAILED attempt 1 (a session and worktree of its own, an infrastructure
+ * end_reason) plus an ASSIGNED attempt 2 pinned here with the same worktree
+ * (C31/C32) and holding the task's lease, so `runner.start(..., { retry })`
+ * takes the `resumeRetry` path (`adapter.resume`, not `adapter.start`)
+ * without going through the retry starter itself.
+ */
+async function seedRetryPair(
+  options: { runtime?: Runtime; maxBudgetUsd?: string | null } = {},
+): Promise<Seeded & { previousExecutionId: string }> {
+  const s = await seedClaimed(options);
+  const worktreePath = path.join(workRoot, "work", `retry-${s.executionId}`);
+  await fs.mkdir(worktreePath, { recursive: true });
+  const branch = "agent/retry-abcdef12";
+  await db.$client.unsafe(
+    `update executions set state = 'FAILED', session_id = $1, worktree_path = $2,
+       branch = $3, end_reason = 'process_crash', end_detail = 'spawn failed',
+       ended_at = $4
+     where id = $5`,
+    ["sess-retry-prev", worktreePath, branch, NOW.toISOString(), s.executionId],
+  );
+  const [retry] = await db
+    .insert(executions)
+    .values({
+      taskId: s.taskId,
+      role: "implementation",
+      attempt: 2,
+      state: "ASSIGNED",
+      runtime: options.runtime ?? "claude",
+      model: "claude-opus-test",
+      workerId: s.workerId,
+      host: HOST,
+      worktreePath,
+      branch,
+    })
+    .returning({ id: executions.id });
+  // What the retry starter does when it pins a retry (C25): the task's
+  // lease moves from the failed attempt to this one.
+  await db.$client.unsafe(
+    "update task_leases set execution_id = $1, expires_at = $2 where task_id = $3",
+    [retry!.id, new Date(NOW.getTime() + 5 * 60_000).toISOString(), s.taskId],
+  );
+  return { ...s, previousExecutionId: s.executionId, executionId: retry!.id };
+}
+
+/** An ASSIGNED spec execution ready for `runner.startSpec` (GOT.37, D8). */
+async function seedSpecAssigned(
+  options: { maxBudgetUsd?: string | null } = {},
+): Promise<Seeded> {
+  const n = ++seq;
+  const [worker] = await db
+    .insert(agentWorkers)
+    .values({ host: HOST, capabilities: [], maxConcurrent: 4, workspaceRoot: workRoot })
+    .onConflictDoNothing()
+    .returning({ id: agentWorkers.id });
+  const workerId =
+    worker?.id ??
+    (await db.query.agentWorkers.findFirst({ where: (w, { eq }) => eq(w.host, HOST) }))!.id;
+  const [project] = await db
+    .insert(projects)
+    .values({
+      key: `BGS${n}`,
+      name: `budget spec ${n}`,
+      jiraJql: `project = BGS${n}`,
+      maxBudgetUsd: options.maxBudgetUsd === undefined ? null : options.maxBudgetUsd,
+    })
+    .returning({ id: projects.id });
+  const [repo] = await db
+    .insert(repositories)
+    .values({
+      projectId: project!.id,
+      name: `spec-repo-${n}`,
+      gitUrl: `git@example.com:spec-repo-${n}.git`,
+      defaultBranch: "main",
+      defaultRuntime: "claude",
+      defaultModel: "claude-opus-test",
+      maxConcurrentWorktrees: 4,
+      setupCommand: "npm ci",
+    })
+    .returning({ id: repositories.id });
+  const [task] = await db
+    .insert(tasks)
+    .values({
+      projectId: project!.id,
+      repositoryId: repo!.id,
+      jiraKey: `BGS-${n}`,
+      jiraSummary: `Receipt language ${n}`,
+      jiraPriority: 1,
+      jiraCreatedAt: NOW,
+      jiraSyncedAt: NOW,
+      state: "SPEC_IN_PROGRESS",
+    })
+    .returning({ id: tasks.id });
+  const [spec] = await db
+    .insert(executions)
+    .values({
+      taskId: task!.id,
+      role: "spec",
+      attempt: 1,
+      state: "ASSIGNED",
+      runtime: "claude",
+      model: "default",
+      workerId,
+      host: HOST,
+    })
+    .returning({ id: executions.id });
+  return { workerId, taskId: task!.id, executionId: spec!.id };
 }
 
 const execution = async (id: string) =>
@@ -324,6 +434,35 @@ describe("StartRequest/ResumeRequest maxBudgetUsd (§7, C55, AC1)", () => {
 
     expect(h.adapter.resumes[0]!.maxBudgetUsd).toBeUndefined();
   });
+
+  it("carries the project's max_budget_usd on a spec session's start request", async () => {
+    const s = await seedSpecAssigned({ maxBudgetUsd: "4.250000" });
+    const h = makeRunner({ workerId: s.workerId, runtime: "claude" });
+    h.adapter.script = async function* () {
+      yield { type: "session", sessionId: "sess-spec-budget" };
+      yield { type: "turn_done", finalText: "here is a draft" };
+    };
+
+    await h.runner.startSpec({ executionId: s.executionId, taskId: s.taskId });
+
+    expect(h.adapter.starts[0]!.maxBudgetUsd).toBe(4.25);
+  });
+
+  it("carries the project's max_budget_usd on an infrastructure retry's resume request", async () => {
+    const s = await seedRetryPair({ maxBudgetUsd: "2.750000" });
+    const h = makeRunner({ workerId: s.workerId, runtime: "claude" });
+    h.adapter.script = async function* () {
+      yield { type: "turn_done", finalText: "continuing after the crash" };
+    };
+
+    await h.runner.start(
+      { executionId: s.executionId, taskId: s.taskId },
+      { retry: { previousExecutionId: s.previousExecutionId } },
+    );
+
+    expect(h.adapter.resumes[0]!.maxBudgetUsd).toBe(2.75);
+    expect(h.adapter.resumes[0]!.sessionId).toBe("sess-retry-prev");
+  });
 });
 
 describe("adapter error budget classification (§9.5, AC2)", () => {
@@ -426,6 +565,32 @@ describe("Codex usage pricing (§9.7, AC3)", () => {
 
     const usage = await usageRowsFor(s.executionId);
     expect(Number(usage[0]!.costUsd)).toBe(0.42);
+  });
+
+  it("a later Claude usage event for the same model with no costUsd stores 0, never priced or warned", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = await seedClaimed({ runtime: "claude" });
+    const h = makeRunner({ workerId: s.workerId, runtime: "claude" });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-claude-two-usage" };
+      // The Claude adapter reports costUsd on a model's first usage event
+      // in a turn only; a later one for the same model carries none. That
+      // is not an unpriced usage row (§9.7 pricing only applies to
+      // runtimes with no budget enforcement of their own, i.e. Codex): it
+      // must be stored as 0, not run through the pricing table.
+      yield { type: "usage", model: "claude-opus-test", input: 100, cached: 0, output: 50, costUsd: 0.42 };
+      yield { type: "usage", model: "claude-opus-test", input: 20, cached: 0, output: 10 };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "done" };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    const usage = await usageRowsFor(s.executionId);
+    expect(usage.map((u) => Number(u.costUsd))).toEqual([0.42, 0]);
+    const row = await execution(s.executionId);
+    expect(Number(row.costUsd)).toBe(0.42);
+    expect(warn).not.toHaveBeenCalled();
   });
 });
 

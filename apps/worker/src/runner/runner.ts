@@ -942,17 +942,20 @@ export function createRunner(deps: RunnerDeps): Runner {
   }
 
   /**
-   * `usage` event: prices a usage event that carries no `costUsd` of its
-   * own (Codex, §9.7) against the loaded pricing table, then one
-   * `execution_usage` row, totals, `usage.recorded`. An unpriced model
-   * stores `cost_usd = NULL` and adds nothing to the totals. Claude usage
-   * already carries `costUsd` and is stored as-is, unpriced.
+   * `usage` event. Only runtimes with no budget enforcement of their own
+   * (`RUNTIMES_WITHOUT_BUDGET_ENFORCEMENT`, currently just Codex, §9.7) are
+   * priced against the loaded pricing table: those adapters never report a
+   * `costUsd`, so an absent one always means "price it". Every other
+   * runtime (Claude) stores `event.costUsd` as reported, defaulting to `0`
+   * — an absent `costUsd` there is a later per-model usage row the adapter
+   * has nothing new to add for, not an unpriced one, and must not be run
+   * through the pricing table or warn as an unknown model. An unpriced
+   * Codex model stores `cost_usd = NULL` and adds nothing to the totals.
    *
-   * §9.7 item 4: once a priced event lands, a runtime with no budget
-   * enforcement of its own (`RUNTIMES_WITHOUT_BUDGET_ENFORCEMENT`) is
-   * checked against the project's `max_budget_usd`; crossing it aborts the
-   * session the same way the quiet timer and a cancel do. Claude relies on
-   * the adapter's own enforcement (the `error` path in `afterTurn`) and is
+   * §9.7 item 4: once a priced event lands, the same runtimes are checked
+   * against the project's `max_budget_usd`; crossing it aborts the session
+   * the same way the quiet timer and a cancel do. Claude relies on the
+   * adapter's own enforcement (the `error` path in `afterTurn`) and is
    * never aborted here.
    */
   async function recordUsage(
@@ -961,16 +964,23 @@ export function createRunner(deps: RunnerDeps): Runner {
     kind: "main" | "resume",
     event: Extract<AgentEvent, { type: "usage" }>,
   ): Promise<void> {
-    const priced =
-      event.costUsd !== undefined
-        ? event.costUsd
-        : priceUsage(pricing, {
-            model: event.model,
-            input: event.input,
-            cached: event.cached,
-            output: event.output,
-          });
-    const costUsd = priced === null ? null : String(priced);
+    const runtimeIsPriced = RUNTIMES_WITHOUT_BUDGET_ENFORCEMENT.has(
+      ctx.execution.runtime,
+    );
+    const priced = runtimeIsPriced
+      ? (event.costUsd ??
+        priceUsage(pricing, {
+          model: event.model,
+          input: event.input,
+          cached: event.cached,
+          output: event.output,
+        }))
+      : null;
+    const costUsd = runtimeIsPriced
+      ? priced === null
+        ? null
+        : String(priced)
+      : String(event.costUsd ?? 0);
     await db.transaction(async (tx) => {
       await lockTaskForTool(tx, ctx.task.id, "key share");
       const usage = await insertExecutionUsage(tx, {
