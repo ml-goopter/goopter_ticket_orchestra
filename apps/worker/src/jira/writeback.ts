@@ -5,6 +5,7 @@ import {
   type Db,
   type JiraWritebackEventRow,
 } from "@orchestra/db";
+import { z } from "zod";
 import type { WorkerConfig } from "../config.js";
 import type { Logger } from "../logger.js";
 import { JiraApiError, createJiraClient, type JiraClient } from "./client.js";
@@ -25,6 +26,40 @@ import { JiraApiError, createJiraClient, type JiraClient } from "./client.js";
 export const DEFAULT_JIRA_WRITEBACK_INTERVAL_MS = 15_000;
 export const DEFAULT_JIRA_WRITEBACK_JITTER_RATIO = 0.1;
 export const JIRA_WRITEBACK_BATCH_LIMIT = 200;
+
+/**
+ * Consecutive failures allowed for one event before it is skipped rather
+ * than retried forever (coordinator decision C14, F1 part 2). A success or
+ * a skip clears the count.
+ */
+export const MAX_EVENT_ATTEMPTS = 5;
+
+/**
+ * Minimal per-type payload shape the write-back loop needs before it makes
+ * any db or Jira call (C14, F1 part 1). Unknown extra fields are ignored;
+ * only the fields `buildWritebackComment` reads are required.
+ */
+const SPEC_APPROVED_PAYLOAD_SCHEMA = z.object({
+  revision_id: z.string().uuid(),
+  version: z.number().int(),
+});
+const PULL_REQUEST_CREATED_PAYLOAD_SCHEMA = z.object({
+  url: z.string(),
+});
+const TASK_STATE_CHANGED_PAYLOAD_SCHEMA = z.object({
+  to: z.string(),
+});
+
+function payloadSchemaFor(type: JiraWritebackEventRow["type"]) {
+  switch (type) {
+    case "spec.approved":
+      return SPEC_APPROVED_PAYLOAD_SCHEMA;
+    case "pull_request.created":
+      return PULL_REQUEST_CREATED_PAYLOAD_SCHEMA;
+    case "task.state_changed":
+      return TASK_STATE_CHANGED_PAYLOAD_SCHEMA;
+  }
+}
 
 /** One `[orchestra:<kind>:<task id>]` marker per kind, per task, for the life of the task (C12). */
 export type WritebackKind =
@@ -98,11 +133,18 @@ async function buildWritebackComment(
 }
 
 /**
- * Handles one event: builds its comment, dedupes against the ticket's
- * existing comments by marker, then posts. Returns `true` when the event is
- * done — posted, already posted, or intentionally skipped (nothing to say,
- * or the ticket is gone) — and `false` when the Jira call failed and the
- * event must be retried on the next run (design.md §11.1 C11).
+ * Outcome of handling one event: `"done"` when the event needs no further
+ * attention — posted, already posted, intentionally skipped (nothing to
+ * say, the ticket is gone, or the payload failed validation) — and
+ * `"retry"` when a transient failure (db error, Jira 5xx or network) means
+ * the event must be retried, bounded by `MAX_EVENT_ATTEMPTS` (design.md
+ * §11.1 C11, C14).
+ */
+type WritebackEventOutcome = "done" | "retry";
+
+/**
+ * Handles one event: validates its payload, builds its comment, dedupes
+ * against the ticket's existing comments by marker, then posts.
  */
 async function handleWritebackEvent(
   db: Db,
@@ -110,7 +152,22 @@ async function handleWritebackEvent(
   config: WorkerConfig,
   logger: Logger,
   event: JiraWritebackEventRow,
-): Promise<boolean> {
+): Promise<WritebackEventOutcome> {
+  const schema = payloadSchemaFor(event.type);
+  const parsed = schema.safeParse(event.payload ?? {});
+  if (!parsed.success) {
+    logger.warn(
+      {
+        eventId: String(event.id),
+        jiraKey: event.jiraKey,
+        type: event.type,
+        issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
+      },
+      "jira writeback: event payload failed validation; event skipped",
+    );
+    return "done";
+  }
+
   let comment: WritebackComment | null;
   try {
     comment = await buildWritebackComment(db, event, config);
@@ -123,22 +180,25 @@ async function handleWritebackEvent(
       },
       "jira writeback: building the comment failed; retrying next run",
     );
-    return false;
+    return "retry";
   }
-  if (!comment) return true;
+  if (!comment) return "done";
 
   const marker = writebackMarker(comment.kind, event.taskId);
 
   let ticket;
   try {
     ticket = await client.getIssue(event.jiraKey);
+    if (ticket.comments.some((c) => c.body.includes(marker))) {
+      return "done";
+    }
   } catch (err) {
     if (err instanceof JiraApiError && err.status === 404) {
       logger.warn(
         { eventId: String(event.id), jiraKey: event.jiraKey, kind: comment.kind },
         "jira writeback: ticket not found; event skipped",
       );
-      return true;
+      return "done";
     }
     logger.error(
       {
@@ -149,11 +209,7 @@ async function handleWritebackEvent(
       },
       "jira writeback: fetching ticket comments failed; retrying next run",
     );
-    return false;
-  }
-
-  if (ticket.comments.some((c) => c.body.includes(marker))) {
-    return true;
+    return "retry";
   }
 
   try {
@@ -164,7 +220,7 @@ async function handleWritebackEvent(
         { eventId: String(event.id), jiraKey: event.jiraKey, kind: comment.kind },
         "jira writeback: ticket not found on comment post; event skipped",
       );
-      return true;
+      return "done";
     }
     logger.error(
       {
@@ -175,10 +231,10 @@ async function handleWritebackEvent(
       },
       "jira writeback: posting comment failed; retrying next run",
     );
-    return false;
+    return "retry";
   }
 
-  return true;
+  return "done";
 }
 
 export interface RunJiraWritebackOptions {
@@ -188,20 +244,28 @@ export interface RunJiraWritebackOptions {
   logger: Logger;
   /** Exclusive lower bound: `execution_events.id` already handled. */
   cursor: bigint;
+  /**
+   * Consecutive-failure counts, keyed by `String(event.id)`. Carried across
+   * runs by the caller's loop state (`startJiraWriteback`); a fresh `Map`
+   * when omitted, mutated in place (C14, F1 part 2).
+   */
+  attempts?: Map<string, number>;
 }
 
 /**
  * Runs one pass: loads events after `cursor`, handles each in order, and
- * returns the cursor to use for the next pass. Stops at the first event
- * whose Jira call fails, so the cursor never advances past an event that
- * was not handled (design.md §11.1 C11) — later events in this same batch
- * are simply retried, in order, on the next pass.
+ * returns the cursor to use for the next pass. A malformed payload is
+ * skipped immediately (the cursor advances). A transient failure retries
+ * the same event on later passes, up to `MAX_EVENT_ATTEMPTS` consecutive
+ * failures, after which it is skipped too so later events are never
+ * stalled forever by one poison event (design.md §11.1 C11, C14).
  */
 export async function runJiraWriteback(
   options: RunJiraWritebackOptions,
 ): Promise<{ cursor: bigint }> {
   const { db, client, config, logger } = options;
   let cursor = options.cursor;
+  const attempts = options.attempts ?? new Map<string, number>();
 
   let events: JiraWritebackEventRow[];
   try {
@@ -215,8 +279,25 @@ export async function runJiraWriteback(
   }
 
   for (const event of events) {
-    const handled = await handleWritebackEvent(db, client, config, logger, event);
-    if (!handled) break;
+    const key = String(event.id);
+    const outcome = await handleWritebackEvent(db, client, config, logger, event);
+
+    if (outcome === "retry") {
+      const failureCount = (attempts.get(key) ?? 0) + 1;
+      if (failureCount < MAX_EVENT_ATTEMPTS) {
+        attempts.set(key, failureCount);
+        break;
+      }
+      logger.error(
+        { eventId: key, jiraKey: event.jiraKey, attempts: failureCount },
+        "jira writeback: event exceeded max attempts; event skipped",
+      );
+      attempts.delete(key);
+      cursor = event.id;
+      continue;
+    }
+
+    attempts.delete(key);
     cursor = event.id;
   }
 
@@ -274,6 +355,8 @@ export function startJiraWriteback(
   // Undefined until the first run initializes it to the current max id
   // (C11): no historical replay on a fresh worker.
   let cursor: bigint | undefined;
+  // Consecutive-failure counts per event id, carried across runs (C14).
+  const attempts = new Map<string, number>();
 
   function scheduleNext(): void {
     if (stopped) return;
@@ -296,7 +379,7 @@ export function startJiraWriteback(
         }
       }
 
-      const result = await runJiraWriteback({ db, client, config, logger, cursor });
+      const result = await runJiraWriteback({ db, client, config, logger, cursor, attempts });
       cursor = result.cursor;
     })();
 

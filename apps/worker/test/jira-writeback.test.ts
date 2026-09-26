@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { WorkerConfig } from "../src/config.js";
 import type { JiraClient } from "../src/jira/client.js";
 import { JiraApiError } from "../src/jira/client.js";
-import { runJiraWriteback } from "../src/jira/writeback.js";
+import { MAX_EVENT_ATTEMPTS, runJiraWriteback } from "../src/jira/writeback.js";
 import type { Logger } from "../src/logger.js";
 import { startTestDb, type TestDb } from "./harness.js";
 
@@ -494,8 +494,8 @@ describe("runJiraWriteback: failures (design.md §11.1, C11)", () => {
   });
 });
 
-describe("runJiraWriteback: malformed payload does not crash the loop (regression, F1)", () => {
-  it("a non-uuid revision_id makes the approver lookup throw; the run does not reject, the cursor stays before the bad event, and a later valid event still posts once the bad one is skipped", async () => {
+describe("runJiraWriteback: malformed payload does not stall the loop (regression, F1 part 1, C14)", () => {
+  it("a non-uuid revision_id fails validation and is skipped on the first pass; a later valid event in the same batch still posts in the same run", async () => {
     const project = await insertProject();
     const approver = await insertUser("Dave");
 
@@ -518,7 +518,7 @@ describe("runJiraWriteback: malformed payload does not crash the loop (regressio
 
     const client = fakeClient();
 
-    const first = await runJiraWriteback({
+    const { cursor } = await runJiraWriteback({
       db,
       client,
       config: configWith(),
@@ -526,26 +526,158 @@ describe("runJiraWriteback: malformed payload does not crash the loop (regressio
       cursor: eventA.id - 1n,
     });
 
-    // The db throws building the comment (invalid uuid syntax); the cursor
-    // must stay before A rather than the promise rejecting.
-    expect(first.cursor).toBe(eventA.id - 1n);
-    expect(client.addComment).not.toHaveBeenCalled();
-
-    // Once the bad event is skipped (cursor advanced past it, as an operator
-    // would after fixing or discarding it), the next run still reaches B.
-    const second = await runJiraWriteback({
-      db,
-      client,
-      config: configWith(),
-      logger,
-      cursor: eventA.id,
-    });
-
-    expect(second.cursor).toBe(eventB.id);
+    // Validation catches the bad payload before any db or Jira call: the
+    // event is skipped immediately, and B, later in the same batch, still
+    // posts in this same run — no restart or second pass needed.
+    expect(cursor).toBe(eventB.id);
     expect(client.addComment).toHaveBeenCalledTimes(1);
     expect(client.addComment).toHaveBeenCalledWith(
       taskB.jiraKey,
       `Specification v 2 approved by Dave. https://app.example/tasks/${taskB.id}\n[orchestra:spec_approved:${taskB.id}]`,
+    );
+  });
+});
+
+describe("runJiraWriteback: bounded retries for transient failures (regression, F1 part 2, C14)", () => {
+  it("skips an event after MAX_EVENT_ATTEMPTS consecutive failures and still posts the following event, clearing the attempts entry", async () => {
+    const project = await insertProject();
+
+    const taskA = await insertTask(project.id, { state: "READY_FOR_MERGE" });
+    const execA = await insertExecution(taskA.id);
+    await insertPullRequest(taskA.id, execA.id, "https://github.com/org/repo/pull/30");
+    const eventA = await insertEvent(taskA.id, "task.state_changed", {
+      from: "CI_RUNNING",
+      to: "READY_FOR_MERGE",
+      trigger: "ci.passed",
+      actor: { kind: "worker", id: null },
+    });
+
+    const taskB = await insertTask(project.id, { state: "READY_FOR_MERGE" });
+    const execB = await insertExecution(taskB.id);
+    await insertPullRequest(taskB.id, execB.id, "https://github.com/org/repo/pull/31");
+    const eventB = await insertEvent(taskB.id, "task.state_changed", {
+      from: "CI_RUNNING",
+      to: "READY_FOR_MERGE",
+      trigger: "ci.passed",
+      actor: { kind: "worker", id: null },
+    });
+
+    // Always fails posting to A's ticket; B posts normally.
+    const addComment = vi.fn(async (key: string) => {
+      if (key === taskA.jiraKey) throw new Error("ECONNRESET");
+    });
+    const client = fakeClient({ addComment });
+
+    const attempts = new Map<string, number>();
+    let cursor = eventA.id - 1n;
+
+    for (let i = 0; i < MAX_EVENT_ATTEMPTS - 1; i += 1) {
+      const result = await runJiraWriteback({ db, client, config: configWith(), logger, cursor, attempts });
+      cursor = result.cursor;
+    }
+
+    // A has not been skipped yet: the cursor is still stuck before it, and
+    // it has failed MAX_EVENT_ATTEMPTS - 1 times so far.
+    expect(cursor).toBe(eventA.id - 1n);
+    expect(attempts.get(String(eventA.id))).toBe(MAX_EVENT_ATTEMPTS - 1);
+    expect(addComment).toHaveBeenCalledTimes(MAX_EVENT_ATTEMPTS - 1);
+
+    // The MAX_EVENT_ATTEMPTS-th consecutive failure skips A in the same run
+    // that it happens, and B — later in the batch — still posts.
+    const last = await runJiraWriteback({ db, client, config: configWith(), logger, cursor, attempts });
+
+    expect(last.cursor).toBe(eventB.id);
+    expect(addComment).toHaveBeenCalledTimes(MAX_EVENT_ATTEMPTS + 1);
+    expect(addComment).toHaveBeenLastCalledWith(taskB.jiraKey, expect.stringContaining(taskB.id));
+    expect(attempts.has(String(eventA.id))).toBe(false);
+  });
+
+  it("a Jira call that fails twice then succeeds posts once and clears the attempts entry", async () => {
+    const project = await insertProject();
+    const task = await insertTask(project.id, { state: "READY_FOR_MERGE" });
+    const execution = await insertExecution(task.id);
+    await insertPullRequest(task.id, execution.id, "https://github.com/org/repo/pull/40");
+    const event = await insertEvent(task.id, "task.state_changed", {
+      from: "CI_RUNNING",
+      to: "READY_FOR_MERGE",
+      trigger: "ci.passed",
+      actor: { kind: "worker", id: null },
+    });
+
+    let calls = 0;
+    const addComment = vi.fn(async () => {
+      calls += 1;
+      if (calls <= 2) throw new Error("ECONNRESET");
+    });
+    const client = fakeClient({ addComment });
+
+    const attempts = new Map<string, number>();
+    let cursor = event.id - 1n;
+
+    for (let i = 0; i < 2; i += 1) {
+      const result = await runJiraWriteback({ db, client, config: configWith(), logger, cursor, attempts });
+      cursor = result.cursor;
+    }
+
+    expect(cursor).toBe(event.id - 1n);
+    expect(attempts.get(String(event.id))).toBe(2);
+
+    const result = await runJiraWriteback({ db, client, config: configWith(), logger, cursor, attempts });
+
+    expect(result.cursor).toBe(event.id);
+    expect(addComment).toHaveBeenCalledTimes(3);
+    expect(attempts.has(String(event.id))).toBe(false);
+  });
+});
+
+describe("runJiraWriteback: a bad ticket shape only retries its own event (regression, F2)", () => {
+  it("keeps an earlier event's cursor progress when a later event's marker check throws", async () => {
+    const project = await insertProject();
+
+    const taskA = await insertTask(project.id, { state: "READY_FOR_MERGE" });
+    const execA = await insertExecution(taskA.id);
+    await insertPullRequest(taskA.id, execA.id, "https://github.com/org/repo/pull/50");
+    const eventA = await insertEvent(taskA.id, "task.state_changed", {
+      from: "CI_RUNNING",
+      to: "READY_FOR_MERGE",
+      trigger: "ci.passed",
+      actor: { kind: "worker", id: null },
+    });
+
+    const taskB = await insertTask(project.id, { state: "READY_FOR_MERGE" });
+    const execB = await insertExecution(taskB.id);
+    await insertPullRequest(taskB.id, execB.id, "https://github.com/org/repo/pull/51");
+    const eventB = await insertEvent(taskB.id, "task.state_changed", {
+      from: "CI_RUNNING",
+      to: "READY_FOR_MERGE",
+      trigger: "ci.passed",
+      actor: { kind: "worker", id: null },
+    });
+
+    const client = fakeClient({
+      getIssue: vi.fn(async (key: string) => {
+        if (key === taskB.jiraKey) {
+          return { key, summary: "s", description: "", comments: undefined as unknown as never };
+        }
+        return { key, summary: "s", description: "", comments: [] };
+      }),
+    });
+
+    const { cursor } = await runJiraWriteback({
+      db,
+      client,
+      config: configWith(),
+      logger,
+      cursor: eventA.id - 1n,
+    });
+
+    // B's marker check throws (comments is undefined); the run must not
+    // reject, and A's cursor progress from earlier in the batch is kept.
+    expect(cursor).toBe(eventA.id);
+    expect(client.addComment).toHaveBeenCalledTimes(1);
+    expect(client.addComment).toHaveBeenCalledWith(
+      taskA.jiraKey,
+      expect.stringContaining(`[orchestra:ready_for_merge:${taskA.id}]`),
     );
   });
 });
