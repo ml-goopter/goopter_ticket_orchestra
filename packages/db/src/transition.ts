@@ -63,6 +63,16 @@ export interface TaskTransitionInput {
   trigger: Trigger;
   actor: Actor;
   set?: TaskSetColumns;
+  /**
+   * Extra fields merged into the auto-appended `task.state_changed` event's
+   * payload, alongside `from`/`to`/`trigger`/`actor` (F4, C51). Optional and
+   * additive: a caller that omits it gets the payload shape unchanged. Used
+   * to mark a transition with metadata the fixed `from`/`to`/`trigger` shape
+   * cannot express, e.g. `{ via: "merged_externally" }` for a PR merged
+   * before CI finished, so downstream consumers (the Jira write-back
+   * selector) can tell it apart from a normal CI pass.
+   */
+  eventPayload?: Record<string, unknown>;
 }
 
 export interface ExecutionTransitionInput {
@@ -204,6 +214,7 @@ async function transitionTask(
       to,
       trigger: input.trigger,
       actor: { kind: input.actor.kind, id: input.actor.id ?? null },
+      ...(input.eventPayload ?? {}),
     },
   });
 

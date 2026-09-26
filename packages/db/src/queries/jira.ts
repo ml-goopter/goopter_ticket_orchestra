@@ -214,6 +214,12 @@ const WRITEBACK_SIMPLE_TYPES = ["spec.approved", "pull_request.created"] as cons
  * and the task's `pull_requests.url` (at most one row per task), so the
  * worker never needs a second round trip, or `drizzle-orm`, to build a
  * comment.
+ *
+ * Excludes a READY_FOR_MERGE `task.state_changed` event whose payload has
+ * `via: "merged_externally"` (F4, C51): `markPullRequestMerged` stamps that
+ * marker on the `ci.passed` transition it runs when a human merged the PR
+ * before CI finished, so this event never actually observed CI passing —
+ * Jira must not be told "CI passed" for it.
  */
 export async function listJiraWritebackEvents(
   db: DbOrTx,
@@ -242,6 +248,7 @@ export async function listJiraWritebackEvents(
           and(
             eq(executionEvents.type, "task.state_changed"),
             sql`(${executionEvents.payload} ->> 'to') in ('READY_FOR_MERGE', 'NEEDS_HUMAN')`,
+            sql`(${executionEvents.payload} ->> 'via') is distinct from 'merged_externally'`,
           ),
         ),
       ),

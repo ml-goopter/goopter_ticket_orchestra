@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `9aae37d` plus this change.
+Status as of 2026-09-25, main at `87fdde9` plus this change.
 
 ## Completed
 
@@ -43,6 +43,7 @@ Status as of 2026-09-25, main at `9aae37d` plus this change.
 | fill-in | GOT.29 | web: admin views for projects, repositories, users, workers | #41 |
 | W7 | GOT.38 | web: spec builder split pane | #42 |
 | W9 | GOT.45 | adapters: Codex implementation | #43 |
+| W8 | GOT.46 | worker: GitHub poller | #44 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -53,7 +54,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
 | W7 | GOT.37 | worker: spec role execution | GOT.31 | M5 |
-| W8 | GOT.46 | worker: GitHub poller | GOT.39 | M6 |
 | W8 | GOT.47 | worker: issue conversation and resume commands | GOT.33, 39 | M7 |
 | W9 | GOT.48 | E2E: sandbox ticket to merged PR through Claude | GOT.38 to 42, 46, 47 | M6 |
 | W9 | GOT.49 | E2E: same ticket through Codex | GOT.45, 48 | M9 |
@@ -70,8 +70,8 @@ GOT.45 was built early against synthesized `codex exec --json` fixtures because 
 
 - All worker tasks: lease renewal must go through the state-gated db helper; a bypass can renew a cancelled execution. Every transaction that locks both rows takes the task row before the execution row (PR #17, #31).
 - GOT.48: the worktree manager's setup command inherits the full worker environment (database URL, tokens, API keys) and has no timeout. Deferred past GOT.31 and GOT.39 without a user decision to change it; the end-to-end run should decide whether to scrub the environment and bound the command (PR #22, #31, #37).
-- GOT.46: call `applyCiFailure` from `packages/db/src/queries/ci.ts` inside a transaction that locks task then execution; it returns `{ applied: false, reason }` for a stale pull request id or head sha and the poller must treat that as "already superseded", not an error. `resume_with_ci_failure` carries `{ pull_request_id, head_sha, round, checks: [{ name, url, log_excerpt }] }` (PR #37).
-- GOT.46: `report_pr_created` now updates the task's single `pull_requests` row and resets it to open; the poller should key its state on `head_sha`, not on row identity (C17, C22, PR #37).
+- Later: call `applyCiFailure` from `packages/db/src/queries/ci.ts` inside a transaction that locks task then execution; it returns `{ applied: false, reason }` for a stale pull request id or head sha and the poller must treat that as "already superseded", not an error. `resume_with_ci_failure` carries `{ pull_request_id, head_sha, round, checks: [{ name, url, log_excerpt }] }` (PR #37).
+- Later: `report_pr_created` now updates the task's single `pull_requests` row and resets it to open; the poller should key its state on `head_sha`, not on row identity (C17, C22, PR #37).
 - GOT.47: command handlers return `handled`, `unclaimed` or `skipped` (C20). Only an execution pinned to another host unclaims. A CI resume for an unpinned execution (host null after a dead-host release) is skipped and completed, leaving the task IMPLEMENTING with a COMPLETED execution. The retry starter (GOT.43) handles only QUEUED retry rows, so the fresh-session fallback for released WAITING_FOR_USER and COMPLETED executions (D5, §6.1) is GOT.47's: on OTHER_HOST with `host` null, pin the execution to this host and start a fresh session seeded with the spec, decisions and the pending prompt (C21, PR #37, #40).
 - GOT.37/47: the retry policy (PR #40) runs inside the FAILED transaction in the runner and the lease sweeper; a spec-role infrastructure failure only notifies (no task edge from SPEC_IN_PROGRESS) and the starter runs implementation rows only, so a failed spec session needs the user to start a new one. Retry rows copy `session_id`; the starter reuses a local worktree (resume when `canResume`, else a fresh session there, C31, C32) and every worktree operation after creation is keyed on the row's recorded `worktree_path` (C33). The failed row keeps `branch` and loses `worktree_path` after a takeover (C38).
 - GOT.47: `projects.max_budget_usd` exists (migration 0004, C29) but nothing reads it: the runner does not pass `maxBudgetUsd` to the adapter and no path produces `budget_exceeded`; `codex exec` has no budget flag, so the check belongs in the runner (PR #38, #43, C30).
@@ -96,7 +96,7 @@ GOT.45 was built early against synthesized `codex exec --json` fixtures because 
 - Later: web api client methods are layered as `ApiClient` -> `BoardApiClient` -> `IssueApiClient` in `apps/web/src/api/client.ts`; add a further layer rather than widening an existing interface, and extend `makeFakeClient` in `apps/web/src/task/fixtures.ts`. Action handlers may set state without the fetch guard, matching `TaskDetailView` (PR #33, #36, accepted minor).
 - GOT.47: the issue view posts messages only while the issue is OPEN and shows the api's EXECUTION_NOT_WAITING as "the agent is busy"; the worker must return the execution to WAITING_FOR_USER after each reply (§9.3) or the composer stays disabled (PR #36).
 - Later: the Jira write-back cursor lives in memory and starts at the current max event id on worker start, and a transient failure is retried five times per event (C14). A restart or a Jira outage longer than about five runs drops that window's comments with no backfill; a persisted cursor or a reconciliation sweep would close it (PR #35, accepted minor).
-- GOT.46: the write-back posts "Pull request opened" on `pull_request.created` and "CI passed. Ready for merge" on `task.state_changed` to READY_FOR_MERGE; the poller needs no Jira code of its own (PR #35).
+- Later: the write-back posts "Pull request opened" on `pull_request.created` and "CI passed. Ready for merge" on `task.state_changed` to READY_FOR_MERGE; the poller needs no Jira code of its own (PR #35).
 - User decision needed: the GOT.29 tracker item asks for a user disable control, but commit 0167d86 deliberately removed `disabled` from `PATCH /users/:id` because design §13 names no route for it. GOT.29 ships without the control (C40) and shows `disabled_at` read-only. Restoring it is a small api change plus a toggle.
 - GOT.34/35: `BLOCKED → READY` (`dependency.resolved`) is not implemented; the user left it out of GOT.26 because §6.2 does not specify it.
 - GOT.37: request-review marks the spec execution COMPLETED in the database only; the worker must end the live spec session when it sees that. Send-back does not resume the session; the worker must (PR #27).
@@ -118,4 +118,5 @@ GOT.45 was built early against synthesized `codex exec --json` fixtures because 
 - GOT.31: `.orchestra/context.json` now requires `runtime`; the worktree manager writes it from its input (PR #29).
 - GOT.44: `report_usage` records one `execution_usage` row per review round with `kind = review`; a multi-model session reports its models comma-joined in `model` (PR #29).
 - GOT.48: the wrapper has not been run against real Claude. Tests use a fake adapter and an in-process MCP server. The first live run needs a running worker, an execution token and Claude credentials on the host (PR #29).
+- GOT.48: the GitHub poller (PR #44) anchors the no-checks grace on a `pending_since` it writes into `ci_detail` on the first poll with zero check runs, never on `created_at` (C50). A task merged on GitHub while CI_RUNNING passes through READY_FOR_MERGE with `via: "merged_externally"` in the event payload and the Jira write-back skips that event (C51); `transition()` takes an optional `eventPayload` merged into the state_changed payload. Log excerpts use the check run `id` as the Actions job id. The first live run should confirm the excerpt fetch and the C50 timing against a real repository.
 - GOT.48 and GOT.49: need a sandbox GitHub repository, a Jira project, and credentials from the user.

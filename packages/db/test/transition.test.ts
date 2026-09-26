@@ -170,6 +170,33 @@ describe("transition() on a task writes state, audit and event (AC2)", () => {
     expect(row!.needsHumanReason).toBe("review rounds exhausted");
   });
 
+  it("F4 regression: merges `eventPayload` into the state_changed event, alongside from/to/trigger/actor", async () => {
+    const taskId = await seedTask(h.db, fx, {
+      jiraKey: "TRN-4B",
+      state: "CI_RUNNING",
+    });
+
+    await h.db.transaction(async (tx) =>
+      transition(tx, {
+        entity: "task",
+        id: taskId,
+        trigger: "ci.passed",
+        actor: { kind: "worker", id: "worker-1" },
+        eventPayload: { via: "merged_externally" },
+      }),
+    );
+
+    const events = await eventRows(taskId);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.payload).toMatchObject({
+      from: "CI_RUNNING",
+      to: "READY_FOR_MERGE",
+      trigger: "ci.passed",
+      actor: { kind: "worker", id: "worker-1" },
+      via: "merged_externally",
+    });
+  });
+
   it("records a null actor id when the actor has none", async () => {
     const taskId = await seedTask(h.db, fx, {
       jiraKey: "TRN-5",

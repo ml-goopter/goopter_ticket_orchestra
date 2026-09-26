@@ -11,6 +11,7 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   startHeartbeat,
 } from "./heartbeat.js";
+import { startGitHubPoller } from "./github/index.js";
 import { createJiraClient, startJiraPoller, startJiraWriteback } from "./jira/index.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PHASE_ORDER, createDefaultPhases } from "./phases/index.js";
@@ -117,6 +118,15 @@ async function main(): Promise<void> {
     config,
     logger: log.child({ component: "jira-writeback" }),
   });
+  // design.md §11.2: independent 60s-interval poller for CI status, merge
+  // and close on every open pull request. No-ops with one warning when
+  // GITHUB_TOKEN is absent; never blocks startup.
+  const stopGitHubPoller = startGitHubPoller({
+    db,
+    config,
+    workerId,
+    logger: log.child({ component: "github-poller" }),
+  });
   // design.md §7.3: claim only tasks whose runtime binary is on PATH.
   const runtimes = detectRuntimes();
   log.info({ runtimes }, "detected agent runtimes");
@@ -208,6 +218,7 @@ async function main(): Promise<void> {
       await toolsServer.stop();
       await stopJiraPoller();
       await stopJiraWriteback();
+      await stopGitHubPoller();
       await stopHeartbeat();
       await closeDb(db);
     },
