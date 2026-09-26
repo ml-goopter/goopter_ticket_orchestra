@@ -2,6 +2,7 @@ import type { ExecutionState } from "@orchestra/core";
 import { loadRunnerContext, unclaimCommand } from "@orchestra/db";
 import { buildResumePrompt } from "@orchestra/prompts";
 import { z } from "zod";
+import type { Logger } from "../logger.js";
 import type { CommandHandlers, CommandOutcome } from "./commands.js";
 import { ResumeError, type Runner } from "./runner.js";
 
@@ -16,8 +17,9 @@ import { ResumeError, type Runner } from "./runner.js";
  * Outcomes (C20): `handled` once the execution is RUNNING; `unclaimed` when
  * the execution is pinned to another host (OTHER_HOST), so the right host
  * takes it (GOT.47 carry-forward); `skipped` when there is nothing to
- * resume: no execution, not an implementation, not COMPLETED, or an invalid
- * payload. Any other refusal throws and leaves the command claimed.
+ * resume: no execution, not an implementation, not COMPLETED, an invalid
+ * payload, or an unpinned execution (host null, C21). Any other refusal
+ * throws and leaves the command claimed.
  */
 
 const ResumeWithCiFailurePayloadSchema = z.object({
@@ -34,6 +36,21 @@ const notCompleted = (state: ExecutionState | undefined): CommandOutcome => ({
   reason:
     state === undefined ? "execution not found" : `execution is ${state}, not COMPLETED`,
 });
+
+/**
+ * C21: an execution whose host is null was released from a dead host (§6.1),
+ * so no worker holds its session and every worker may claim the command.
+ * Unclaiming it would have each worker reclaim it every tick, so it is
+ * skipped and logged at error until the fresh-session fallback (GOT.43)
+ * exists.
+ */
+function unpinned(log: Logger): CommandOutcome {
+  log.error({}, "resume_with_ci_failure: execution is unpinned");
+  return {
+    outcome: "skipped",
+    reason: "execution unpinned; fresh-session fallback (GOT.43) required",
+  };
+}
 
 export function registerCiFailureHandler(
   handlers: CommandHandlers,
@@ -63,6 +80,8 @@ export function registerCiFailureHandler(
       };
     }
 
+    if (loaded.execution.host === null) return unpinned(log);
+
     const prompt = buildResumePrompt("ci_failure", {
       sha: payload.head_sha,
       checks: payload.checks.map((c) => ({ name: c.name, log: c.log_excerpt })),
@@ -76,6 +95,9 @@ export function registerCiFailureHandler(
     } catch (err) {
       if (!(err instanceof ResumeError)) throw err;
       if (err.code === "OTHER_HOST") {
+        // Released between the context load and the runner's lock.
+        const reloaded = await loadRunnerContext(ctx.db, executionId);
+        if (reloaded && reloaded.execution.host === null) return unpinned(log);
         await unclaimCommand(ctx.db, command.id);
         log.info({ reason: err.message }, "resume_with_ci_failure: execution is on another host");
         return { outcome: "unclaimed" };

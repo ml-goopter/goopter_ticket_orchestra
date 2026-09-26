@@ -328,8 +328,9 @@ export interface UpsertPullRequestInput {
  * `pull_requests` row. The first call inserts it open with `ci_state =
  * pending`. A later call, after a CI-failure resume, updates that row in
  * place: `number`, `url`, `head_sha`, `execution_id`, `ci_state = pending`,
- * `ci_detail = null`, `last_polled_at = now`. `state` and `created_at` are
- * kept.
+ * `ci_detail = null`, `last_polled_at = now`, and `state = open` with
+ * `merged_at = null`, so a retried task that opens a new PR after the old
+ * one closed is polled again (GOT.39 C22). `created_at` is kept.
  */
 export async function upsertPullRequest(
   db: DbOrTx,
@@ -355,6 +356,8 @@ export async function upsertPullRequest(
         number: input.number,
         url: input.url,
         headSha: input.headSha,
+        state: "open",
+        mergedAt: null,
         ciState: "pending",
         ciDetail: null,
         lastPolledAt: input.now,

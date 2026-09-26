@@ -36,6 +36,30 @@ function isValidGitUrl(value: string): boolean {
   return segments.length >= 2;
 }
 
+/**
+ * Mirrors `FORBIDDEN_TEST_COMMAND_CHARS` in `packages/adapters/src/policies.ts`
+ * (GOT.39 F1). `apps/api` does not depend on `@orchestra/adapters`, so the set
+ * is copied rather than imported. Keep the two in step: a value the adapter's
+ * `validateTestCommand` rejects must be rejected here, or the review role
+ * fails every round at runtime.
+ */
+const FORBIDDEN_TEST_COMMAND_CHARS = /[()*\n\r&;|`$<>]/;
+
+/** Trimmed; rejects what `validateTestCommand` rejects. `null` clears it. */
+const TestCommandSchema = z
+  .string()
+  .trim()
+  .min(1, "test_command must not be empty")
+  .refine(
+    (value) => !FORBIDDEN_TEST_COMMAND_CHARS.test(value),
+    "test_command must not contain ( ) * & ; | ` $ < > or a newline",
+  )
+  .refine(
+    (value) => !value.endsWith(":*"),
+    'test_command must not end with ":*"',
+  )
+  .nullable();
+
 const CreateRepositorySchema = z
   .object({
     project_id: z.string().refine(isUuid, "project_id must be a uuid"),
@@ -52,7 +76,7 @@ const CreateRepositorySchema = z
     max_concurrent_worktrees: z.number().int().min(1).default(1),
     required_capability: z.string().nullable().optional().default(null),
     setup_command: z.string().nullable().optional().default(null),
-    test_command: z.string().nullable().optional().default(null),
+    test_command: TestCommandSchema.optional().default(null),
   })
   .strict();
 
@@ -72,7 +96,7 @@ const PatchRepositorySchema = z
     max_concurrent_worktrees: z.number().int().min(1),
     required_capability: z.string().nullable(),
     setup_command: z.string().nullable(),
-    test_command: z.string().nullable(),
+    test_command: TestCommandSchema,
   })
   .strict()
   .partial();

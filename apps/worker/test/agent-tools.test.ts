@@ -1594,6 +1594,57 @@ describe("report_pr_created", () => {
       first!.id,
     ]);
   });
+
+  it("GOT.39 F4 (C22): reporting a new PR over a closed or merged row reopens it, clears merged_at, and takes the new number and sha", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    expectOk(
+      await call(s.token, "report_pr_created", {
+        url: "https://github.com/goopter/orchestra/pull/42",
+        number: 42,
+        head_sha: "sha-old",
+      }),
+    );
+    const [first] = await db.query.pullRequests.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    // The old PR was closed (merged_at set too, to prove it is cleared).
+    await db.$client.unsafe(
+      "update pull_requests set state = 'closed', merged_at = '2026-01-01T00:00:00Z' where id = $1",
+      [first!.id],
+    );
+
+    // The task goes round again and its session reaches report_pr_created.
+    await db.$client.unsafe("update tasks set state = 'REVIEWING' where id = $1", [s.taskId]);
+    await db.$client.unsafe(
+      "update executions set state = 'RUNNING', ended_at = null where id = $1",
+      [s.executionId],
+    );
+    const token = await db.transaction((tx) => issueToken(tx, s.executionId));
+    issuedTokens.push(token);
+
+    expectOk(
+      await call(token, "report_pr_created", {
+        url: "https://github.com/goopter/orchestra/pull/43",
+        number: 43,
+        head_sha: "sha-new",
+      }),
+    );
+
+    const prs = await db.query.pullRequests.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    expect(prs).toHaveLength(1);
+    expect(prs[0]).toMatchObject({
+      id: first!.id,
+      number: 43,
+      url: "https://github.com/goopter/orchestra/pull/43",
+      headSha: "sha-new",
+      state: "open",
+      mergedAt: null,
+      ciState: "pending",
+    });
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+  });
 });
 
 // ================================================================= AC3

@@ -111,7 +111,7 @@ interface Seeded {
  * `report_pr_created` leaves behind.
  */
 async function seedCiRunning(
-  options: { maxCiRounds?: number; ciRounds?: number } = {},
+  options: { maxCiRounds?: number; ciRounds?: number; headSha?: string } = {},
 ): Promise<Seeded> {
   const n = ++seq;
   const [worker] = await db
@@ -187,7 +187,7 @@ async function seedCiRunning(
       executionId: execution!.id,
       number: 7,
       url: "https://github.com/goopter/repo/pull/7",
-      headSha: "abc1234",
+      headSha: options.headSha ?? "abc1234",
       state: "open",
       ciState: "pending",
       lastPolledAt: NOW,
@@ -317,11 +317,12 @@ async function completeExecution(executionId: string): Promise<void> {
 
 describe("applyCiFailure (design.md §5.3, §11.2, C16)", () => {
   it("moves the task to IMPLEMENTING, increments ci_rounds, writes ci.failed and enqueues resume_with_ci_failure", async () => {
-    const s = await seedCiRunning();
+    const s = await seedCiRunning({ headSha: "def5678" });
 
     const result = await failCi(s, "def5678");
 
-    expect(result).toMatchObject({ round: 1, escalated: false });
+    expect(result).toMatchObject({ applied: true, round: 1, escalated: false });
+    if (!result.applied) throw new Error("expected the failure to apply");
     expect((await task(s.taskId)).state).toBe("IMPLEMENTING");
     const row = await execution(s.executionId);
     expect(row.ciRounds).toBe(1);
@@ -403,11 +404,87 @@ describe("applyCiFailure (design.md §5.3, §11.2, C16)", () => {
     expect(await eventsOf(s.taskId, "ci.failed")).toEqual([]);
     expect(await commandsFor(s.taskId)).toEqual([]);
   });
+
+  /** Nothing `applyCiFailure` writes is present: the no-op left the task as seeded. */
+  async function expectNothingWritten(s: Seeded): Promise<void> {
+    expect((await task(s.taskId)).state).toBe("CI_RUNNING");
+    const row = await execution(s.executionId);
+    expect(row.ciRounds).toBe(0);
+    expect(row.state).toBe("COMPLETED");
+    expect(await eventsOf(s.taskId, "ci.failed")).toEqual([]);
+    expect(await commandsFor(s.taskId)).toEqual([]);
+    const audit = await db.$client.unsafe<{ trigger: string }[]>(
+      "select trigger from audit_events where entity_id in ($1, $2)",
+      [s.taskId, s.executionId],
+    );
+    expect(audit).toEqual([]);
+  }
+
+  it("GOT.39 F2: a stale head sha (report_pr_created committed a newer one) is a typed no-op that writes nothing", async () => {
+    // The poller read sha A; the resumed agent's report_pr_created then
+    // committed sha B before the poller's transaction took the task lock.
+    const s = await seedCiRunning({ headSha: "sha-B" });
+
+    const result = await failCi(s, "sha-A");
+
+    expect(result).toEqual({
+      applied: false,
+      reason: expect.stringContaining("head sha"),
+    });
+    await expectNothingWritten(s);
+  });
+
+  it("GOT.39 F2: a pull request id that is not the task's PR row is a typed no-op that writes nothing", async () => {
+    const s = await seedCiRunning();
+
+    const result = await db.transaction((tx) =>
+      applyCiFailure(tx, {
+        taskId: s.taskId,
+        executionId: s.executionId,
+        pullRequestId: "00000000-0000-4000-8000-000000000000",
+        headSha: "abc1234",
+        checks: CHECKS,
+        actor: WORKER,
+        now: NOW,
+      }),
+    );
+
+    expect(result).toEqual({
+      applied: false,
+      reason: expect.stringContaining("pull request"),
+    });
+    await expectNothingWritten(s);
+  });
+
+  it("GOT.39 F2: a task with no PR row is a typed no-op that writes nothing", async () => {
+    const s = await seedCiRunning();
+    await db.$client.unsafe("delete from pull_requests where id = $1", [s.pullRequestId]);
+
+    const result = await failCi(s);
+
+    expect(result).toEqual({
+      applied: false,
+      reason: expect.stringContaining("pull request"),
+    });
+    await expectNothingWritten(s);
+  });
+
+  it("GOT.39 F2: a matching pull request id and head sha applies as before", async () => {
+    const s = await seedCiRunning({ headSha: "sha-B" });
+
+    const result = await failCi(s, "sha-B");
+
+    expect(result).toMatchObject({ applied: true, round: 1, escalated: false });
+    expect((await task(s.taskId)).state).toBe("IMPLEMENTING");
+    expect((await execution(s.executionId)).ciRounds).toBe(1);
+    expect(await eventsOf(s.taskId, "ci.failed")).toHaveLength(1);
+    expect(await commandsFor(s.taskId)).toHaveLength(1);
+  });
 });
 
 describe("resume_with_ci_failure handler (design.md §5.2, §9.2, AC3)", () => {
   it("resumes the COMPLETED execution with the CI header prompt and completes the command", async () => {
-    const s = await seedCiRunning({ maxCiRounds: 3 });
+    const s = await seedCiRunning({ maxCiRounds: 3, headSha: "def5678" });
     const adapter = new FakeAdapter();
     const runner = makeRunner(HOST, s.workerId, adapter);
     let during: ExecutionState | undefined;
@@ -459,10 +536,12 @@ describe("resume_with_ci_failure handler (design.md §5.2, §9.2, AC3)", () => {
     expect((await execution(s.executionId)).state).toBe("COMPLETED");
   });
 
-  it("OTHER_HOST: unclaims the command without failing the execution; a consumer on the right host handles it later", async () => {
+  const UNPINNED_REASON = "execution unpinned; fresh-session fallback (GOT.43) required";
+
+  it("GOT.39 F3 (C21): an unpinned execution (host null) is skipped at error, never unclaimed, so no worker reclaims it each tick", async () => {
     const s = await seedCiRunning();
-    // The §6.1 dead-host release unpinned it, so this host may claim it but
-    // the runner refuses it.
+    // The §6.1 dead-host release unpinned it, so any host may claim it, but
+    // no host holds its session.
     await db.$client.unsafe(
       "update executions set host = null, worker_id = null where id = $1",
       [s.executionId],
@@ -473,27 +552,67 @@ describe("resume_with_ci_failure handler (design.md §5.2, §9.2, AC3)", () => {
 
     await consume(HOST, s.workerId, runner);
 
-    let [command] = await commandsFor(s.taskId);
-    expect(command!.claimedAt).toBeNull();
-    expect(command!.completedAt).toBeNull();
+    const [command] = await commandsFor(s.taskId);
+    expect(command!.claimedAt).not.toBeNull();
+    expect(command!.completedAt).not.toBeNull();
     expect(adapter.resumes).toHaveLength(0);
     const row = await execution(s.executionId);
     expect(row.state).toBe("COMPLETED");
     expect(row.endReason).toBeNull();
-    // C20: `unclaimed`, logged at info, never as a handler failure.
-    expect(
-      records.some((r) => r.level === "info" && r.msg === "command left for another worker"),
-    ).toBe(true);
-    expect(records.filter((r) => r.level === "error")).toEqual([]);
+    expect(records.some((r) => r.msg === "command left for another worker")).toBe(false);
+    expect(records.find((r) => r.msg === "command skipped")?.fields.reason).toBe(UNPINNED_REASON);
+    expect(records.filter((r) => r.level === "error").map((r) => r.msg)).toEqual([
+      "resume_with_ci_failure: execution is unpinned",
+    ]);
 
-    // Now pinned to the other host: this host no longer claims it.
+    // A later tick, on this host or another, does not pick it up again.
+    await consume(HOST, s.workerId, runner);
+    const otherAdapter = new FakeAdapter();
+    const otherRunner = makeRunner(OTHER_HOST, s.otherWorkerId, otherAdapter);
+    await consume(OTHER_HOST, s.otherWorkerId, otherRunner);
+    expect(adapter.resumes).toHaveLength(0);
+    expect(otherAdapter.resumes).toHaveLength(0);
+    expect(records.filter((r) => r.msg === "command skipped")).toHaveLength(1);
+  });
+
+  it("GOT.39 F3 (C21): unpinned between the context load and the lock is skipped, not unclaimed", async () => {
+    const s = await seedCiRunning();
+    await failCi(s);
+    const adapter = new FakeAdapter();
+    adapter.onCanResume = async () => {
+      await db.$client.unsafe(
+        "update executions set host = null, worker_id = null where id = $1",
+        [s.executionId],
+      );
+    };
+    const runner = makeRunner(HOST, s.workerId, adapter);
+
+    await consume(HOST, s.workerId, runner);
+
+    const [command] = await commandsFor(s.taskId);
+    expect(command!.claimedAt).not.toBeNull();
+    expect(command!.completedAt).not.toBeNull();
+    expect(adapter.resumes).toHaveLength(0);
+    expect((await execution(s.executionId)).state).toBe("COMPLETED");
+    expect(records.find((r) => r.msg === "command skipped")?.fields.reason).toBe(UNPINNED_REASON);
+    expect(records.some((r) => r.msg === "command left for another worker")).toBe(false);
+  });
+
+  it("pinned to another host: this host never claims it; a consumer on the right host handles it", async () => {
+    const s = await seedCiRunning();
     await db.$client.unsafe(
       "update executions set host = $1, worker_id = $2 where id = $3",
       [OTHER_HOST, s.otherWorkerId, s.executionId],
     );
+    await failCi(s);
+    const adapter = new FakeAdapter();
+    const runner = makeRunner(HOST, s.workerId, adapter);
+
     await consume(HOST, s.workerId, runner);
-    [command] = await commandsFor(s.taskId);
+    let [command] = await commandsFor(s.taskId);
     expect(command!.claimedAt).toBeNull();
+    expect(command!.completedAt).toBeNull();
+    expect(adapter.resumes).toHaveLength(0);
 
     const otherAdapter = new FakeAdapter();
     otherAdapter.script = async function* () {
@@ -588,7 +707,9 @@ describe("resume_with_ci_failure handler (design.md §5.2, §9.2, AC3)", () => {
 
   it("a payload that fails validation is skipped and completed, logged at error, not left claimed", async () => {
     const s = await seedCiRunning();
-    const { commandId } = await failCi(s);
+    const failed = await failCi(s);
+    if (!failed.applied) throw new Error("expected the failure to apply");
+    const { commandId } = failed;
     await db.$client.unsafe(
       "update execution_commands set payload = '{\"head_sha\": 7}'::jsonb where id = $1",
       [commandId!],

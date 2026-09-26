@@ -2,6 +2,7 @@ import { eq, sql } from "drizzle-orm";
 import { appendEvent } from "../events.js";
 import { executions } from "../schema/executions.js";
 import { projects } from "../schema/projects.js";
+import { pullRequests } from "../schema/pull_requests.js";
 import { tasks } from "../schema/tasks.js";
 import { NotFoundError, transition, type Actor, type Tx } from "../transition.js";
 import { lockExecutionForTool, lockTaskForTool } from "./agent-tools.js";
@@ -38,13 +39,26 @@ export interface ResumeWithCiFailurePayload {
   checks: CiFailedCheck[];
 }
 
-export interface ApplyCiFailureResult {
+export type ApplyCiFailureResult = AppliedCiFailure | SkippedCiFailure;
+
+export interface AppliedCiFailure {
+  applied: true;
   /** `executions.ci_rounds` after the increment. */
   round: number;
   /** True when the round exceeded `max_ci_rounds` and the task went NEEDS_HUMAN. */
   escalated: boolean;
   /** The enqueued command, or null when escalated. */
   commandId: string | null;
+}
+
+/**
+ * The failure no longer describes the task's PR (GOT.39 F2): the report was
+ * read before `report_pr_created` committed a new head sha, or names a PR
+ * row that is not the task's. Nothing was written.
+ */
+export interface SkippedCiFailure {
+  applied: false;
+  reason: string;
 }
 
 /**
@@ -56,6 +70,11 @@ export interface ApplyCiFailureResult {
  * `needs_human_reason` and nothing is enqueued; otherwise a
  * `resume_with_ci_failure` command is. A task not in CI_RUNNING throws
  * `TransitionError` and the transaction writes nothing.
+ *
+ * Under the task lock, and before any write, the task's `pull_requests` row
+ * must be `pullRequestId` at `headSha` (GOT.39 F2). `report_pr_created` takes
+ * the same task lock, so a failure read for a superseded sha sees the new
+ * row here and returns `{ applied: false, reason }` without writing.
  */
 export async function applyCiFailure(
   tx: Tx,
@@ -66,6 +85,26 @@ export async function applyCiFailure(
   }
   if (!(await lockExecutionForTool(tx, input.executionId))) {
     throw new NotFoundError("execution", input.executionId);
+  }
+
+  const [pr] = await tx
+    .select({ id: pullRequests.id, headSha: pullRequests.headSha })
+    .from(pullRequests)
+    .where(eq(pullRequests.taskId, input.taskId));
+  if (!pr) {
+    return { applied: false, reason: "task has no pull request" };
+  }
+  if (pr.id !== input.pullRequestId) {
+    return {
+      applied: false,
+      reason: `pull request ${input.pullRequestId} is not the task's pull request ${pr.id}`,
+    };
+  }
+  if (pr.headSha !== input.headSha) {
+    return {
+      applied: false,
+      reason: `stale head sha ${input.headSha}; the pull request is at ${pr.headSha}`,
+    };
   }
 
   await transition(tx, {
@@ -111,7 +150,7 @@ export async function applyCiFailure(
         needsHumanReason: `CI round limit exceeded: round ${round} > max_ci_rounds ${max}`,
       },
     });
-    return { round, escalated: true, commandId: null };
+    return { applied: true, round, escalated: true, commandId: null };
   }
 
   const payload: ResumeWithCiFailurePayload = {
@@ -132,5 +171,5 @@ export async function applyCiFailure(
     createdBy: null,
     now: input.now,
   });
-  return { round, escalated: false, commandId: command.id };
+  return { applied: true, round, escalated: false, commandId: command.id };
 }
