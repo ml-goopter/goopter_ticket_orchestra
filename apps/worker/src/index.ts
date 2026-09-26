@@ -11,7 +11,7 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   startHeartbeat,
 } from "./heartbeat.js";
-import { createJiraClient, startJiraPoller } from "./jira/index.js";
+import { createJiraClient, startJiraPoller, startJiraWriteback } from "./jira/index.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PHASE_ORDER, createDefaultPhases } from "./phases/index.js";
 import { registerWorker } from "./registration.js";
@@ -108,6 +108,14 @@ async function main(): Promise<void> {
     workerId,
     logger: log.child({ component: "jira-poller" }),
   });
+  // design.md §11.1: independent write-back loop, posting a Jira comment on
+  // spec approval, PR creation, READY_FOR_MERGE and NEEDS_HUMAN. Same
+  // credential gate as the poller (E4); never blocks startup.
+  const stopJiraWriteback = startJiraWriteback({
+    db,
+    config,
+    logger: log.child({ component: "jira-writeback" }),
+  });
   // design.md §7.3: claim only tasks whose runtime binary is on PATH.
   const runtimes = detectRuntimes();
   log.info({ runtimes }, "detected agent runtimes");
@@ -177,6 +185,7 @@ async function main(): Promise<void> {
       await runner.shutdown();
       await toolsServer.stop();
       await stopJiraPoller();
+      await stopJiraWriteback();
       await stopHeartbeat();
       await closeDb(db);
     },
