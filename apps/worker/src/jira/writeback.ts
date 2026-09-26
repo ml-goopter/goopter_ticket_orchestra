@@ -111,7 +111,20 @@ async function handleWritebackEvent(
   logger: Logger,
   event: JiraWritebackEventRow,
 ): Promise<boolean> {
-  const comment = await buildWritebackComment(db, event, config);
+  let comment: WritebackComment | null;
+  try {
+    comment = await buildWritebackComment(db, event, config);
+  } catch (err) {
+    logger.error(
+      {
+        eventId: String(event.id),
+        jiraKey: event.jiraKey,
+        err: err instanceof Error ? err.message : String(err),
+      },
+      "jira writeback: building the comment failed; retrying next run",
+    );
+    return false;
+  }
   if (!comment) return true;
 
   const marker = writebackMarker(comment.kind, event.taskId);
@@ -289,6 +302,11 @@ export function startJiraWriteback(
 
     try {
       await inFlight;
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "jira writeback: run failed; scheduling next run",
+      );
     } finally {
       inFlight = undefined;
       scheduleNext();

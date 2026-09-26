@@ -115,6 +115,77 @@ describe("startJiraWriteback credential gate (design.md §11.1, E4)", () => {
   });
 });
 
+describe("startJiraWriteback loop: a rejecting run does not crash the process (regression, F1)", () => {
+  it("logs the error and keeps scheduling when handling an event throws outside the per-event error handling", async () => {
+    // `getIssue` returns a ticket with no `comments` array: something
+    // handleWritebackEvent's per-event try/catch blocks do not guard
+    // against, so the rejection can only be caught by the run loop itself.
+    const client = fakeClient({
+      getIssue: vi.fn(async () => ({
+        key: "GOOP-1",
+        summary: "s",
+        description: "",
+        comments: undefined as unknown as never,
+      })),
+    });
+
+    const row = {
+      id: 1n,
+      type: "pull_request.created" as const,
+      payload: { url: "https://github.com/org/repo/pull/1" },
+      taskId: "task-1",
+      jiraKey: "GOOP-1",
+      jiraProjectId: "project-1",
+      needsHumanReason: null,
+      pullRequestUrl: "https://github.com/org/repo/pull/1",
+    };
+
+    const from = () =>
+      Object.assign(Promise.resolve([{ id: 0n }]), {
+        innerJoin: () => ({
+          leftJoin: () => ({
+            where: () => ({
+              orderBy: () => ({
+                limit: () => Promise.resolve([row]),
+              }),
+            }),
+          }),
+        }),
+      });
+    const db = { select: vi.fn(() => ({ from })) };
+
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (err: unknown) => unhandled.push(err);
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    const stop = startJiraWriteback({
+      db: db as never,
+      config: configWith(),
+      logger,
+      client,
+      intervalMs: 1000,
+      jitterRatio: 0,
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(1000);
+      // Give Node's microtask queue a chance to flag any unhandled rejection.
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(unhandled).toHaveLength(0);
+      expect(records.some((r) => r.level === "error")).toBe(true);
+
+      // The loop is still alive: it schedules and runs a second pass.
+      const callsBefore = db.select.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(db.select.mock.calls.length).toBeGreaterThan(callsBefore);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      await stop();
+    }
+  });
+});
+
 describe("startJiraWriteback loop (design.md §11.1, C10)", () => {
   it("runs on an interval-plus-jitter cadence and stops cleanly", async () => {
     const client = fakeClient();

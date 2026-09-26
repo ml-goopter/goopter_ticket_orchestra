@@ -494,6 +494,62 @@ describe("runJiraWriteback: failures (design.md §11.1, C11)", () => {
   });
 });
 
+describe("runJiraWriteback: malformed payload does not crash the loop (regression, F1)", () => {
+  it("a non-uuid revision_id makes the approver lookup throw; the run does not reject, the cursor stays before the bad event, and a later valid event still posts once the bad one is skipped", async () => {
+    const project = await insertProject();
+    const approver = await insertUser("Dave");
+
+    const taskA = await insertTask(project.id, { state: "SPEC_REVIEW" });
+    const eventA = await insertEvent(taskA.id, "spec.approved", {
+      revision_id: "not-a-uuid",
+      version: 1,
+      runtime: "claude",
+      actor: { kind: "user", id: approver.id },
+    });
+
+    const taskB = await insertTask(project.id, { state: "SPEC_REVIEW" });
+    const revisionB = await insertApprovedRevision(taskB.id, approver.id, 2);
+    const eventB = await insertEvent(taskB.id, "spec.approved", {
+      revision_id: revisionB.id,
+      version: 2,
+      runtime: "claude",
+      actor: { kind: "user", id: approver.id },
+    });
+
+    const client = fakeClient();
+
+    const first = await runJiraWriteback({
+      db,
+      client,
+      config: configWith(),
+      logger,
+      cursor: eventA.id - 1n,
+    });
+
+    // The db throws building the comment (invalid uuid syntax); the cursor
+    // must stay before A rather than the promise rejecting.
+    expect(first.cursor).toBe(eventA.id - 1n);
+    expect(client.addComment).not.toHaveBeenCalled();
+
+    // Once the bad event is skipped (cursor advanced past it, as an operator
+    // would after fixing or discarding it), the next run still reaches B.
+    const second = await runJiraWriteback({
+      db,
+      client,
+      config: configWith(),
+      logger,
+      cursor: eventA.id,
+    });
+
+    expect(second.cursor).toBe(eventB.id);
+    expect(client.addComment).toHaveBeenCalledTimes(1);
+    expect(client.addComment).toHaveBeenCalledWith(
+      taskB.jiraKey,
+      `Specification v 2 approved by Dave. https://app.example/tasks/${taskB.id}\n[orchestra:spec_approved:${taskB.id}]`,
+    );
+  });
+});
+
 describe("runJiraWriteback: PUBLIC_URL (design.md §11.1, §15.3)", () => {
   it("omits the link sentence when PUBLIC_URL is unset", async () => {
     const project = await insertProject();
