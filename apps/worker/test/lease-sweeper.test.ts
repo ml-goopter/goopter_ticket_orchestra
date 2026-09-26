@@ -235,9 +235,34 @@ async function expectSwept(
   expect(failed).toHaveLength(1);
 
   expect(await leasesFor(ids.taskId)).toHaveLength(0);
-  // Q10: the retry policy (GOT.43) owns the task; the sweeper leaves it.
+  // §9.5: below max_infra_retries the policy queues a retry and leaves the
+  // task where it is.
   expect(await taskState(ids.taskId)).toBe(taskBefore);
   expect(await auditFor(ids.taskId)).toHaveLength(0);
+  await expectRetryQueued(ids);
+}
+
+/** GOT.43 AC6: one QUEUED retry with no host, queued at NOW + 30 s. */
+async function expectRetryQueued(ids: { taskId: string; executionId: string }) {
+  const retries = (
+    await db.query.executions.findMany({ where: (t, { eq }) => eq(t.taskId, ids.taskId) })
+  ).filter((e) => e.id !== ids.executionId);
+  expect(retries).toHaveLength(1);
+  expect(retries[0]).toMatchObject({
+    state: "QUEUED",
+    attempt: 2,
+    host: null,
+    workerId: null,
+    infraRetriesUsed: 1,
+    branch: "orchestra/branch",
+  });
+  const queued = await eventsFor(retries[0]!.id);
+  expect(queued.map((e) => e.type)).toEqual(["execution.queued"]);
+  expect(queued[0]!.payload).toMatchObject({
+    retry_of: ids.executionId,
+    not_before: at(30 * 1000).toISOString(),
+  });
+  return retries[0]!;
 }
 
 // ----------------------------------------------------------- lease sweeper
@@ -450,6 +475,45 @@ describe("lease sweeper (design.md §6.5)", () => {
     const error = records.find((r) => r.level === "error");
     expect(error?.fields.executionId).toBe(broken.executionId);
     expect(String(error?.fields.err)).toContain("forced failure");
+  });
+
+  it("GOT.43 AC6 queues the retry in the lease transaction", async () => {
+    const me = await sweeper();
+    const other = await seedWorker();
+    const ids = await seedLeased({ state: "RUNNING", worker: other, expiresAt: at(-1) });
+
+    await createLeaseSweeperPhase().run(ctx(me.id));
+
+    const retry = await expectRetryQueued(ids);
+    const [failedAudit] = (await raw(
+      "select xmin::text as x from audit_events where entity_id = $1 and to_state = 'FAILED'",
+      [ids.executionId],
+    )) as Array<{ x: string }>;
+    const [retryRow] = (await raw("select xmin::text as x from executions where id = $1", [
+      retry.id,
+    ])) as Array<{ x: string }>;
+    expect(retryRow!.x).toBe(failedAudit!.x);
+    const notes = await db.query.notifications.findMany({
+      where: (n, { eq }) => eq(n.taskId, ids.taskId),
+    });
+    expect(notes.map((n) => n.kind)).toEqual(["execution_failed"]);
+  });
+
+  it("GOT.43 AC6 at max_infra_retries escalates the task instead of retrying", async () => {
+    const me = await sweeper();
+    const other = await seedWorker();
+    const ids = await seedLeased({ state: "RUNNING", worker: other, expiresAt: at(-1) });
+    await raw("update executions set infra_retries_used = 3 where id = $1", [ids.executionId]);
+
+    await createLeaseSweeperPhase().run(ctx(me.id));
+
+    expect((await execution(ids.executionId)).state).toBe("FAILED");
+    const t = (await db.query.tasks.findFirst({ where: (x, { eq }) => eq(x.id, ids.taskId) }))!;
+    expect(t.state).toBe("NEEDS_HUMAN");
+    expect(t.needsHumanReason).toMatch(/^infrastructure retries exhausted \(3\)/);
+    expect(t.needsHumanReason).toContain("lease_expired");
+    const all = await db.query.executions.findMany({ where: (x, { eq }) => eq(x.taskId, ids.taskId) });
+    expect(all).toHaveLength(1);
   });
 
   it("a second run sweeps nothing more", async () => {

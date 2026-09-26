@@ -10,6 +10,7 @@ import {
   type ReleasedExecution,
 } from "@orchestra/db";
 import type { Logger } from "../logger.js";
+import { runFailurePolicy } from "../runner/retry.js";
 import type { Phase } from "../tick.js";
 
 export type { ExpiredLease } from "@orchestra/db";
@@ -46,8 +47,9 @@ const errMessage = (err: unknown): string =>
 
 /**
  * design.md §6.5. Fails every `ASSIGNED` or `RUNNING` execution whose lease
- * expired before `now` and deletes the lease, one transaction per lease.
- * The task is left as it is: the retry policy (§9.5) is GOT.43's (Q10).
+ * expired before `now`, deletes the lease and applies the §9.5 retry policy,
+ * one transaction per lease: below `max_infra_retries` a retry execution
+ * with no host is queued for any worker, otherwise the task is escalated.
  * The worktree stays on the dead host. A lease that fails is logged and
  * the next one still runs. Returns the execution ids failed.
  */
@@ -70,14 +72,16 @@ export async function sweepExpiredLeases(
         });
         if (!lease) return null;
 
+        const actor = { kind: "worker" as const, id: workerId };
+        const endDetail = `lease expired at ${lease.expiresAt.toISOString()}, held by worker ${lease.workerId}`;
         await transition(tx, {
           entity: "execution",
           id: lease.executionId,
           trigger: "execution.failed",
-          actor: { kind: "worker", id: workerId },
+          actor,
           set: {
             endReason: "lease_expired",
-            endDetail: `lease expired at ${lease.expiresAt.toISOString()}, held by worker ${lease.workerId}`,
+            endDetail,
             endedAt: now,
             // §8: the agent-tools token is revoked when the execution
             // leaves RUNNING.
@@ -85,19 +89,29 @@ export async function sweepExpiredLeases(
           },
         });
         await deleteLease(tx, lease.leaseId);
-        return lease;
+        // Task, then execution, are locked by `lockExpiredLease`.
+        const outcome = await runFailurePolicy(tx, {
+          executionId: lease.executionId,
+          endReason: "lease_expired",
+          endDetail,
+          actor,
+          now,
+          logger,
+        });
+        return { lease, outcome: outcome.kind };
       });
       if (!swept) continue;
 
-      failed.push(swept.executionId);
+      failed.push(swept.lease.executionId);
       logger.warn(
         {
-          taskId: swept.taskId,
-          executionId: swept.executionId,
-          leaseWorkerId: swept.workerId,
-          expiresAt: swept.expiresAt.toISOString(),
+          taskId: swept.lease.taskId,
+          executionId: swept.lease.executionId,
+          leaseWorkerId: swept.lease.workerId,
+          expiresAt: swept.lease.expiresAt.toISOString(),
+          retryPolicy: swept.outcome,
         },
-        "lease expired, execution failed; task awaits the retry policy",
+        "lease expired, execution failed; retry policy applied",
       );
     } catch (err) {
       logger.error(
