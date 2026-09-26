@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  AuthorKindSchema,
   CiStateSchema,
   DASHBOARD_COLUMNS,
   EndReasonSchema,
@@ -290,3 +291,75 @@ export const TaskTransitionResultSchema = z.object({
   to: TaskStateSchema,
 });
 export type TaskTransitionResult = z.infer<typeof TaskTransitionResultSchema>;
+
+/**
+ * `issue_messages` row shape (`GET /issues/:id`, apps/api/src/routes/issues.ts,
+ * design.md §4.2 "issue_messages"). Drizzle's camelCase column names, as
+ * returned unchanged by `getIssueDetail`.
+ */
+export const IssueMessageSchema = z.object({
+  id: z.string(),
+  issueId: z.string(),
+  authorKind: AuthorKindSchema,
+  userId: z.string().nullable(),
+  body: z.string(),
+  createdAt: z.string(),
+});
+export type IssueMessage = z.infer<typeof IssueMessageSchema>;
+
+/**
+ * The execution an issue belongs to, as returned by `GET /issues/:id`
+ * (`IssueExecutionSummary` in packages/db/src/queries/issues.ts).
+ */
+export const IssueExecutionSummarySchema = z.object({
+  id: z.string(),
+  role: ExecutionRoleSchema,
+  state: ExecutionStateSchema,
+  runtime: RuntimeSchema,
+});
+export type IssueExecutionSummary = z.infer<typeof IssueExecutionSummarySchema>;
+
+/**
+ * The task an issue belongs to, as returned by `GET /issues/:id`. Unlike
+ * every other field on this shape, the route builds this object by hand
+ * with a snake_case `jira_key` key (apps/api/src/routes/issues.ts).
+ */
+export const IssueTaskSummarySchema = z.object({
+  id: z.string(),
+  jira_key: z.string(),
+  state: TaskStateSchema,
+});
+export type IssueTaskSummary = z.infer<typeof IssueTaskSummarySchema>;
+
+/**
+ * `GET /issues/:id` response shape (design.md §12.4, §10.2-§10.5): the
+ * issue, its messages oldest first, the execution and task it belongs to,
+ * and its decision once resolved.
+ */
+export const IssueDetailSchema = z.object({
+  issue: IssueSchema,
+  messages: z.array(IssueMessageSchema),
+  execution: IssueExecutionSummarySchema,
+  task: IssueTaskSummarySchema,
+  decision: TaskDecisionSchema.nullable(),
+});
+export type IssueDetail = z.infer<typeof IssueDetailSchema>;
+
+/** `POST /issues/:id/messages` response shape (apps/api/src/routes/issues.ts). */
+export const PostIssueMessageResultSchema = z.object({
+  messageId: z.string(),
+  commandId: z.string(),
+  executionId: z.string(),
+});
+export type PostIssueMessageResult = z.infer<typeof PostIssueMessageResultSchema>;
+
+/** `POST /issues/:id/resolve` response shape (apps/api/src/routes/issues.ts). */
+export const ResolveIssueResultSchema = z.object({
+  issueId: z.string(),
+  decisionId: z.string(),
+  kind: ResolutionKindSchema,
+  commandId: z.string().nullable(),
+  task: z.object({ from: TaskStateSchema, to: TaskStateSchema }).nullable(),
+  revisionId: z.string().nullable(),
+});
+export type ResolveIssueResult = z.infer<typeof ResolveIssueResultSchema>;
