@@ -46,6 +46,11 @@ Expected `docker compose ps` output: `db` healthy, `migrate` `Exited (0)`
 listens (`apps/api/src/index.ts`, `apps/api/src/app.ts`) rather than exiting
 immediately.
 
+`.env`'s `NODE_ENV` defaults to `production`, which marks the session
+cookie `Secure` (`apps/api/src/plugins/auth.ts`); set it to `development`
+for logging in over plain `http://localhost` instead of TLS, and keep it
+`production` behind TLS for anything reachable off this machine.
+
 ```sh
 curl -s http://localhost:8080/api/health
 ```
@@ -258,16 +263,21 @@ The worktree sweeper (`apps/worker/src/sweeper/worktrees.ts`) runs hourly
 and, in order:
 
 1. Removes the worktree and local branch for any task that is `DONE` or
-   `CANCELLED`, or any execution that `FAILED` with no retry pending, once
-   24 hours have passed since the execution ended
-   (`FINISHED_RETENTION_MS`).
-2. For an execution `WAITING_FOR_USER` or a task `NEEDS_HUMAN`, idle more
-   than 14 days (`IDLE_EVICTION_MS`): pushes the branch if it is ahead of
-   `origin`, removes the worktree, and stamps `executions.worktree_evicted_at`.
-3. If disk usage of `WORKER_WORKSPACE_ROOT` exceeds
+   `CANCELLED`, once 24 hours have passed since the execution ended
+   (`FINISHED_RETENTION_MS`, the `"finished"` class).
+2. Removes the worktree and local branch for any execution that `FAILED`
+   with no retry pending, once 24 hours have passed since it ended
+   (`FINISHED_RETENTION_MS`, the `"failed"` class).
+3. For an execution `WAITING_FOR_USER` or a task `NEEDS_HUMAN`, idle more
+   than 14 days (`IDLE_EVICTION_MS`, the `"idle"` class): pushes the branch
+   if it is ahead of `origin`, removes the worktree, and stamps
+   `executions.worktree_evicted_at`.
+4. If disk usage of `WORKER_WORKSPACE_ROOT` exceeds
    `WORKER_DISK_HIGH_WATER_PCT` (default 85), evicts the oldest eligible
-   worktree under rule 2 first, then rule 1, until back under the
-   threshold.
+   worktree from the idle class (rule 3) first, then the failed class
+   (rule 2), until back under the threshold. `DONE`/`CANCELLED` worktrees
+   (rule 1) are never touched by disk pressure, only by the 24-hour rule
+   above (`apps/worker/src/sweeper/worktrees.ts`, the `pressure` array).
 
 Resuming an execution whose worktree was evicted recreates it from the
 pushed remote branch before starting the session; the session id itself is

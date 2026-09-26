@@ -22,6 +22,10 @@ how it is built.
    openssl rand -base64 48
    ```
 
+   `NODE_ENV` defaults to `production`, which marks the session cookie
+   `Secure`; set it to `development` in `.env` if you are logging in over
+   plain `http://localhost` rather than TLS.
+
 2. Build and start Postgres, the migration job, the api, and the web UI:
 
    ```sh
