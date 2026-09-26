@@ -140,6 +140,8 @@ export interface InsertRepositoryInput {
   maxConcurrentWorktrees: number;
   requiredCapability: string | null;
   setupCommand: string | null;
+  /** design.md OI3 (C15). Omitted means null. */
+  testCommand?: string | null;
 }
 
 /**

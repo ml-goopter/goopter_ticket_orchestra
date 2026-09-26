@@ -22,10 +22,28 @@ export interface CommandContext {
   logger: Logger;
 }
 
+/**
+ * What a handler did with its command (GOT.39 C20).
+ *
+ *  - `handled`: done. The consumer stamps `completed_at`.
+ *  - `unclaimed`: the handler already reset `claimed_at` (`unclaimCommand`)
+ *    so another worker may take it. The consumer does not stamp it and
+ *    logs at info.
+ *  - `skipped`: nothing to do, ever. The consumer stamps `completed_at` and
+ *    logs `reason` at warn.
+ *
+ * Returning nothing counts as `handled`. A thrown error leaves the command
+ * claimed and uncompleted, logged at error.
+ */
+export type CommandOutcome =
+  | { outcome: "handled" }
+  | { outcome: "unclaimed" }
+  | { outcome: "skipped"; reason: string };
+
 export type CommandHandler = (
   command: ExecutionCommandRow,
   ctx: CommandContext,
-) => Promise<void>;
+) => Promise<CommandOutcome | void>;
 
 export interface CommandHandlers {
   /** Throws when `type` already has a handler. */
@@ -52,9 +70,10 @@ export function createCommandHandlers(): CommandHandlers {
 /**
  * The `consume_commands` tick phase. Claims up to 10 handled commands in one
  * statement, then runs each handler outside that transaction, in
- * `created_at` order. `completed_at` is set once a handler resolves. A
- * handler that throws is logged and its command stays claimed and
- * uncompleted; the next command still runs.
+ * `created_at` order. `completed_at` is set once a handler resolves
+ * `handled` or `skipped`; an `unclaimed` command is left for the next claim
+ * (`CommandOutcome`). A handler that throws is logged and its command stays
+ * claimed and uncompleted; the next command still runs.
  */
 export function createConsumeCommandsPhase(
   handlers: CommandHandlers = createCommandHandlers(),
@@ -87,15 +106,31 @@ export function createConsumeCommandsPhase(
         };
         if (!handler) continue;
         try {
-          await handler(command, {
+          const result = await handler(command, {
             db: ctx.db,
             workerId: ctx.workerId,
             host,
             now: ctx.now,
             logger: ctx.logger,
           });
-          await completeExecutionCommand(ctx.db, command.id, new Date());
-          ctx.logger.info(fields, "command completed");
+          const outcome: CommandOutcome = result ?? { outcome: "handled" };
+          switch (outcome.outcome) {
+            case "unclaimed":
+              ctx.logger.info(fields, "command left for another worker");
+              break;
+            case "skipped":
+              await completeExecutionCommand(ctx.db, command.id, new Date());
+              ctx.logger.warn({ ...fields, reason: outcome.reason }, "command skipped");
+              break;
+            case "handled":
+              await completeExecutionCommand(ctx.db, command.id, new Date());
+              ctx.logger.info(fields, "command completed");
+              break;
+            default: {
+              const exhaustive: never = outcome;
+              throw new Error(`unhandled command outcome: ${JSON.stringify(exhaustive)}`);
+            }
+          }
         } catch (err) {
           ctx.logger.error(
             { ...fields, err: err instanceof Error ? err.message : String(err) },
@@ -126,12 +161,13 @@ export function registerCancelHandler(
     const executionId = command.executionId;
     if (executionId === null) {
       ctx.logger.warn({ commandId: command.id }, "cancel command names no execution");
-      return;
+      return { outcome: "skipped", reason: "cancel command names no execution" };
     }
     const aborted = runner.abort(executionId);
     ctx.logger.info(
       { commandId: command.id, executionId, aborted },
       aborted ? "cancel aborted live session" : "cancel: no live session here",
     );
+    return { outcome: "handled" };
   });
 }

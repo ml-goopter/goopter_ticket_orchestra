@@ -108,6 +108,26 @@ export async function completeExecutionCommand(
     .where(eq(executionCommands.id, commandId));
 }
 
+/**
+ * Returns a claimed, uncompleted command to the queue (`claimed_at` back to
+ * null), so the §6.1 claim on the right host can take it (GOT.39, GOT.47
+ * carry-forward). A completed command is left alone.
+ */
+export async function unclaimCommand(
+  db: DbOrTx,
+  commandId: string,
+): Promise<void> {
+  await db
+    .update(executionCommands)
+    .set({ claimedAt: null })
+    .where(
+      and(
+        eq(executionCommands.id, commandId),
+        isNull(executionCommands.completedAt),
+      ),
+    );
+}
+
 /** One `task_decisions` row with the deciding user's email (§9.2). */
 export interface RunnerDecision {
   issueId: string;

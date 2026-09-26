@@ -16,3 +16,4 @@ export * from "./stream.js";
 export * from "./spec.js";
 export * from "./runner.js";
 export * from "./sweeper.js";
+export * from "./ci.js";

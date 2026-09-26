@@ -133,8 +133,8 @@ export interface RunnerDeps {
   /** PATH the agent's PATH is built on. Defaults to `process.env.PATH`. */
   basePath?: string;
   /**
-   * Repository test command. No column holds it yet (design.md OI3), so the
-   * default is null; GOT.39 supplies it here.
+   * Repository test command (design.md OI3, C15). Defaults to the
+   * repository row's `test_command`.
    */
   testCommandFor?: (ctx: RunnerContext) => string | null;
   timings?: Partial<RunnerTimings>;
@@ -269,7 +269,8 @@ export function createRunner(deps: RunnerDeps): Runner {
   const now = deps.now ?? (() => new Date());
   const timings: RunnerTimings = { ...DEFAULT_RUNNER_TIMINGS, ...deps.timings };
   const reviewWrapperBin = deps.reviewWrapperBin ?? DEFAULT_REVIEW_WRAPPER_BIN;
-  const testCommandFor = deps.testCommandFor ?? (() => null);
+  const testCommandFor =
+    deps.testCommandFor ?? ((ctx: RunnerContext) => ctx.repository?.testCommand ?? null);
   const live = new Map<string, RunState>();
   let closed = false;
 

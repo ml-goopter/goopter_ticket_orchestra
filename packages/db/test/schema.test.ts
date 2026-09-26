@@ -40,6 +40,7 @@ const EXPECTED_TABLES: Record<string, string[]> = {
     "max_concurrent_worktrees",
     "required_capability",
     "setup_command",
+    "test_command",
     "created_at",
   ],
   tasks: [

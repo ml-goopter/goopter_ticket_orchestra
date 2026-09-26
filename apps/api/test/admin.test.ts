@@ -273,6 +273,192 @@ describe("admin routes", () => {
       expect(patchRes.json().default_branch).toBe("develop");
     });
 
+    it("GOT.39 C15: stores test_command on create, returns it on read, and patches it", async () => {
+      const app = await withAuthedApp();
+      const project = await createProject(app, "REPOTC");
+
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/repositories",
+        headers: { cookie },
+        payload: {
+          project_id: project.id,
+          name: "tc-repo",
+          git_url: "git@example.com:goopter/tc-repo.git",
+          default_branch: "main",
+          default_runtime: "claude",
+          test_command: "pnpm test",
+        },
+      });
+      expect(createRes.statusCode).toBe(201);
+      const created = createRes.json();
+      expect(created.test_command).toBe("pnpm test");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/repositories/${created.id}`,
+        headers: { cookie },
+      });
+      expect(getRes.json().test_command).toBe("pnpm test");
+
+      const patchRes = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${created.id}`,
+        headers: { cookie },
+        payload: { test_command: "npm run test:unit" },
+      });
+      expect(patchRes.statusCode).toBe(200);
+      expect(patchRes.json().test_command).toBe("npm run test:unit");
+
+      const clearRes = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${created.id}`,
+        headers: { cookie },
+        payload: { test_command: null },
+      });
+      expect(clearRes.json().test_command).toBeNull();
+
+      const defaultRes = await app.inject({
+        method: "POST",
+        url: "/api/repositories",
+        headers: { cookie },
+        payload: {
+          project_id: project.id,
+          name: "tc-default-repo",
+          git_url: "git@example.com:goopter/tc-default-repo.git",
+          default_branch: "main",
+          default_runtime: "claude",
+        },
+      });
+      expect(defaultRes.json().test_command).toBeNull();
+    });
+
+    describe("GOT.39 F1: test_command must pass the review role's validateTestCommand", () => {
+      const BAD_TEST_COMMANDS: Array<[string, string]> = [
+        ["empty", ""],
+        ["whitespace", "   "],
+        ["&&", "pnpm test && rm -rf /"],
+        [";", "pnpm test; echo x"],
+        ["|", "pnpm test | tee out"],
+        ["$", "pnpm test $HOME"],
+        ["backtick", "pnpm test `id`"],
+        ["redirect", "pnpm test > out"],
+        ["paren", "pnpm test) Bash(rm -rf"],
+        ["star", "pnpm *"],
+        ["newline", "pnpm test\nBash(rm)"],
+        [":* suffix", "pnpm test:*"],
+      ];
+
+      async function createTcRepo(app: FastifyInstance, key: string) {
+        const project = await createProject(app, key);
+        const res = await app.inject({
+          method: "POST",
+          url: "/api/repositories",
+          headers: { cookie },
+          payload: {
+            project_id: project.id,
+            name: `${key.toLowerCase()}-repo`,
+            git_url: `git@example.com:goopter/${key.toLowerCase()}-repo.git`,
+            default_branch: "main",
+            default_runtime: "claude",
+            test_command: "pnpm test",
+          },
+        });
+        expect(res.statusCode).toBe(201);
+        return { project, repo: res.json() as { id: string } };
+      }
+
+      it.each(BAD_TEST_COMMANDS)(
+        "create rejects a %s test_command with 400 VALIDATION_ERROR",
+        async (_label, testCommand) => {
+          const app = await withAuthedApp();
+          const project = await createProject(app, "TCBADC");
+          const res = await app.inject({
+            method: "POST",
+            url: "/api/repositories",
+            headers: { cookie },
+            payload: {
+              project_id: project.id,
+              name: "bad-tc-repo",
+              git_url: "git@example.com:goopter/bad-tc-repo.git",
+              default_branch: "main",
+              default_runtime: "claude",
+              test_command: testCommand,
+            },
+          });
+          expect(res.statusCode).toBe(400);
+          expect(res.json().error.code).toBe("VALIDATION_ERROR");
+          const list = await app.inject({
+            method: "GET",
+            url: `/api/repositories?project=${project.id}`,
+            headers: { cookie },
+          });
+          expect(list.json()).toEqual([]);
+        },
+      );
+
+      it.each(BAD_TEST_COMMANDS)(
+        "patch rejects a %s test_command with 400 VALIDATION_ERROR and keeps the old value",
+        async (_label, testCommand) => {
+          const app = await withAuthedApp();
+          const { repo } = await createTcRepo(app, "TCBADP");
+          const res = await app.inject({
+            method: "PATCH",
+            url: `/api/repositories/${repo.id}`,
+            headers: { cookie },
+            payload: { test_command: testCommand },
+          });
+          expect(res.statusCode).toBe(400);
+          expect(res.json().error.code).toBe("VALIDATION_ERROR");
+          const getRes = await app.inject({
+            method: "GET",
+            url: `/api/repositories/${repo.id}`,
+            headers: { cookie },
+          });
+          expect(getRes.json().test_command).toBe("pnpm test");
+        },
+      );
+
+      it("trims a plain command on create and on patch, and null still clears it", async () => {
+        const app = await withAuthedApp();
+        const project = await createProject(app, "TCTRIM");
+        const createRes = await app.inject({
+          method: "POST",
+          url: "/api/repositories",
+          headers: { cookie },
+          payload: {
+            project_id: project.id,
+            name: "trim-repo",
+            git_url: "git@example.com:goopter/trim-repo.git",
+            default_branch: "main",
+            default_runtime: "claude",
+            test_command: "  pnpm test --run  ",
+          },
+        });
+        expect(createRes.statusCode).toBe(201);
+        const created = createRes.json();
+        expect(created.test_command).toBe("pnpm test --run");
+
+        const patchRes = await app.inject({
+          method: "PATCH",
+          url: `/api/repositories/${created.id}`,
+          headers: { cookie },
+          payload: { test_command: "\tnpm run test:unit " },
+        });
+        expect(patchRes.statusCode).toBe(200);
+        expect(patchRes.json().test_command).toBe("npm run test:unit");
+
+        const clearRes = await app.inject({
+          method: "PATCH",
+          url: `/api/repositories/${created.id}`,
+          headers: { cookie },
+          payload: { test_command: null },
+        });
+        expect(clearRes.statusCode).toBe(200);
+        expect(clearRes.json().test_command).toBeNull();
+      });
+    });
+
     it.each([
       ["plain word", "not-a-url"],
       ["ftp url", "ftp://example.com/org/repo.git"],
