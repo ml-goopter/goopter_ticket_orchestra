@@ -17,7 +17,13 @@ import { useLatestRequest } from "../board/useLatestRequest.js";
 import { useEventStream, type EventSourceFactory } from "../sse/useEventStream.js";
 import { SpecDraftForm } from "../spec/SpecDraftForm.js";
 import { changedSpecFields, emptySpecContent, specContentEquals } from "../spec/specForm.js";
-import { isLiveExecutionState, isSpecChatBacklogEvent, SPEC_STREAM_EVENT_TYPES } from "../spec/specSession.js";
+import {
+  isLiveExecutionState,
+  isSpecChatBacklogEvent,
+  isSpecChatLiveEvent,
+  specRoleExecutionIds,
+  SPEC_STREAM_EVENT_TYPES,
+} from "../spec/specSession.js";
 import { buildTimelineItems, mergeTimelineEvents } from "../task/timelineItems.js";
 
 export interface SpecBuilderViewProps {
@@ -185,11 +191,7 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
         // (Approve stays disabled) rather than silently passing it.
       }
       try {
-        const specExecutionIds = new Set(
-          loadedAggregate.executions
-            .filter((execution) => execution.role === "spec")
-            .map((execution) => execution.id),
-        );
+        const specExecutionIds = specRoleExecutionIds(loadedAggregate.executions);
         let backlog: TimelineEvent[] = [];
         let after: number | undefined;
         for (;;) {
@@ -244,6 +246,15 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
 
   const eventSourceAvailable = createEventSource !== undefined || typeof EventSource !== "undefined";
 
+  // Same spec-role execution id set the backlog load filters by (F1, GOT.38
+  // review round 1). `null` before the first `getTask` resolves; an event
+  // arriving in that narrow window passes through unfiltered rather than
+  // being dropped before we know which executions belong to this task.
+  const specExecutionIds = useMemo(
+    () => (aggregate ? specRoleExecutionIds(aggregate.executions) : null),
+    [aggregate],
+  );
+
   // Bare URL (C23, docs/build-order.md GOT.38/42 note): the hook appends its
   // own `after=` on reconnect, so passing one here would duplicate the param
   // and the api would reject it with 400.
@@ -254,6 +265,12 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
     onEvent: (event) => {
       const parsed = TimelineEventSchema.safeParse(event.data);
       if (!parsed.success) return;
+      if (specExecutionIds && !isSpecChatLiveEvent(parsed.data, specExecutionIds)) {
+        // Another execution's chat noise sharing this task's stream (e.g. a
+        // paused implementation execution, design.md §10.4): not this
+        // pane's chat, and not a signal to refetch either.
+        return;
+      }
       setEvents((prev) => mergeTimelineEvents(prev, [parsed.data]));
       if (parsed.data.type !== "agent.message.delta" && parsed.data.type !== "agent.message" && parsed.data.type !== "agent.tool_call") {
         // spec.proposed / spec.revised / spec.review_requested /
@@ -365,7 +382,13 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   async function handleApprove() {
     setActionError(null);
     try {
-      await apiClient.approveSpec(id, runtimeValue);
+      // D18: `runtime` is only sent when the user actually picked something
+      // other than the repository's default in the dropdown. Sending the
+      // resolved default on every approval would write a permanent
+      // `tasks.runtime_override`, so the task stops tracking the
+      // repository's default runtime the next time it changes.
+      const runtimeChanged = runtimeOverride !== null && runtimeOverride !== defaultRuntime;
+      await apiClient.approveSpec(id, runtimeChanged ? runtimeOverride : undefined);
       await refetch(false);
     } catch (err) {
       setActionError(describeError(err));

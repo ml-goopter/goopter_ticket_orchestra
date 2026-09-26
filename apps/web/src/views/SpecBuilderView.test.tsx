@@ -178,17 +178,20 @@ describe("SpecBuilderView", () => {
 
     await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
 
+    // "exec-spec-1" is `aggregateInProgress()`'s spec-role execution id
+    // (F1, GOT.38 review round 1): the live handler now drops chat rows
+    // from any other execution, so these must be tagged with it.
     await act(async () => {
       currentSource().emit(
         "agent.message.delta",
-        makeTimelineEvent({ id: 1, executionId: "exec-1", type: "agent.message.delta", payload: { text: "Hel" } }),
+        makeTimelineEvent({ id: 1, executionId: "exec-spec-1", type: "agent.message.delta", payload: { text: "Hel" } }),
         "1",
       );
     });
     await act(async () => {
       currentSource().emit(
         "agent.message.delta",
-        makeTimelineEvent({ id: 2, executionId: "exec-1", type: "agent.message.delta", payload: { text: "lo" } }),
+        makeTimelineEvent({ id: 2, executionId: "exec-spec-1", type: "agent.message.delta", payload: { text: "lo" } }),
         "2",
       );
     });
@@ -199,7 +202,7 @@ describe("SpecBuilderView", () => {
     await act(async () => {
       currentSource().emit(
         "agent.message",
-        makeTimelineEvent({ id: 3, executionId: "exec-1", type: "agent.message", payload: { text: "Hello there" } }),
+        makeTimelineEvent({ id: 3, executionId: "exec-spec-1", type: "agent.message", payload: { text: "Hello there" } }),
         "3",
       );
     });
@@ -210,12 +213,45 @@ describe("SpecBuilderView", () => {
     await act(async () => {
       currentSource().emit(
         "agent.tool_call",
-        makeTimelineEvent({ id: 4, executionId: "exec-1", type: "agent.tool_call", payload: { name: "search_docs" } }),
+        makeTimelineEvent({ id: 4, executionId: "exec-spec-1", type: "agent.tool_call", payload: { name: "search_docs" } }),
         "4",
       );
     });
 
     await waitFor(() => expect(screen.getByTestId("tool-chip").textContent).toBe("search_docs"));
+  });
+
+  it("drops a live agent.message from another execution sharing the task, but keeps one from the spec execution (F1)", async () => {
+    const client = makeFakeClient({ getTask: vi.fn().mockResolvedValue(aggregateInProgress()) });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    // "exec-impl-1" is `aggregateInProgress()`'s implementation execution
+    // (paused, sharing this task's stream per design.md §10.4): its chat
+    // rows must not render in the spec chat pane.
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({
+          id: 1,
+          executionId: "exec-impl-1",
+          type: "agent.message",
+          payload: { text: "Implementation chatter" },
+        }),
+        "1",
+      );
+    });
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({ id: 2, executionId: "exec-spec-1", type: "agent.message", payload: { text: "Spec chat" } }),
+        "2",
+      );
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId("chat-message")).toHaveLength(1));
+    expect(screen.getByTestId("chat-message").textContent).toBe("Spec chat");
   });
 
   it("loads the chat backlog from GET /tasks/:id/timeline on mount, and a live event with an overlapping id is not duplicated", async () => {
@@ -370,7 +406,7 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
   });
 
-  it("sends the selected runtime on Approve, defaulting to the repository's default runtime", async () => {
+  it("omits runtime on Approve when the dropdown is left at the repository's default (D18)", async () => {
     const approveSpec = vi.fn().mockResolvedValue({ from: "SPEC_REVIEW", to: "SPEC_APPROVED", revisionId: "rev-draft" });
     const getTask = vi.fn().mockResolvedValue(
       aggregateInProgress({
@@ -394,7 +430,39 @@ describe("SpecBuilderView", () => {
       fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     });
 
-    await waitFor(() => expect(approveSpec).toHaveBeenCalledWith("task-1", "codex"));
+    // Sending the resolved default here would write a permanent
+    // `tasks.runtime_override` (D18), so the task stops tracking the
+    // repository's default runtime the next time it changes.
+    await waitFor(() => expect(approveSpec).toHaveBeenCalledWith("task-1", undefined));
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+  });
+
+  it("sends the runtime on Approve when the user picks something other than the repository's default (D18)", async () => {
+    const approveSpec = vi.fn().mockResolvedValue({ from: "SPEC_REVIEW", to: "SPEC_APPROVED", revisionId: "rev-draft" });
+    const getTask = vi.fn().mockResolvedValue(
+      aggregateInProgress({
+        task: { ...makeTaskAggregate().task, state: "SPEC_REVIEW" },
+        revisions: [makeRevision({ content: validSpecContent })],
+      }),
+    );
+    const client = makeFakeClient({
+      getTask,
+      approveSpec,
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ name: "tsk-repo", default_runtime: "codex" })]),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Runtime") as HTMLSelectElement).value).toBe("codex"));
+    fireEvent.change(screen.getByLabelText("Runtime"), { target: { value: "claude" } });
+
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    });
+
+    await waitFor(() => expect(approveSpec).toHaveBeenCalledWith("task-1", "claude"));
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
   });
 

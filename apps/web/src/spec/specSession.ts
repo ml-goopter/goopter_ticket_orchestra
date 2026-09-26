@@ -1,5 +1,5 @@
 import type { ExecutionEventType, ExecutionState } from "@orchestra/core";
-import type { TimelineEvent } from "../api/types.js";
+import type { Execution, TimelineEvent } from "../api/types.js";
 
 /**
  * Event types the spec builder's chat subscribes to on `GET
@@ -54,4 +54,27 @@ export function isSpecChatBacklogEvent(event: TimelineEvent, specExecutionIds: R
     return event.executionId === null || specExecutionIds.has(event.executionId);
   }
   return false;
+}
+
+/** The task's spec-role execution ids (an aggregate can carry several across retries), for `isSpecChatBacklogEvent`/`isSpecChatLiveEvent`. */
+export function specRoleExecutionIds(executions: readonly Pick<Execution, "id" | "role">[]): Set<string> {
+  return new Set(executions.filter((execution) => execution.role === "spec").map((execution) => execution.id));
+}
+
+const CHAT_EVENT_TYPES: ReadonlySet<string> = new Set(["agent.message", "agent.message.delta", "agent.tool_call"]);
+
+/**
+ * Whether a live `GET /tasks/:id/stream` row belongs in the spec chat pane
+ * (F1, GOT.38 review round 1): the stream carries every execution event for
+ * the task, not just the spec execution's, so without this a paused
+ * implementation execution sharing the task (design.md §10.4: it stays
+ * `WAITING_FOR_USER` while a `spec_revision` decision reopens the spec
+ * builder) would render its `agent.message`/`.delta`/`agent.tool_call` rows
+ * in this pane too. Every other subscribed type (`spec.*`,
+ * `task.state_changed`) is task-scoped rather than per-execution, so it
+ * always passes through to the refetch trigger.
+ */
+export function isSpecChatLiveEvent(event: TimelineEvent, specExecutionIds: ReadonlySet<string>): boolean {
+  if (!CHAT_EVENT_TYPES.has(event.type)) return true;
+  return event.executionId !== null && specExecutionIds.has(event.executionId);
 }
