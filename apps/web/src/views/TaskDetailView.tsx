@@ -6,6 +6,7 @@ import { ApiError, createApiClient, type BoardApiClient } from "../api/client.js
 import { TimelineEventSchema, type TaskAggregate, type TimelineEvent } from "../api/types.js";
 import { useRefetchOnReconnect } from "../board/useEventReconnect.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
+import { CostBreakdown } from "../cost/CostBreakdown.js";
 import { useEventStream, type EventSourceFactory } from "../sse/useEventStream.js";
 import { EVENT_FAMILIES, FAMILY_LABELS, familyOf, type EventFamily } from "../task/eventFamilies.js";
 import { buildTimelineItems, mergeTimelineEvents, type TimelineItem } from "../task/timelineItems.js";
@@ -433,6 +434,7 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
               </li>
             ))}
           </ul>
+          <CostBreakdown taskId={aggregate.task.id} request={apiClient.request} />
         </section>
 
         <section aria-label="Pull request">

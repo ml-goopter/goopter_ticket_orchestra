@@ -202,6 +202,89 @@ describe("admin routes", () => {
       });
       expect(res.statusCode).toBe(404);
     });
+
+    it("GOT.44 Q9: defaults max_budget_usd to null, stores and reads it, and patches it", async () => {
+      const app = await withAuthedApp();
+
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/projects",
+        headers: { cookie },
+        payload: { key: "BUDG", name: "Budgeted", jira_jql: "project = BUDG" },
+      });
+      expect(createRes.statusCode).toBe(201);
+      expect(createRes.json().max_budget_usd).toBeNull();
+
+      const withBudgetRes = await app.inject({
+        method: "POST",
+        url: "/api/projects",
+        headers: { cookie },
+        payload: {
+          key: "BUDG2",
+          name: "Budgeted 2",
+          jira_jql: "project = BUDG2",
+          max_budget_usd: 500.5,
+        },
+      });
+      expect(withBudgetRes.statusCode).toBe(201);
+      const created = withBudgetRes.json();
+      expect(created.max_budget_usd).toBe(500.5);
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/projects/${created.id}`,
+        headers: { cookie },
+      });
+      expect(getRes.json().max_budget_usd).toBe(500.5);
+
+      const patchRes = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${created.id}`,
+        headers: { cookie },
+        payload: { max_budget_usd: 750 },
+      });
+      expect(patchRes.statusCode).toBe(200);
+      expect(patchRes.json().max_budget_usd).toBe(750);
+
+      const clearRes = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${created.id}`,
+        headers: { cookie },
+        payload: { max_budget_usd: null },
+      });
+      expect(clearRes.statusCode).toBe(200);
+      expect(clearRes.json().max_budget_usd).toBeNull();
+    });
+
+    it("rejects a negative max_budget_usd with 400 on create and patch", async () => {
+      const app = await withAuthedApp();
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/projects",
+        headers: { cookie },
+        payload: {
+          key: "BUDN",
+          name: "Bad Budget",
+          jira_jql: "project = BUDN",
+          max_budget_usd: -1,
+        },
+      });
+      expect(createRes.statusCode).toBe(400);
+
+      const okRes = await app.inject({
+        method: "POST",
+        url: "/api/projects",
+        headers: { cookie },
+        payload: { key: "BUDN2", name: "Ok Budget", jira_jql: "project = BUDN2" },
+      });
+      const patchRes = await app.inject({
+        method: "PATCH",
+        url: `/api/projects/${okRes.json().id}`,
+        headers: { cookie },
+        payload: { max_budget_usd: -5 },
+      });
+      expect(patchRes.statusCode).toBe(400);
+    });
   });
 
   describe("repositories (AC2)", () => {

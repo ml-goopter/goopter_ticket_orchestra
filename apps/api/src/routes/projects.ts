@@ -19,6 +19,12 @@ function validationMessage(error: ZodError): string {
     .join("; ");
 }
 
+/** design.md build-order Q9: no enforcement here, only storage. */
+const MaxBudgetUsdSchema = z
+  .number()
+  .nonnegative("max_budget_usd must not be negative")
+  .nullable();
+
 const CreateProjectSchema = z
   .object({
     key: z.string().regex(KEY_RE, "key must match ^[A-Z][A-Z0-9_]+$"),
@@ -28,6 +34,7 @@ const CreateProjectSchema = z
     max_protocol_retries: z.number().int().min(0).default(2),
     max_ci_rounds: z.number().int().min(0).default(3),
     max_review_rounds: z.number().int().min(0).default(3),
+    max_budget_usd: MaxBudgetUsdSchema.default(null),
   })
   .strict();
 
@@ -40,6 +47,7 @@ const PatchProjectSchema = z
     max_protocol_retries: z.number().int().min(0),
     max_ci_rounds: z.number().int().min(0),
     max_review_rounds: z.number().int().min(0),
+    max_budget_usd: MaxBudgetUsdSchema,
   })
   .strict()
   .partial();
@@ -54,6 +62,7 @@ function toResponse(row: ProjectRow) {
     max_protocol_retries: row.maxProtocolRetries,
     max_ci_rounds: row.maxCiRounds,
     max_review_rounds: row.maxReviewRounds,
+    max_budget_usd: row.maxBudgetUsd === null ? null : Number(row.maxBudgetUsd),
     created_at: row.createdAt,
   };
 }
@@ -91,6 +100,10 @@ export default async function projectsRoutes(
         maxProtocolRetries: parsed.data.max_protocol_retries,
         maxCiRounds: parsed.data.max_ci_rounds,
         maxReviewRounds: parsed.data.max_review_rounds,
+        maxBudgetUsd:
+          parsed.data.max_budget_usd === null
+            ? null
+            : parsed.data.max_budget_usd.toFixed(6),
       });
       reply.code(201);
       return toResponse(row);
@@ -129,6 +142,14 @@ export default async function projectsRoutes(
           : {}),
         ...(parsed.data.max_review_rounds !== undefined
           ? { maxReviewRounds: parsed.data.max_review_rounds }
+          : {}),
+        ...(parsed.data.max_budget_usd !== undefined
+          ? {
+              maxBudgetUsd:
+                parsed.data.max_budget_usd === null
+                  ? null
+                  : parsed.data.max_budget_usd.toFixed(6),
+            }
           : {}),
       });
       if (!row) throw notFound(request.params.id);

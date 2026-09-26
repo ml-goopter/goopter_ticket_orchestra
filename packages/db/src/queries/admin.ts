@@ -63,6 +63,8 @@ export interface InsertProjectInput {
   maxProtocolRetries: number;
   maxCiRounds: number;
   maxReviewRounds: number;
+  /** design.md build-order Q9. Decimal string or `null`; omitted means `null`. */
+  maxBudgetUsd?: string | null;
 }
 
 /** Inserts one project row. A duplicate `key` surfaces as `UniqueViolationError`. */
