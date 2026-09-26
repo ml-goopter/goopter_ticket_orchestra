@@ -487,11 +487,16 @@ describe("retry starter claim (C25, AC7)", () => {
         host: OTHER_HOST,
         workerId: otherWorker,
       });
+      // A younger due retry on another task with no sibling. With the
+      // select's filter it is taken in the same run; without it the blocked,
+      // older row is picked, the re-check returns null, and the run stops.
+      const free = await seedRetry();
       const spy = spyRunner();
       const due = at(30 * SECOND);
 
-      expect(await runRetryStarter(starterOptions(s, spy.runner, due))).toEqual([]);
-      expect(spy.calls).toHaveLength(0);
+      const first = await runRetryStarter(starterOptions(s, spy.runner, due));
+      expect(first.map((c) => c.executionId)).toEqual([free.retryId]);
+      expect(spy.calls.map((c) => c.claim.executionId)).toEqual([free.retryId]);
       expect(await executionRow(s.retryId)).toMatchObject({ state: "QUEUED", host: null });
 
       await raw("update executions set state = 'CANCELLED' where id = $1", [sibling]);
