@@ -50,6 +50,9 @@ const EXPECTED_EDGES: {
   { entity: "execution", from: "WAITING_FOR_USER", trigger: "execution.resumed", to: "RUNNING" },
   { entity: "execution", from: "RUNNING", trigger: "execution.completed", to: "COMPLETED" },
   { entity: "execution", from: "RUNNING", trigger: "execution.failed", to: "FAILED" },
+  // GOT.31 (user decision O1): a failure before the session starts
+  // (setup_failed, early adapter error, agent_hung, §6.5 lease_expired).
+  { entity: "execution", from: "ASSIGNED", trigger: "execution.failed", to: "FAILED" },
   { entity: "execution", from: "QUEUED", trigger: "execution.cancelled", to: "CANCELLED" },
   { entity: "execution", from: "ASSIGNED", trigger: "execution.cancelled", to: "CANCELLED" },
   { entity: "execution", from: "RUNNING", trigger: "execution.cancelled", to: "CANCELLED" },
