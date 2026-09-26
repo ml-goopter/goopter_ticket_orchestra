@@ -1,9 +1,12 @@
 import { sign as signCookie } from "@fastify/cookie";
 import type {
+  EndReason,
   ExecutionState,
   IssueStatus,
   IssueType,
   NotificationKind,
+  ReviewVerdict,
+  Runtime,
   Severity,
   TaskState,
 } from "@orchestra/core";
@@ -14,9 +17,12 @@ import {
   notifications,
   projects,
   repositories,
+  reviewResults,
   runMigrations,
   sessions,
+  specificationApprovals,
   specificationRevisions,
+  taskDecisions,
   taskDependencies,
   tasks,
   users,
@@ -276,12 +282,17 @@ export interface SeedExecutionOptions {
   role?: "spec" | "implementation";
   attempt?: number;
   state: ExecutionState;
-  runtime?: "claude" | "codex";
+  runtime?: Runtime;
   model?: string;
   costUsd?: string;
   inputTokens?: number;
   cachedInputTokens?: number;
   outputTokens?: number;
+  specRevisionId?: string | null;
+  sessionId?: string | null;
+  branch?: string | null;
+  endReason?: EndReason | null;
+  createdAt?: Date;
 }
 
 /** Inserts one execution on `taskId` and returns its id. */
@@ -303,6 +314,11 @@ export async function seedExecution(
       inputTokens: options.inputTokens ?? 0,
       cachedInputTokens: options.cachedInputTokens ?? 0,
       outputTokens: options.outputTokens ?? 0,
+      specRevisionId: options.specRevisionId ?? null,
+      sessionId: options.sessionId ?? null,
+      branch: options.branch ?? null,
+      endReason: options.endReason ?? null,
+      ...(options.createdAt ? { createdAt: options.createdAt } : {}),
     })
     .returning({ id: executions.id });
   return row!.id;
@@ -376,6 +392,93 @@ export async function seedRevision(
     })
     .returning({ id: specificationRevisions.id });
   if (!row) throw new Error("seedRevision: insert returned no row");
+  return row.id;
+}
+
+export interface SeedApprovalOptions {
+  approvedBy: string;
+  runtime?: Runtime;
+  approvedAt?: Date;
+}
+
+/** Inserts one `specification_approvals` row directly. */
+export async function seedApproval(
+  db: Db,
+  revisionId: string,
+  options: SeedApprovalOptions,
+): Promise<string> {
+  const [row] = await db
+    .insert(specificationApprovals)
+    .values({
+      revisionId,
+      approvedBy: options.approvedBy,
+      approvedAt: options.approvedAt ?? new Date("2026-01-01T00:00:00Z"),
+      runtime: options.runtime ?? "claude",
+    })
+    .returning({ id: specificationApprovals.id });
+  if (!row) throw new Error("seedApproval: insert returned no row");
+  return row.id;
+}
+
+export interface SeedTaskDecisionOptions {
+  taskId: string;
+  issueId: string;
+  decision?: string;
+  clarification?: string | null;
+  chosenOption?: string | null;
+  decidedBy: string;
+  decidedAt?: Date;
+}
+
+/** Inserts one `task_decisions` row directly. */
+export async function seedTaskDecision(
+  db: Db,
+  options: SeedTaskDecisionOptions,
+): Promise<string> {
+  const [row] = await db
+    .insert(taskDecisions)
+    .values({
+      taskId: options.taskId,
+      issueId: options.issueId,
+      decision: options.decision ?? "Proceed as clarified.",
+      clarification: options.clarification ?? null,
+      chosenOption: options.chosenOption ?? null,
+      decidedBy: options.decidedBy,
+      decidedAt: options.decidedAt ?? new Date("2026-01-01T00:00:00Z"),
+    })
+    .returning({ id: taskDecisions.id });
+  if (!row) throw new Error("seedTaskDecision: insert returned no row");
+  return row.id;
+}
+
+export interface SeedReviewResultOptions {
+  round?: number;
+  verdict?: ReviewVerdict;
+  findings?: unknown;
+  reviewerRuntime?: Runtime;
+  createdAt?: Date;
+}
+
+/** Inserts one `review_results` row directly. */
+export async function seedReviewResult(
+  db: Db,
+  executionId: string,
+  options: SeedReviewResultOptions = {},
+): Promise<string> {
+  const [row] = await db
+    .insert(reviewResults)
+    .values({
+      executionId,
+      round: options.round ?? 1,
+      verdict: options.verdict ?? "findings",
+      findings: options.findings ?? [
+        { severity: "warning", description: "Nit.", action: "Fix later." },
+      ],
+      reviewerRuntime: options.reviewerRuntime ?? "claude",
+      ...(options.createdAt ? { createdAt: options.createdAt } : {}),
+    })
+    .returning({ id: reviewResults.id });
+  if (!row) throw new Error("seedReviewResult: insert returned no row");
   return row.id;
 }
 
