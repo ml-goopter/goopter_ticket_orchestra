@@ -49,6 +49,7 @@ import type { ClaimedExecution, OnClaimed } from "../scheduler/claim.js";
 import {
   SetupFailedError,
   type PrepareImplementationInput,
+  type PrepareSpecInput,
   type PreparedWorktree,
 } from "../worktrees/index.js";
 
@@ -112,6 +113,8 @@ export interface RunnerDeps {
     prepareImplementation(
       input: PrepareImplementationInput,
     ): Promise<PreparedWorktree>;
+    /** Resume of an evicted spec execution recreates its worktree (§6.6). */
+    prepareSpec(input: PrepareSpecInput): Promise<PreparedWorktree>;
   };
   /** One adapter per runtime (§7.3). A missing runtime fails the execution. */
   adapters: Partial<Record<Runtime, AgentAdapter>>;
@@ -899,9 +902,13 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   /**
    * §6.6: the sweeper evicted this execution's worktree. Recreates it at the
-   * same `work/<executionId>` path from `origin/<branch>`, then records the
-   * path, clears `worktree_evicted_at` and appends `worktree.prepared`.
-   * Returns the worktree path. Any failure before the write refuses with
+   * same `work/<executionId>` path: a spec worktree detached at
+   * `origin/<default_branch>` (§9.1); an implementation worktree from
+   * `origin/<branch>`, or from `origin/<default_branch>` on the same branch
+   * name when the remote lacks it (the sweeper pushes a branch that is
+   * ahead, so nothing was left to push). Then records the path, clears
+   * `worktree_evicted_at` and appends `worktree.prepared`. Returns the
+   * worktree path. Any failure before the write refuses with
    * `WORKTREE_UNAVAILABLE` and writes nothing.
    */
   async function restoreEvictedWorktree(
@@ -910,40 +917,49 @@ export function createRunner(deps: RunnerDeps): Runner {
   ): Promise<string> {
     let prepared: PreparedWorktree;
     try {
-      if (ctx.execution.role !== "implementation" || !ctx.execution.branch) {
-        throw new Error("only an implementation worktree with a branch can be recreated");
-      }
       if (!ctx.repository) throw new Error("task has no repository");
-      if (!ctx.revision) throw new Error("no approved specification revision");
-      prepared = await deps.worktrees.prepareImplementation({
-        executionId: ctx.execution.id,
-        repository: {
-          name: ctx.repository.name,
-          gitUrl: ctx.repository.gitUrl,
-          defaultBranch: ctx.repository.defaultBranch,
-          setupCommand: ctx.repository.setupCommand,
-        },
-        task: {
-          id: ctx.task.id,
-          jiraKey: ctx.task.jiraKey,
-          jiraSummary: ctx.task.jiraSummary,
-        },
-        spec: {
-          version: ctx.revision.version,
-          content: SpecContentSchema.parse(ctx.revision.content),
-        },
-        decisions: ctx.decisions.map((d) => ({
-          issue_id: d.issueId,
-          decision: d.decision,
-          clarification: d.clarification,
-          chosen_option: d.chosenOption,
-          decided_by: d.decidedBy,
-          decided_at: d.decidedAt.toISOString(),
-        })),
-        reviewCommand: testCommandFor(ctx),
-        runtime: ctx.execution.runtime,
-        resumeFromRemote: true,
-      });
+      const repository = {
+        name: ctx.repository.name,
+        gitUrl: ctx.repository.gitUrl,
+        defaultBranch: ctx.repository.defaultBranch,
+        setupCommand: ctx.repository.setupCommand,
+      };
+      if (ctx.execution.role === "spec") {
+        prepared = await deps.worktrees.prepareSpec({
+          executionId: ctx.execution.id,
+          repository,
+        });
+      } else {
+        if (ctx.execution.role !== "implementation" || !ctx.execution.branch) {
+          throw new Error(`a ${ctx.execution.role} worktree cannot be recreated`);
+        }
+        if (!ctx.revision) throw new Error("no approved specification revision");
+        prepared = await deps.worktrees.prepareImplementation({
+          executionId: ctx.execution.id,
+          repository,
+          task: {
+            id: ctx.task.id,
+            jiraKey: ctx.task.jiraKey,
+            jiraSummary: ctx.task.jiraSummary,
+          },
+          spec: {
+            version: ctx.revision.version,
+            content: SpecContentSchema.parse(ctx.revision.content),
+          },
+          decisions: ctx.decisions.map((d) => ({
+            issue_id: d.issueId,
+            decision: d.decision,
+            clarification: d.clarification,
+            chosen_option: d.chosenOption,
+            decided_by: d.decidedBy,
+            decided_at: d.decidedAt.toISOString(),
+          })),
+          reviewCommand: testCommandFor(ctx),
+          runtime: ctx.execution.runtime,
+          resumeFromRemote: true,
+          fallbackToDefaultBranch: true,
+        });
+      }
     } catch (err) {
       return refuse(
         "WORKTREE_UNAVAILABLE",

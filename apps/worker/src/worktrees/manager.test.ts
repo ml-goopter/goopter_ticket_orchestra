@@ -292,6 +292,30 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
     expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
   });
 
+  it("resume with fallbackToDefaultBranch starts the branch from origin/<default> when origin lacks it", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+
+    const result = await manager.prepareImplementation(
+      implInput("exec-1", { resumeFromRemote: true, fallbackToDefaultBranch: true }),
+    );
+
+    expect(result.branch).toBe(BRANCH);
+    expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(remoteTip("main"));
+    expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
+  });
+
+  it("resume with fallbackToDefaultBranch still uses origin/<branch> when it exists", async () => {
+    const pushed = pushCommit(BRANCH, "pushed.txt", "pushed");
+    const manager = new WorktreeManager({ workspaceRoot });
+
+    const result = await manager.prepareImplementation(
+      implInput("exec-1", { resumeFromRemote: true, fallbackToDefaultBranch: true }),
+    );
+
+    expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(pushed);
+    expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
+  });
+
   it("A5: resume from the remote branch when a local branch of that name exists", async () => {
     const manager = new WorktreeManager({ workspaceRoot });
     const first = await manager.prepareImplementation(implInput("exec-1"));

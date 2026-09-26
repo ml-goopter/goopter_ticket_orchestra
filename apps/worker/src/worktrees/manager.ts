@@ -51,6 +51,13 @@ export interface PrepareImplementationInput {
    * pushed branch (design.md §6.5, §6.6, §9.1).
    */
   resumeFromRemote?: boolean;
+  /**
+   * With `resumeFromRemote`: when `origin` has no such branch after the
+   * fetch, start it from `origin/<default_branch>` as a fresh start does.
+   * Resume after eviction uses it: the sweeper pushes a branch that is
+   * ahead, so a missing remote branch means nothing was left to push.
+   */
+  fallbackToDefaultBranch?: boolean;
 }
 
 export interface PrepareSpecInput {
@@ -278,12 +285,17 @@ export class WorktreeManager {
     const worktreePath = this.worktreePath(executionId);
     const branch = workingBranchName(input.task.jiraKey, input.task.id);
     const barePath = this.barePath(repository);
-    const startPoint = input.resumeFromRemote
-      ? `refs/remotes/origin/${branch}`
-      : `refs/remotes/origin/${repository.defaultBranch}`;
+    const remoteBranch = `refs/remotes/origin/${branch}`;
 
     await withRepoLock(barePath, async () => {
       await this.fetch(barePath, repository.gitUrl);
+      const fromRemote =
+        input.resumeFromRemote === true &&
+        (input.fallbackToDefaultBranch !== true ||
+          (await refExists(barePath, remoteBranch)));
+      const startPoint = fromRemote
+        ? remoteBranch
+        : `refs/remotes/origin/${repository.defaultBranch}`;
       await runGit(barePath, ["worktree", "prune"]);
       await this.releaseBranch(barePath, branch);
       await fs.mkdir(path.dirname(worktreePath), { recursive: true });
@@ -293,7 +305,7 @@ export class WorktreeManager {
       await runGit(barePath, [
         "worktree",
         "add",
-        input.resumeFromRemote ? "--track" : "--no-track",
+        fromRemote ? "--track" : "--no-track",
         "-B",
         branch,
         worktreePath,

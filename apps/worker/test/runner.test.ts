@@ -63,6 +63,7 @@ import {
   SetupFailedError,
   WorktreeManager,
   type PrepareImplementationInput,
+  type PrepareSpecInput,
 } from "../src/worktrees/index.js";
 import { sleep, startTestDb, waitFor, type TestDb } from "./harness.js";
 
@@ -339,6 +340,7 @@ interface Harness {
   adapter: FakeAdapter;
   registry: ExecutionRegistry;
   prepared: PrepareImplementationInput[];
+  specPrepared: PrepareSpecInput[];
   runner: Runner;
 }
 
@@ -358,6 +360,7 @@ function makeRunner(
 ): Harness {
   const registry = createExecutionRegistry();
   const prepared: PrepareImplementationInput[] = [];
+  const specPrepared: PrepareSpecInput[] = [];
   const adapter = new FakeAdapter((cwd) => path.basename(cwd));
   const created = createRunner({
     db,
@@ -378,6 +381,13 @@ function makeRunner(
         }
         return { worktreePath, branch: `agent/${input.task.jiraKey}-abcdef12` };
       },
+      async prepareSpec(input) {
+        specPrepared.push(input);
+        if (options.worktrees) return options.worktrees.prepareSpec(input);
+        const worktreePath = path.join(workRoot, "work", input.executionId);
+        await fs.mkdir(worktreePath, { recursive: true });
+        return { worktreePath, branch: null };
+      },
     },
     adapters: options.adapters ?? { claude: adapter },
     toolsUrl: () => TOOLS_URL,
@@ -387,7 +397,7 @@ function makeRunner(
     timings: { leaseRenewMs: options.leaseRenewMs ?? 100, blockingGraceMs: 400, blockingPollMs: 50 },
   });
   runner = created;
-  return { adapter, registry, prepared, runner: created };
+  return { adapter, registry, prepared, specPrepared, runner: created };
 }
 
 async function expectCleanedUp(h: Harness, executionId: string): Promise<void> {
@@ -1216,17 +1226,23 @@ describe("resume after eviction (§6.6, F3)", () => {
     manager = new WorktreeManager({ workspaceRoot });
   });
 
-  /**
-   * A WAITING_FOR_USER execution whose real worktree has one commit, then
-   * evicted as the sweeper does: optionally pushed, worktree and local
-   * branch removed, `worktree_evicted_at` stamped.
-   */
-  async function evictedExecution(options: { pushed: boolean }) {
-    const s = await seedClaimed();
+  /** Points the task's repository at the local remote, with no setup command. */
+  async function useLocalRemote(taskId: string): Promise<void> {
     await db.$client.unsafe(
       "update repositories set git_url = $1, setup_command = null where id = (select repository_id from tasks where id = $2)",
-      [remote, s.taskId],
+      [remote, taskId],
     );
+  }
+
+  /**
+   * A WAITING_FOR_USER execution with a real worktree, evicted as the
+   * sweeper does: a branch with one commit is pushed first, a branch never
+   * committed to is not; then the worktree and local branch are removed and
+   * `worktree_evicted_at` is stamped.
+   */
+  async function evictedExecution(options: { committed: boolean }) {
+    const s = await seedClaimed();
+    await useLocalRemote(s.taskId);
     const h = makeRunner({ workerId: s.workerId, worktrees: manager });
     h.adapter.script = async function* ({ executionId }) {
       yield { type: "session", sessionId: "sess-ev" };
@@ -1238,18 +1254,19 @@ describe("resume after eviction (§6.6, F3)", () => {
     expect(row.state).toBe("WAITING_FOR_USER");
     const worktreePath = row.worktreePath!;
     const branch = row.branch!;
-    await fs.writeFile(path.join(worktreePath, "work.txt"), "work");
-    git(worktreePath, "add", "work.txt");
-    git(worktreePath, "commit", "-q", "-m", "work");
+    if (options.committed) {
+      await fs.writeFile(path.join(worktreePath, "work.txt"), "work");
+      git(worktreePath, "add", "work.txt");
+      git(worktreePath, "commit", "-q", "-m", "work");
+    }
     const head = git(worktreePath, "rev-parse", "HEAD");
     const [repo] = await db.$client.unsafe<{ name: string }[]>(
       "select r.name from repositories r join tasks t on t.repository_id = r.id where t.id = $1",
       [s.taskId],
     );
     const repositoryName = repo!.name;
-    if (options.pushed) {
-      await manager.pushIfAhead({ repositoryName, branch, defaultBranch: "main" });
-    }
+    const push = await manager.pushIfAhead({ repositoryName, branch, defaultBranch: "main" });
+    expect(push.pushed).toBe(options.committed);
     await manager.remove(s.executionId, { repositoryName, branch });
     await db.$client.unsafe(
       "update executions set worktree_evicted_at = now() where id = $1",
@@ -1259,7 +1276,7 @@ describe("resume after eviction (§6.6, F3)", () => {
   }
 
   it("recreates the worktree from origin/<branch>, clears worktree_evicted_at and writes worktree.prepared before resuming", async () => {
-    const { s, h, worktreePath, branch, head } = await evictedExecution({ pushed: true });
+    const { s, h, worktreePath, branch, head } = await evictedExecution({ committed: true });
     const preparedBefore = (await eventTypes(s.executionId)).filter(
       (t) => t === "worktree.prepared",
     ).length;
@@ -1294,8 +1311,41 @@ describe("resume after eviction (§6.6, F3)", () => {
     );
   });
 
-  it("rejects with a typed error and writes nothing when the remote branch is missing", async () => {
-    const { s, h } = await evictedExecution({ pushed: false });
+  it("recreates a never-committed branch from origin/<default_branch> when origin lacks it, and resumes", async () => {
+    const { s, h, worktreePath, branch } = await evictedExecution({ committed: false });
+    const mainTip = git(remote, "rev-parse", "refs/heads/main");
+    expect(() => git(remote, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`)).toThrow();
+    let during: { head: string; branch: string } | undefined;
+    h.adapter.script = async function* ({ executionId }) {
+      during = {
+        head: git(worktreePath, "rev-parse", "HEAD"),
+        branch: git(worktreePath, "branch", "--show-current"),
+      };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "done" };
+    };
+
+    const { done } = await h.runner.resume({ executionId: s.executionId, prompt: "answer" });
+    await done;
+
+    expect(during).toEqual({ head: mainTip, branch });
+    expect(h.adapter.resumes[0]!.cwd).toBe(worktreePath);
+    const row = await execution(s.executionId);
+    expect(row.worktreeEvictedAt).toBeNull();
+    expect(row.branch).toBe(branch);
+    expect(row.state).toBe("COMPLETED");
+    const types = await eventTypes(s.executionId);
+    expect(types.lastIndexOf("worktree.prepared")).toBeLessThan(
+      types.indexOf("execution.resumed"),
+    );
+  });
+
+  it("rejects with a typed error and writes nothing when recreating the worktree fails with a git error", async () => {
+    const { s, h } = await evictedExecution({ committed: true });
+    await db.$client.unsafe(
+      "update repositories set git_url = $1 where id = (select repository_id from tasks where id = $2)",
+      [path.join(workRoot, "no-such-remote.git"), s.taskId],
+    );
     const before = await writeSnapshot(s.executionId);
 
     const err = await h.runner
@@ -1304,10 +1354,63 @@ describe("resume after eviction (§6.6, F3)", () => {
 
     expect(err).toBeInstanceOf(ResumeError);
     expect((err as ResumeError).code).toBe("WORKTREE_UNAVAILABLE");
+    expect((err as ResumeError).message).toMatch(/git fetch/);
     expect(await writeSnapshot(s.executionId)).toEqual(before);
     expect((await execution(s.executionId)).worktreeEvictedAt).not.toBeNull();
     expect(h.adapter.resumes).toHaveLength(0);
     expect(h.runner.isLive(s.executionId)).toBe(false);
+  });
+
+  it("recreates an evicted spec worktree with prepareSpec at work/<id> and resumes the spec session", async () => {
+    const s = await seedClaimed();
+    await useLocalRemote(s.taskId);
+    const h = makeRunner({ workerId: s.workerId, worktrees: manager });
+    const [spec] = await db
+      .insert(executions)
+      .values({
+        taskId: s.taskId,
+        role: "spec",
+        attempt: 1,
+        state: "WAITING_FOR_USER",
+        runtime: "claude",
+        model: "default",
+        host: HOST,
+        sessionId: "spec-ev",
+        worktreeEvictedAt: new Date(),
+      })
+      .returning({ id: executions.id });
+    const worktreePath = path.join(workspaceRoot, "work", spec!.id);
+    await db.$client.unsafe("update executions set worktree_path = $1 where id = $2", [
+      worktreePath,
+      spec!.id,
+    ]);
+    const mainTip = git(remote, "rev-parse", "refs/heads/main");
+    let during: { head: string; branch: string } | undefined;
+    h.adapter.script = async function* () {
+      during = {
+        head: git(worktreePath, "rev-parse", "HEAD"),
+        branch: git(worktreePath, "branch", "--show-current"),
+      };
+      yield { type: "turn_done", finalText: "draft" };
+    };
+
+    const { done } = await h.runner.resume({ executionId: spec!.id, prompt: "hi" });
+    await done;
+
+    expect(h.specPrepared.map((p) => p.executionId)).toEqual([spec!.id]);
+    expect(h.prepared.filter((p) => p.executionId === spec!.id)).toEqual([]);
+    // Detached at the default branch: no current branch.
+    expect(during).toEqual({ head: mainTip, branch: "" });
+    expect(h.adapter.resumes[0]!.cwd).toBe(worktreePath);
+    expect(h.adapter.resumes[0]!.allowedTools).toBe("spec");
+    const row = await execution(spec!.id);
+    expect(row.worktreeEvictedAt).toBeNull();
+    expect(row.worktreePath).toBe(worktreePath);
+    expect(row.branch).toBeNull();
+    expect(row.state).toBe("RUNNING");
+    const types = await eventTypes(spec!.id);
+    expect(types.indexOf("worktree.prepared")).toBeGreaterThanOrEqual(0);
+    expect(types.indexOf("worktree.prepared")).toBeLessThan(types.indexOf("execution.resumed"));
   });
 
   it("refuses a resume whose worktree the sweeper evicted after the context loaded", async () => {
