@@ -21,6 +21,7 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from "vitest";
 import { loadConfig } from "../src/config.js";
 import type { LogFields, Logger } from "../src/logger.js";
@@ -38,6 +39,7 @@ import {
   WorktreeManager,
   workingBranchName,
 } from "../src/worktrees/manager.js";
+import * as runModule from "../src/worktrees/run.js";
 import { sleep, startTestDb, type TestDb } from "./harness.js";
 
 /**
@@ -349,11 +351,17 @@ function recordingOps(
   return {
     removed,
     pushes,
-    async remove(executionId, options) {
-      hooks.onRemove?.(executionId);
-      const result = await target.remove(executionId, options);
-      if (result.tipMoved !== true) removed.push(executionId);
-      return result;
+    withRepositoryLock(repositoryName, fn) {
+      return target.withRepositoryLock(repositoryName, (repo) =>
+        fn({
+          async remove(executionId, options) {
+            hooks.onRemove?.(executionId);
+            const result = await repo.remove(executionId, options);
+            if (result.tipMoved !== true) removed.push(executionId);
+            return result;
+          },
+        }),
+      );
     },
     async pushIfAhead(input) {
       await hooks.onPush?.(input.branch);
@@ -886,6 +894,66 @@ describe("git network calls run outside the row locks (F2)", () => {
         fields: expect.objectContaining({ executionId: waiting.executionId }),
       }),
     );
+  });
+
+  it("round 2 F2: a sweeper waiting for the repository lock holds no task lock", async () => {
+    const failed = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "FAILED",
+      endedAt: at(-30 * HOUR),
+    });
+    // A fetch that stays pending until released holds the repository lock.
+    const realRunGit = runModule.runGit;
+    let entered!: () => void;
+    const inFetch = new Promise<void>((resolve) => (entered = resolve));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const spy = vi
+      .spyOn(runModule, "runGit")
+      .mockImplementation(async (cwd, args, options) => {
+        if (args[0] === "fetch") {
+          entered();
+          await gate;
+        }
+        return realRunGit(cwd, args, options);
+      });
+
+    try {
+      const holder = manager.pushIfAhead({
+        repositoryName: REPO_NAME,
+        branch: failed.branch,
+        defaultBranch: "main",
+      });
+      await inFetch;
+      const sweeping = sweep({ worktrees: manager });
+      // Long enough for the sweeper to list its candidates and reach the lock.
+      await sleep(500);
+      const moved = db.transaction(async (tx) => {
+        await lockTaskForTool(tx, failed.taskId);
+        await transition(tx, {
+          entity: "task",
+          id: failed.taskId,
+          trigger: "task.cancelled",
+          actor: { kind: "user" },
+        });
+      });
+      const outcome = await Promise.race([
+        moved.then(() => "moved" as const),
+        sleep(3_000).then(() => "blocked" as const),
+      ]);
+      release();
+      await holder;
+      await sweeping;
+      await moved;
+
+      expect(outcome).toBe("moved");
+      expect((await db.query.tasks.findFirst({
+        where: (t, { eq }) => eq(t.id, failed.taskId),
+      }))!.state).toBe("CANCELLED");
+    } finally {
+      release();
+      spy.mockRestore();
+    }
   });
 
   it("a push that exceeds the network timeout fails with a git error and keeps the worktree", async () => {

@@ -19,7 +19,7 @@ export const FINISHED_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const IDLE_EVICTION_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** The `WorktreeManager` methods the sweeper uses. */
-export type WorktreeOps = Pick<WorktreeManager, "remove" | "pushIfAhead">;
+export type WorktreeOps = Pick<WorktreeManager, "withRepositoryLock" | "pushIfAhead">;
 
 /** Percentage (0-100) of the filesystem holding `workspaceRoot` in use. */
 export type DiskUsage = (workspaceRoot: string) => Promise<number>;
@@ -78,6 +78,13 @@ const errMessage = (err: unknown): string =>
  * deletes the worktree and local branch, stamps `worktree_evicted_at`, and
  * appends `worktree.evicted`; the path and branch stay on the row for the
  * resume path. A candidate that fails is logged and the next one runs.
+ *
+ * Lock order for one candidate: the per-repository lock of the worktree
+ * manager, then the task row, then the execution row. The repository lock
+ * is in-process, so Postgres cannot see a wait on it; taking it before the
+ * row locks means the sweeper never holds a row while it waits behind a
+ * fetch or push on the same repository. The runner never calls the manager
+ * while holding a row lock, so the order is not inverted anywhere.
  */
 export async function sweepWorktrees(
   input: WorktreeSweepInput,
@@ -103,12 +110,13 @@ export async function sweepWorktrees(
 
   /**
    * Applies `action` to one candidate. An eviction pushes first, holding no
-   * row lock, so a slow remote never blocks a transition or a resume. Then,
-   * under the task and execution row locks, the rule is re-checked, the
-   * branch must be the one pushed and its local tip unchanged since the
-   * push (checked by `remove` under the repository lock), and only then is
-   * the worktree removed and the row written. Returns true when the
-   * worktree was removed. Never throws.
+   * lock across the call. Then, holding the repository lock, a transaction
+   * takes the task and execution row locks, re-checks the rule, requires
+   * the branch to be the one pushed and its local tip unchanged since the
+   * push, and only then removes the worktree and writes the row. A slow
+   * push or a fetch by another caller delays the sweeper but never a
+   * transition or a resume. Returns true when the worktree was removed.
+   * Never throws.
    */
   const apply = async (
     candidate: WorktreeCandidate,
@@ -149,42 +157,43 @@ export async function sweepWorktrees(
         expectedTip = push.tip;
       }
 
-      const outcome = await db.transaction(async (tx) => {
-        const row = await lockWorktreeCandidate(tx, {
-          host,
-          kind,
-          before,
-          executionId: candidate.executionId,
-          taskId: candidate.taskId,
-        });
-        if (!row) return "gone" as const;
-        if (row.branch !== candidate.branch || row.repositoryName !== repositoryName) {
-          return "gone" as const;
-        }
-
-        const removed = await worktrees.remove(row.executionId, {
-          repositoryName,
-          branch: row.branch,
-          ...(expectedTip !== undefined ? { expectedTip } : {}),
-        });
-        if (removed.tipMoved) return "tip_moved" as const;
-        if (action === "remove") {
-          await clearExecutionWorktree(tx, row.executionId);
-        } else {
-          await markWorktreeEvicted(tx, row.executionId, now);
-          await appendEvent(tx, {
-            taskId: row.taskId,
-            executionId: row.executionId,
-            type: "worktree.evicted",
-            payload: {
-              execution_id: row.executionId,
-              branch: row.branch,
-              pushed,
-            },
+      const outcome = await worktrees.withRepositoryLock(repositoryName, (repo) =>
+        db.transaction(async (tx) => {
+          const row = await lockWorktreeCandidate(tx, {
+            host,
+            kind,
+            before,
+            executionId: candidate.executionId,
+            taskId: candidate.taskId,
           });
-        }
-        return "done" as const;
-      });
+          if (!row) return "gone" as const;
+          if (row.branch !== candidate.branch || row.repositoryName !== repositoryName) {
+            return "gone" as const;
+          }
+
+          const removed = await repo.remove(row.executionId, {
+            branch: row.branch,
+            ...(expectedTip !== undefined ? { expectedTip } : {}),
+          });
+          if (removed.tipMoved) return "tip_moved" as const;
+          if (action === "remove") {
+            await clearExecutionWorktree(tx, row.executionId);
+          } else {
+            await markWorktreeEvicted(tx, row.executionId, now);
+            await appendEvent(tx, {
+              taskId: row.taskId,
+              executionId: row.executionId,
+              type: "worktree.evicted",
+              payload: {
+                execution_id: row.executionId,
+                branch: row.branch,
+                pushed,
+              },
+            });
+          }
+          return "done" as const;
+        }),
+      );
 
       if (outcome === "gone") return false;
       if (outcome === "tip_moved") {

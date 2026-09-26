@@ -388,6 +388,10 @@ function makeRunner(
         await fs.mkdir(worktreePath, { recursive: true });
         return { worktreePath, branch: null };
       },
+      async remove(executionId, removeOptions) {
+        if (options.worktrees) return options.worktrees.remove(executionId, removeOptions);
+        return { branchDeleted: false };
+      },
     },
     adapters: options.adapters ?? { claude: adapter },
     toolsUrl: () => TOOLS_URL,
@@ -1309,6 +1313,15 @@ describe("resume after eviction (§6.6, F3)", () => {
     expect(types.lastIndexOf("worktree.prepared")).toBeLessThan(
       types.indexOf("execution.resumed"),
     );
+    const prepared = (await eventsFor(s.executionId)).filter(
+      (e) => e.type === "worktree.prepared",
+    );
+    expect(prepared.at(-1)!.payload).toEqual({
+      worktree_path: worktreePath,
+      branch,
+      start_point: "remote_branch",
+    });
+    expect(records.filter((r) => r.level === "warn")).toEqual([]);
   });
 
   it("recreates a never-committed branch from origin/<default_branch> when origin lacks it, and resumes", async () => {
@@ -1338,6 +1351,60 @@ describe("resume after eviction (§6.6, F3)", () => {
     expect(types.lastIndexOf("worktree.prepared")).toBeLessThan(
       types.indexOf("execution.resumed"),
     );
+    const prepared = (await eventsFor(s.executionId)).filter(
+      (e) => e.type === "worktree.prepared",
+    );
+    expect(prepared.at(-1)!.payload).toEqual({
+      worktree_path: worktreePath,
+      branch,
+      start_point: "default_branch",
+    });
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        fields: expect.objectContaining({ branch, startPoint: "default_branch" }),
+      }),
+    );
+  });
+
+  it("round 2 F1: a recreation whose setup fails removes the worktree, so the next resume starts clean", async () => {
+    const { s, h, worktreePath, branch, head } = await evictedExecution({ committed: true });
+    const flag = path.join(workRoot, `setup-ok-${s.executionId}`);
+    await db.$client.unsafe(
+      "update repositories set setup_command = $1 where id = (select repository_id from tasks where id = $2)",
+      [`test -f '${flag}' || exit 7`, s.taskId],
+    );
+    const before = await writeSnapshot(s.executionId);
+
+    const err = await h.runner
+      .resume({ executionId: s.executionId, prompt: "answer" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResumeError);
+    expect((err as ResumeError).code).toBe("WORKTREE_UNAVAILABLE");
+    expect((err as ResumeError).message).toMatch(/exit/);
+    expect(await writeSnapshot(s.executionId)).toEqual(before);
+    expect(await fs.stat(worktreePath).then(() => true, () => false)).toBe(false);
+    expect(h.runner.isLive(s.executionId)).toBe(false);
+
+    await fs.writeFile(flag, "");
+    let during: { head: string; branch: string } | undefined;
+    h.adapter.script = async function* ({ executionId }) {
+      during = {
+        head: git(worktreePath, "rev-parse", "HEAD"),
+        branch: git(worktreePath, "branch", "--show-current"),
+      };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "done" };
+    };
+
+    const { done } = await h.runner.resume({ executionId: s.executionId, prompt: "answer" });
+    await done;
+
+    expect(during).toEqual({ head, branch });
+    const row = await execution(s.executionId);
+    expect(row.worktreeEvictedAt).toBeNull();
+    expect(row.state).toBe("COMPLETED");
   });
 
   it("rejects with a typed error and writes nothing when recreating the worktree fails with a git error", async () => {

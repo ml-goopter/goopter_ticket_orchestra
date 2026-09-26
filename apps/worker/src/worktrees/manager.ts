@@ -23,7 +23,8 @@ import { runGit, runShell } from "./run.js";
  * worktrees have checked out.
  *
  * A failed prepare leaves whatever it created in place. The worktree sweeper
- * (design.md §6.6) removes it with the failed execution.
+ * (design.md §6.6) removes it with the failed execution. A later prepare of
+ * the same execution (resume after eviction) clears it before adding.
  */
 
 /** Fields of a `repositories` row the manager needs (design.md §4.2). */
@@ -65,10 +66,18 @@ export interface PrepareSpecInput {
   repository: WorktreeRepository;
 }
 
+/**
+ * Where `prepareImplementation` started the working branch:
+ * `origin/<branch>` or `origin/<default_branch>`.
+ */
+export type StartPoint = "remote_branch" | "default_branch";
+
 export interface PreparedWorktree {
   worktreePath: string;
   /** Working branch, `null` for a detached spec worktree. */
   branch: string | null;
+  /** Set by `prepareImplementation`; absent for a spec worktree. */
+  startPoint?: StartPoint;
 }
 
 export interface RemoveOptions {
@@ -90,6 +99,15 @@ export interface RemoveResult {
   branchDeleted: boolean;
   /** Set when `expectedTip` did not match: nothing was removed. */
   tipMoved?: true;
+}
+
+/** What `withRepositoryLock` hands its callback. */
+export interface LockedRepository {
+  /** `remove` on the locked repository, without taking the lock again. */
+  remove(
+    executionId: string,
+    options: Omit<RemoveOptions, "repositoryName">,
+  ): Promise<RemoveResult>;
 }
 
 export interface PushIfAheadInput {
@@ -275,6 +293,9 @@ export class WorktreeManager {
    * worktree's agent process is still running. Calling this while an
    * earlier session for the same task is still live races that session.
    *
+   * A `work/<executionId>` left by an earlier failed prepare of the same
+   * execution is deleted, and its git record pruned, before the add.
+   *
    * Throws `GitCommandError` for a git failure and `SetupFailedError` when
    * the setup command exits non-zero.
    */
@@ -287,7 +308,7 @@ export class WorktreeManager {
     const barePath = this.barePath(repository);
     const remoteBranch = `refs/remotes/origin/${branch}`;
 
-    await withRepoLock(barePath, async () => {
+    const fromRemote = await withRepoLock(barePath, async () => {
       await this.fetch(barePath, repository.gitUrl);
       const fromRemote =
         input.resumeFromRemote === true &&
@@ -296,7 +317,7 @@ export class WorktreeManager {
       const startPoint = fromRemote
         ? remoteBranch
         : `refs/remotes/origin/${repository.defaultBranch}`;
-      await runGit(barePath, ["worktree", "prune"]);
+      await this.clearStale(barePath, worktreePath);
       await this.releaseBranch(barePath, branch);
       await fs.mkdir(path.dirname(worktreePath), { recursive: true });
       // `-B` creates or resets the branch, so a leftover local branch of the
@@ -312,6 +333,7 @@ export class WorktreeManager {
         startPoint,
       ]);
       await this.excludeContextDir(worktreePath);
+      return fromRemote;
     });
 
     const setupCommand = repository.setupCommand?.trim();
@@ -342,12 +364,17 @@ export class WorktreeManager {
     await fs.mkdir(path.dirname(contextFile), { recursive: true });
     await fs.writeFile(contextFile, `${JSON.stringify(context, null, 2)}\n`);
 
-    return { worktreePath, branch };
+    return {
+      worktreePath,
+      branch,
+      startPoint: fromRemote ? "remote_branch" : "default_branch",
+    };
   }
 
   /**
    * Spec worktree (design.md §9.1): detached at `origin/<default_branch>`,
-   * no setup command, no context file.
+   * no setup command, no context file. Clears a stale `work/<executionId>`
+   * first, as `prepareImplementation` does.
    */
   async prepareSpec(input: PrepareSpecInput): Promise<PreparedWorktree> {
     const { executionId, repository } = input;
@@ -356,7 +383,7 @@ export class WorktreeManager {
 
     await withRepoLock(barePath, async () => {
       await this.fetch(barePath, repository.gitUrl);
-      await runGit(barePath, ["worktree", "prune"]);
+      await this.clearStale(barePath, worktreePath);
       await fs.mkdir(path.dirname(worktreePath), { recursive: true });
       await runGit(barePath, [
         "worktree",
@@ -387,43 +414,71 @@ export class WorktreeManager {
     executionId: string,
     options: RemoveOptions,
   ): Promise<RemoveResult> {
+    const barePath = this.barePathByName(options.repositoryName);
+    return withRepoLock(barePath, () =>
+      this.removeLocked(barePath, executionId, options),
+    );
+  }
+
+  /**
+   * Runs `fn` holding the per-repository lock that `prepareImplementation`,
+   * `prepareSpec`, `remove` and `pushIfAhead` take. `fn` gets a `remove`
+   * that runs under this lock. Calling any of those four manager methods on
+   * the same repository from inside `fn` waits on the lock `fn` holds and
+   * never returns.
+   *
+   * The worktree sweeper takes this lock before it opens the transaction
+   * that locks the task and execution rows, so it never waits for the lock
+   * while holding those rows.
+   */
+  async withRepositoryLock<T>(
+    repositoryName: string,
+    fn: (repository: LockedRepository) => Promise<T>,
+  ): Promise<T> {
+    const barePath = this.barePathByName(repositoryName);
+    return withRepoLock(barePath, () =>
+      fn({
+        remove: (executionId, options) =>
+          this.removeLocked(barePath, executionId, { ...options, repositoryName }),
+      }),
+    );
+  }
+
+  /** `remove`'s body. The caller holds the lock on `barePath`. */
+  private async removeLocked(
+    barePath: string,
+    executionId: string,
+    options: RemoveOptions,
+  ): Promise<RemoveResult> {
     const worktreePath = this.worktreePath(executionId);
-    assertSafe(options.repositoryName, SAFE_SEGMENT, "repository name");
     const branch = options.branch ?? null;
     if (branch !== null) assertSafe(branch, SAFE_BRANCH, "branch");
     if (options.expectedTip !== undefined && branch === null) {
       throw new Error("expectedTip needs a branch");
     }
-    const barePath = path.join(
-      this.workspaceRoot,
-      "repos",
-      `${options.repositoryName}.git`,
-    );
 
-    return withRepoLock(barePath, async () => {
-      if (options.expectedTip !== undefined) {
-        const current = (await exists(barePath))
-          ? await refTip(barePath, `refs/heads/${branch}`)
-          : null;
-        if (current !== options.expectedTip) {
-          return { branchDeleted: false, tipMoved: true };
-        }
+    if (options.expectedTip !== undefined) {
+      const current = (await exists(barePath))
+        ? await refTip(barePath, `refs/heads/${branch}`)
+        : null;
+      if (current !== options.expectedTip) {
+        return { branchDeleted: false, tipMoved: true };
       }
-      await fs.rm(worktreePath, { recursive: true, force: true });
-      if (!(await exists(barePath))) return { branchDeleted: false };
-      await runGit(barePath, ["worktree", "prune"]);
-      if (branch === null) return { branchDeleted: false };
+    }
+    await fs.rm(worktreePath, { recursive: true, force: true });
+    if (!(await exists(barePath))) return { branchDeleted: false };
+    await runGit(barePath, ["worktree", "prune"]);
+    if (branch === null) return { branchDeleted: false };
 
-      const ref = `refs/heads/${branch}`;
-      const worktrees = await listWorktrees(barePath);
-      if (worktrees.some((w) => w.branch === ref)) {
-        return { branchDeleted: false };
-      }
-      const refs = await runGit(barePath, ["for-each-ref", "--format=%(refname)", ref]);
-      if (refs.trim() !== ref) return { branchDeleted: false };
-      await runGit(barePath, ["branch", "-D", branch]);
-      return { branchDeleted: true };
-    });
+    const ref = `refs/heads/${branch}`;
+    const worktrees = await listWorktrees(barePath);
+    if (worktrees.some((w) => w.branch === ref)) {
+      return { branchDeleted: false };
+    }
+    const refs = await runGit(barePath, ["for-each-ref", "--format=%(refname)", ref]);
+    if (refs.trim() !== ref) return { branchDeleted: false };
+    await runGit(barePath, ["branch", "-D", branch]);
+    return { branchDeleted: true };
   }
 
   /**
@@ -494,11 +549,25 @@ export class WorktreeManager {
   }
 
   private barePath(repository: WorktreeRepository): string {
-    assertSafe(repository.name, SAFE_SEGMENT, "repository name");
     if (repository.gitUrl.startsWith("-")) {
       throw new Error(`invalid git url: ${JSON.stringify(repository.gitUrl)}`);
     }
-    return path.join(this.workspaceRoot, "repos", `${repository.name}.git`);
+    return this.barePathByName(repository.name);
+  }
+
+  private barePathByName(repositoryName: string): string {
+    assertSafe(repositoryName, SAFE_SEGMENT, "repository name");
+    return path.join(this.workspaceRoot, "repos", `${repositoryName}.git`);
+  }
+
+  /**
+   * Deletes `worktreePath` and prunes git's record of it, so a `worktree
+   * add` at that path does not fail with "already exists". Called under the
+   * repository lock.
+   */
+  private async clearStale(barePath: string, worktreePath: string): Promise<void> {
+    await fs.rm(worktreePath, { recursive: true, force: true });
+    await runGit(barePath, ["worktree", "prune"]);
   }
 
   /**

@@ -51,6 +51,8 @@ import {
   type PrepareImplementationInput,
   type PrepareSpecInput,
   type PreparedWorktree,
+  type RemoveOptions,
+  type RemoveResult,
 } from "../worktrees/index.js";
 
 /**
@@ -115,6 +117,8 @@ export interface RunnerDeps {
     ): Promise<PreparedWorktree>;
     /** Resume of an evicted spec execution recreates its worktree (§6.6). */
     prepareSpec(input: PrepareSpecInput): Promise<PreparedWorktree>;
+    /** Resume removes a worktree whose recreation failed part way (§6.6). */
+    remove(executionId: string, options: RemoveOptions): Promise<RemoveResult>;
   };
   /** One adapter per runtime (§7.3). A missing runtime fails the execution. */
   adapters: Partial<Record<Runtime, AgentAdapter>>;
@@ -906,14 +910,17 @@ export function createRunner(deps: RunnerDeps): Runner {
    * `origin/<default_branch>` (§9.1); an implementation worktree from
    * `origin/<branch>`, or from `origin/<default_branch>` on the same branch
    * name when the remote lacks it (the sweeper pushes a branch that is
-   * ahead, so nothing was left to push). Then records the path, clears
-   * `worktree_evicted_at` and appends `worktree.prepared`. Returns the
-   * worktree path. Any failure before the write refuses with
-   * `WORKTREE_UNAVAILABLE` and writes nothing.
+   * ahead, so nothing was left to push); that fallback is logged as a
+   * warning. Then records the path, clears `worktree_evicted_at` and appends
+   * `worktree.prepared` with `start_point` for an implementation worktree.
+   * Returns the worktree path. Any failure before the write removes what the
+   * recreation left at `work/<executionId>`, so the next resume starts
+   * clean, then refuses with `WORKTREE_UNAVAILABLE` and writes nothing.
    */
   async function restoreEvictedWorktree(
     ctx: RunnerContext,
     refuse: (code: ResumeErrorCode, message: string) => never,
+    log: Logger,
   ): Promise<string> {
     let prepared: PreparedWorktree;
     try {
@@ -961,9 +968,30 @@ export function createRunner(deps: RunnerDeps): Runner {
         });
       }
     } catch (err) {
+      if (ctx.repository) {
+        // The row keeps `worktree_evicted_at`; the local branch goes too,
+        // as eviction left it.
+        try {
+          await deps.worktrees.remove(ctx.execution.id, {
+            repositoryName: ctx.repository.name,
+            branch: ctx.execution.role === "implementation" ? ctx.execution.branch : null,
+          });
+        } catch (removeErr) {
+          log.warn(
+            { err: errMessage(removeErr) },
+            "could not remove the worktree of a failed recreation",
+          );
+        }
+      }
       return refuse(
         "WORKTREE_UNAVAILABLE",
         `evicted worktree could not be recreated: ${setupDetail(err)}`,
+      );
+    }
+    if (prepared.startPoint === "default_branch") {
+      log.warn(
+        { branch: prepared.branch, startPoint: prepared.startPoint },
+        "remote branch missing, evicted worktree recreated from the default branch",
       );
     }
     await db.transaction(async (tx) => {
@@ -973,7 +1001,11 @@ export function createRunner(deps: RunnerDeps): Runner {
         taskId: ctx.task.id,
         executionId: ctx.execution.id,
         type: "worktree.prepared",
-        payload: { worktree_path: prepared.worktreePath, branch: prepared.branch },
+        payload: {
+          worktree_path: prepared.worktreePath,
+          branch: prepared.branch,
+          ...(prepared.startPoint ? { start_point: prepared.startPoint } : {}),
+        },
       });
     });
     return prepared.worktreePath;
@@ -1014,7 +1046,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       if (!found) return refuse("NO_ADAPTER", `${execution.runtime} adapter not available`);
       adapter = found;
       if (execution.worktreeEvictedAt !== null) {
-        worktreePath = await restoreEvictedWorktree(ctx, refuse);
+        worktreePath = await restoreEvictedWorktree(ctx, refuse, log);
       }
       if (!(await adapter.canResume(sessionId, worktreePath))) {
         refuse("CANNOT_RESUME", "session cannot be resumed");

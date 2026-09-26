@@ -172,6 +172,7 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
     expect(result).toEqual({
       worktreePath: path.join(workspaceRoot, "work", "exec-1"),
       branch: BRANCH,
+      startPoint: "default_branch",
     });
     expect(git(bareClonePath(), "rev-parse", "--is-bare-repository")).toBe(
       "true",
@@ -300,6 +301,7 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
     );
 
     expect(result.branch).toBe(BRANCH);
+    expect(result.startPoint).toBe("default_branch");
     expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(remoteTip("main"));
     expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
   });
@@ -312,6 +314,7 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
       implInput("exec-1", { resumeFromRemote: true, fallbackToDefaultBranch: true }),
     );
 
+    expect(result.startPoint).toBe("remote_branch");
     expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(pushed);
     expect(git(result.worktreePath, "branch", "--show-current")).toBe(BRANCH);
   });
@@ -374,6 +377,25 @@ describe("WorktreeManager.prepareImplementation (design.md §9.1)", () => {
 
     expect(git(fresh.worktreePath, "branch", "--show-current")).toBe(BRANCH);
     expect(worktreeRecords()).not.toContain(stale.worktreePath);
+  });
+
+  it("round 2 F1: clears a work/<id> a failed prepare of the same execution left, directory and record", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const failing = { ...repository, setupCommand: "touch leftover.txt; exit 3" };
+    await expect(
+      manager.prepareImplementation(implInput("exec-1", { repository: failing })),
+    ).rejects.toBeInstanceOf(SetupFailedError);
+    const worktreePath = path.join(workspaceRoot, "work", "exec-1");
+    expect(existsSync(path.join(worktreePath, "leftover.txt"))).toBe(true);
+    expect(worktreeRecords()).toContain(worktreePath);
+
+    const result = await manager.prepareImplementation(
+      implInput("exec-1", { resumeFromRemote: true, fallbackToDefaultBranch: true }),
+    );
+
+    expect(result.worktreePath).toBe(worktreePath);
+    expect(existsSync(path.join(worktreePath, "leftover.txt"))).toBe(false);
+    expect(git(worktreePath, "branch", "--show-current")).toBe(BRANCH);
   });
 
   it("A7: a passing setup command runs exactly once with the worktree as cwd", async () => {
@@ -569,6 +591,18 @@ describe("WorktreeManager.prepareSpec (design.md §9.1)", () => {
     expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(remoteTip("main"));
     expect(existsSync(path.join(result.worktreePath, EXECUTION_CONTEXT_PATH))).toBe(false);
     expect(existsSync(path.join(result.worktreePath, ".setup-ran"))).toBe(false);
+  });
+
+  it("round 2 F1: clears a stale work/<id> of the same execution before adding", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const stale = await manager.prepareSpec({ executionId: "spec-1", repository });
+    writeFileSyncIn(stale.worktreePath, "leftover.txt", "stale");
+
+    const result = await manager.prepareSpec({ executionId: "spec-1", repository });
+
+    expect(result.worktreePath).toBe(stale.worktreePath);
+    expect(existsSync(path.join(result.worktreePath, "leftover.txt"))).toBe(false);
+    expect(git(result.worktreePath, "rev-parse", "HEAD")).toBe(remoteTip("main"));
   });
 });
 
@@ -883,6 +917,48 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
     await expect(manager.pushIfAhead(pushInput())).resolves.toMatchObject({
       pushed: true,
     });
+  });
+
+  it("round 2 F3: the timeout kills git's whole process group, not only git", async () => {
+    const manager = new WorktreeManager({ workspaceRoot, networkTimeoutMs: 1_500 });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    const pidFile = path.join(tmp, "hook-child.pid");
+    // The hook's child records its pid, then sleeps past the timeout.
+    const hook = path.join(remote, "hooks", "pre-receive");
+    await fs.writeFile(
+      hook,
+      `#!/bin/sh\nsh -c 'echo $$ > "$1"; exec sleep 30' sh "${pidFile}" &\nwait\n`,
+      { mode: 0o755 },
+    );
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
+        throw err;
+      }
+    };
+
+    let pid: number | undefined;
+    try {
+      const err = await manager.pushIfAhead(pushInput()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GitCommandError);
+      expect((err as GitCommandError).message).toMatch(/timed out after 1500 ms/);
+      pid = Number((await fs.readFile(pidFile, "utf8")).trim());
+      expect(pid).toBeGreaterThan(0);
+
+      // A killed child is reaped shortly after; a surviving one sleeps 30 s.
+      const deadline = Date.now() + 3_000;
+      while (alive(pid) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(alive(pid)).toBe(false);
+    } finally {
+      await fs.rm(hook, { force: true });
+      if (pid !== undefined && alive(pid)) process.kill(pid, "SIGKILL");
+    }
   });
 
   it("F2: a fetch that exceeds networkTimeoutMs fails with GitCommandError", async () => {
