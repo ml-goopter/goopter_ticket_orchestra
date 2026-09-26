@@ -173,10 +173,10 @@ async function main(): Promise<void> {
   // design.md §11.2: CI feedback resumes the same execution (GOT.39).
   registerCiFailureHandler(commands, runner);
   // design.md §12.3, D8: spec sessions start and chat by command (GOT.37).
-  // A send_message on an implementation execution is the issue
-  // conversation (§9.3, GOT.47).
+  // A send_message on an issue is the issue conversation (§9.3, GOT.47),
+  // on an implementation or a spec execution (C54).
   registerSpecHandlers(commands, runner, {
-    implementationSendMessage: createIssueMessageHandler(runner),
+    issueSendMessage: createIssueMessageHandler(runner),
   });
   // design.md §10.3, §10.4: issue resolution resumes the execution (GOT.47).
   registerIssueHandlers(commands, runner);

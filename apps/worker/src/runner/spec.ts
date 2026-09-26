@@ -124,12 +124,19 @@ async function createSpecExecution(
 
 export interface SpecHandlerOptions {
   /**
-   * GOT.47: handles a `send_message` whose execution is not a spec
-   * execution (the issue conversation, §9.3). Without it such a command is
-   * skipped.
+   * GOT.47: handles a `send_message` on an issue (§9.3, §10.2): every one
+   * on an implementation execution, and one whose payload names an
+   * `issue_id` on a spec execution (C54), which a blocking `raise_issue` left
+   * in WAITING_FOR_USER. Without it such a command is skipped.
    */
-  implementationSendMessage?: CommandHandler;
+  issueSendMessage?: CommandHandler;
 }
+
+/** An issue message (`/issues/:id/messages`) rather than a spec chat turn. */
+const isIssueMessage = (payload: unknown): boolean =>
+  typeof payload === "object" &&
+  payload !== null &&
+  typeof (payload as { issue_id?: unknown }).issue_id === "string";
 
 export function registerSpecHandlers(
   handlers: CommandHandlers,
@@ -165,11 +172,12 @@ export function registerSpecHandlers(
     }
     const loaded = await loadRunnerContext(ctx.db, executionId);
     if (!loaded) return { outcome: "skipped", reason: "execution not found" };
-    // Issue conversation on an implementation execution (GOT.47).
+    // Issue conversation (GOT.47): any message on an implementation
+    // execution, an issue message on a spec execution (C54).
+    if (loaded.execution.role !== "spec" || isIssueMessage(command.payload)) {
+      if (options.issueSendMessage) return options.issueSendMessage(command, ctx);
+    }
     if (loaded.execution.role !== "spec") {
-      if (options.implementationSendMessage) {
-        return options.implementationSendMessage(command, ctx);
-      }
       return { outcome: "skipped", reason: "not a spec execution" };
     }
     const parsed = SendMessagePayloadSchema.safeParse(command.payload);

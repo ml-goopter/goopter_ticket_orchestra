@@ -386,6 +386,22 @@ export class WorktreeManager {
   }
 
   /**
+   * Rewrites `.orchestra/context.json` in an existing worktree at its
+   * recorded path (C33), in the format `prepareImplementation` writes:
+   * `resume_with_revision` moves the execution to a newly approved revision,
+   * and `orchestra-review` reads the spec from this file (§9.8, GOT.47 C53).
+   * Throws when `context` is invalid or the path is not a recorded worktree
+   * path.
+   */
+  async writeContext(worktreePath: string, context: ExecutionContext): Promise<void> {
+    const target = this.recordedWorktreePath(worktreePath);
+    const parsed = ExecutionContextSchema.parse(context);
+    const contextFile = path.join(target, EXECUTION_CONTEXT_PATH);
+    await fs.mkdir(path.dirname(contextFile), { recursive: true });
+    await fs.writeFile(contextFile, `${JSON.stringify(parsed, null, 2)}\n`);
+  }
+
+  /**
    * Spec worktree (design.md §9.1): detached at `origin/<default_branch>`,
    * no setup command, no context file. Clears a stale `work/<executionId>`
    * first, as `prepareImplementation` does.

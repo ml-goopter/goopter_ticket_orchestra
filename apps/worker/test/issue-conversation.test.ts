@@ -43,11 +43,13 @@ import {
   createRunner,
   registerIssueHandlers,
   registerSpecHandlers,
+  specMessagePrompt,
   type CommandHandlers,
   type Runner,
   type RunnerDeps,
 } from "../src/runner/index.js";
 import type { TickContext } from "../src/tick.js";
+import { WorktreeManager } from "../src/worktrees/index.js";
 import { startTestDb, waitFor, type TestDb } from "./harness.js";
 
 /**
@@ -136,9 +138,16 @@ interface Seeded {
  * the approved revision 1 and the OPEN blocking issue.
  */
 async function seedWaiting(
-  options: { host?: string | null; sessionId?: string | null; worktree?: "present" | "missing" | "none" } = {},
+  options: {
+    host?: string | null;
+    sessionId?: string | null;
+    worktree?: "present" | "missing" | "none";
+    role?: "implementation" | "spec";
+    state?: ExecutionState;
+  } = {},
 ): Promise<Seeded> {
   const n = ++seq;
+  const spec = options.role === "spec";
   const [worker] = await db
     .insert(agentWorkers)
     .values({ host: HOST, capabilities: [], maxConcurrent: 4, workspaceRoot: workRoot })
@@ -177,7 +186,7 @@ async function seedWaiting(
       jiraPriority: 1,
       jiraCreatedAt: NOW,
       jiraSyncedAt: NOW,
-      state: "IMPLEMENTING",
+      state: spec ? "SPEC_IN_PROGRESS" : "IMPLEMENTING",
     })
     .returning({ id: tasks.id });
   const [revision] = await db
@@ -189,7 +198,8 @@ async function seedWaiting(
     revision!.id,
   ]);
 
-  const worktreePath = path.join(workRoot, `work-${n}`);
+  // `<workspace root>/work/<segment>`, the path the worktree manager records.
+  const worktreePath = path.join(workRoot, "work", `exec-${n}`);
   const worktree = options.worktree ?? "present";
   if (worktree === "present") await fs.mkdir(worktreePath, { recursive: true });
   const host = options.host === undefined ? HOST : options.host;
@@ -198,21 +208,21 @@ async function seedWaiting(
     .insert(executions)
     .values({
       taskId: task!.id,
-      role: "implementation",
+      role: spec ? "spec" : "implementation",
       attempt: 1,
-      state: "WAITING_FOR_USER",
+      state: options.state ?? "WAITING_FOR_USER",
       runtime: "claude",
       model: "default",
-      specRevisionId: revision!.id,
+      specRevisionId: spec ? null : revision!.id,
       workerId: host === HOST ? worker!.id : host === OTHER_HOST ? other!.id : null,
       host,
       worktreePath: worktree === "none" ? null : worktreePath,
-      branch,
+      branch: spec ? null : branch,
       sessionId: options.sessionId === undefined ? `sess-${n}` : options.sessionId,
       startedAt: NOW,
     })
     .returning({ id: executions.id });
-  await db.insert(taskLeases).values({
+  if (!spec) await db.insert(taskLeases).values({
     taskId: task!.id,
     executionId: execution!.id,
     workerId: worker!.id,
@@ -381,6 +391,9 @@ function makeRunner(
       },
       prepareSpec: () => Promise.reject(new Error("not expected")),
       remove: async () => ({ branchDeleted: false }),
+      // The real writer (C53), against the recorded path.
+      writeContext: (worktreePath, context) =>
+        new WorktreeManager({ workspaceRoot: workRoot }).writeContext(worktreePath, context),
     },
     adapters: { claude: adapter },
     toolsUrl: () => "http://127.0.0.1:4999/mcp",
@@ -395,7 +408,7 @@ function makeRunner(
 function handlersFor(runner: Runner): CommandHandlers {
   const handlers = createCommandHandlers();
   registerSpecHandlers(handlers, runner, {
-    implementationSendMessage: createIssueMessageHandler(runner),
+    issueSendMessage: createIssueMessageHandler(runner),
   });
   registerIssueHandlers(handlers, runner);
   return handlers;
@@ -625,7 +638,150 @@ describe("resume_with_revision (design.md §9.2, §10.4, AC3)", () => {
       spec_revision_id: v2!.id,
     });
   });
+
+  it("C53: rewrites .orchestra/context.json with the new revision before the adapter runs", async () => {
+    const s = await seedWaiting();
+    const contextFile = path.join(s.worktreePath, ".orchestra", "context.json");
+    await fs.mkdir(path.dirname(contextFile), { recursive: true });
+    await fs.writeFile(contextFile, JSON.stringify({ spec: { version: 1, content: SPEC_V1 } }));
+    await db.$client.unsafe("update specification_revisions set status = 'superseded' where id = $1", [s.revisionId]);
+    const [v2] = await db
+      .insert(specificationRevisions)
+      .values({ taskId: s.taskId, version: 2, status: "approved", content: SPEC_V2 })
+      .returning({ id: specificationRevisions.id });
+    await db.$client.unsafe("update tasks set approved_revision_id = $2 where id = $1", [s.taskId, v2!.id]);
+    const adapter = new FakeAdapter();
+    const runner = makeRunner(HOST, s.workerId, adapter);
+    let seenByAgent: unknown;
+    adapter.script = async function* () {
+      seenByAgent = JSON.parse(await fs.readFile(contextFile, "utf8"));
+      await completeExecution(s.executionId);
+      yield { type: "turn_done", finalText: "reconciled" };
+    };
+    await enqueue(s, "resume_with_revision", { revision_id: v2!.id });
+
+    await consume(HOST, s.workerId, runner);
+    await turnEnded(runner, s.executionId);
+
+    const expected = {
+      task: { id: s.taskId, jira_key: s.jiraKey, jira_summary: `receipt language ${s.n}` },
+      spec: { version: 2, content: SPEC_V2 },
+      decisions: [],
+      repository: { name: "repo", default_branch: "main", branch: s.branch },
+      runtime: "claude",
+      review_command: "pnpm test",
+    };
+    expect(seenByAgent).toEqual(expected);
+    expect(JSON.parse(await fs.readFile(contextFile, "utf8"))).toEqual(expected);
+  });
 });
+
+describe("issues on a spec execution (C54)", () => {
+  it("send_message on an issue of a WAITING_FOR_USER spec execution stores the reply and returns to WAITING_FOR_USER", async () => {
+    const s = await seedWaiting({ role: "spec" });
+    const adapter = new FakeAdapter();
+    const runner = makeRunner(HOST, s.workerId, adapter);
+    let during: ExecutionState | undefined;
+    adapter.script = async function* () {
+      during = (await execution(s.executionId)).state;
+      yield { type: "text", delta: "Store language, per the ticket." };
+      yield { type: "turn_done", finalText: "Store language, per the ticket." };
+    };
+    const id = await enqueue(s, "send_message", { issue_id: s.issueId, text: "which one?" });
+
+    await consume(HOST, s.workerId, runner);
+    expect((await command(id)).completedAt).not.toBeNull();
+    await turnEnded(runner, s.executionId);
+
+    expect(during).toBe("RUNNING");
+    expect(adapter.resumes).toHaveLength(1);
+    const req = adapter.resumes[0]!;
+    expect(req.allowedTools).toBe("spec");
+    expect(req.sessionId).toBe(`sess-${s.n}`);
+    expect(req.prompt).toBe(issueHeader(s.issueId, `user${s.n}@example.com`, "which one?"));
+    expect((await execution(s.executionId)).state).toBe("WAITING_FOR_USER");
+    expect((await agentMessages(s.issueId)).map((m) => m.body)).toEqual([
+      "Store language, per the ticket.",
+    ]);
+    const [resumed] = await eventsOf(s.taskId, "execution.resumed");
+    expect(resumed!.payload).toMatchObject({ command: "send_message", issue_id: s.issueId });
+  });
+
+  it("resume_with_decision moves a WAITING_FOR_USER spec execution to RUNNING, where it stays between turns", async () => {
+    const s = await seedWaiting({ role: "spec" });
+    const adapter = new FakeAdapter();
+    const runner = makeRunner(HOST, s.workerId, adapter);
+    let during: ExecutionState | undefined;
+    adapter.script = async function* () {
+      during = (await execution(s.executionId)).state;
+      yield { type: "text", delta: "Noted, updating the draft." };
+      yield { type: "turn_done", finalText: "Noted, updating the draft." };
+    };
+    const decisionId = await resolveAsClarification(s, s.issueId, {
+      decision: "Use the store language.",
+      chosenOption: "store",
+    });
+    const id = await enqueue(s, "resume_with_decision", { issue_id: s.issueId, decision_id: decisionId });
+
+    await consume(HOST, s.workerId, runner);
+    expect((await command(id)).completedAt).not.toBeNull();
+    await turnEnded(runner, s.executionId);
+
+    expect(during).toBe("RUNNING");
+    expect(adapter.starts).toHaveLength(0);
+    const req = adapter.resumes[0]!;
+    expect(req.allowedTools).toBe("spec");
+    expect(req.prompt.startsWith(`## Answer to your issue ${s.issueId}`)).toBe(true);
+    expect(req.prompt).toContain("Decision: Use the store language.");
+    expect(req.prompt).toContain("Chosen option: store");
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("RUNNING");
+    expect(row.endReason).toBeNull();
+    expect(await eventsOf(s.taskId, "execution.failed")).toEqual([]);
+    const [resumed] = await eventsOf(s.taskId, "execution.resumed");
+    expect(resumed!.payload).toMatchObject({ command: "resume_with_decision", issue_id: s.issueId });
+  });
+
+  it("a chat send_message on a RUNNING spec execution still takes the spec chat path", async () => {
+    const s = await seedWaiting({ role: "spec", state: "RUNNING" });
+    const adapter = new FakeAdapter();
+    const runner = makeRunner(HOST, s.workerId, adapter);
+    adapter.script = replyScript("Here is a draft.");
+    const id = await enqueue(s, "send_message", { text: "draft it please" });
+
+    await consume(HOST, s.workerId, runner);
+    expect((await command(id)).completedAt).not.toBeNull();
+    await turnEnded(runner, s.executionId);
+
+    expect(adapter.resumes).toHaveLength(1);
+    expect(adapter.resumes[0]!.prompt).toBe(specMessagePrompt("draft it please"));
+    expect((await execution(s.executionId)).state).toBe("RUNNING");
+    expect(await agentMessages(s.issueId)).toEqual([]);
+    // In place: no transition, so no execution.resumed.
+    expect(await eventsOf(s.taskId, "execution.resumed")).toEqual([]);
+  });
+
+  it("skips an issue command on an unpinned spec execution at error, since it has no fallback", async () => {
+    const s = await seedWaiting({ role: "spec", host: null });
+    const adapter = new FakeAdapter();
+    const runner = makeRunner(HOST, s.workerId, adapter);
+    const id = await enqueue(s, "send_message", { issue_id: s.issueId, text: "hello" });
+
+    await consume(HOST, s.workerId, runner);
+
+    const row = await command(id);
+    expect(row.completedAt).not.toBeNull();
+    expect(adapter.resumes).toHaveLength(0);
+    expect(adapter.starts).toHaveLength(0);
+    expect((await execution(s.executionId)).host).toBeNull();
+    expect(records.some((r) => r.level === "error" && r.msg.includes("unpinned"))).toBe(true);
+  });
+});
+
+/** The implementation path's `## Message from the user` header (§9.2). */
+function issueHeader(issueId: string, author: string, text: string): string {
+  return `## Message from the user\nIssue ${issueId}:\n- ${author}: ${text}`;
+}
 
 describe("fresh-session fallback (C21, D5, §6.1, AC4)", () => {
   it("pins a released execution (host null) here and starts a fresh session with the full prompt and the header", async () => {

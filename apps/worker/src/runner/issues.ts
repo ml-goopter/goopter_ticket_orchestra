@@ -1,4 +1,4 @@
-import { SpecContentSchema, type SpecContent } from "@orchestra/core";
+import { SpecContentSchema, type ExecutionRole, type SpecContent } from "@orchestra/core";
 import {
   appendEvent,
   findUserById,
@@ -29,21 +29,26 @@ import { ResumeError, type ResumeInput, type Runner } from "./runner.js";
  * GOT.47: the issue conversation and the issue resume commands (design.md
  * §9.2, §9.3, §10.2-§10.4).
  *
- * - `send_message` on an implementation execution in WAITING_FOR_USER
- *   (`{ issue_id, text }`, §10.2): resumes with the `## Message from the
+ * - `send_message` on an issue (`{ issue_id, text }`, §10.2) of an
+ *   execution in WAITING_FOR_USER: resumes with the `## Message from the
  *   user` header; after the turn the runner stores the agent's final text
  *   as an agent `issue_messages` row and returns the execution to
  *   WAITING_FOR_USER while a blocking issue is still OPEN (§9.3). The spec
- *   handler routes a spec execution's `send_message` elsewhere.
+ *   handler hands it every message on an implementation execution and
+ *   issue messages on a spec execution (C54).
  * - `resume_with_decision` (`{ issue_id, decision_id }`, §10.3): resumes
- *   with the `## Answer to your issue <id>` header.
- * - `resume_with_revision` (`{ revision_id }`, §10.4): resumes against the
- *   newly approved revision with the `## Specification revised to version
- *   N` header and the diff from the execution's previous revision.
+ *   with the `## Answer to your issue <id>` header. A spec execution then
+ *   stays RUNNING between turns, as a spec session does (C54).
+ * - `resume_with_revision` (`{ revision_id }`, §10.4, implementation only):
+ *   resumes against the newly approved revision with the `## Specification
+ *   revised to version N` header and the diff from the execution's previous
+ *   revision.
  *
- * Every resume passes `freshPrompt`, so an execution released from a dead
- * host or whose session cannot be resumed starts a fresh session here
- * (C21, D5), and records the command and issue in `execution.resumed`.
+ * Every resume passes `freshPrompt`, so an implementation execution
+ * released from a dead host or whose session cannot be resumed starts a
+ * fresh session here (C21, D5). A spec execution has no fallback: unpinned
+ * (host null), it is skipped at error, as the spec handlers do. Every
+ * resume records the command and issue in `execution.resumed`.
  *
  * Outcomes (C20): `handled` once the execution is RUNNING; `unclaimed` when a
  * turn is live here or the execution is pinned to another host; `skipped`
@@ -66,6 +71,9 @@ const ResumeWithRevisionPayloadSchema = z.object({
 });
 
 type IssueRunner = Pick<Runner, "resume" | "isLive">;
+
+/** Roles an issue conversation or decision applies to (C54). */
+const BOTH_ROLES: readonly ExecutionRole[] = ["implementation", "spec"];
 
 // --------------------------------------------------------- prompt builders
 
@@ -138,9 +146,21 @@ async function unclaim(
 }
 
 /**
- * The checks every issue command shares: the execution exists, is an
- * implementation execution in WAITING_FOR_USER and runs no turn here. A
- * live turn unclaims (checked first, since a live turn is RUNNING).
+ * C21 for a spec execution: released from a dead host (host null) with no
+ * fallback, so no worker holds its session. Skipped at error rather than
+ * unclaimed, or every worker would reclaim it each tick (spec handler
+ * precedent).
+ */
+function unpinnedSpec(command: ExecutionCommandRow, log: Logger): CommandOutcome {
+  log.error({}, `${command.type}: spec execution is unpinned`);
+  return { outcome: "skipped", reason: "execution unpinned; no worker holds its session" };
+}
+
+/**
+ * The checks every issue command shares: the execution exists, has one of
+ * `roles`, is in WAITING_FOR_USER and runs no turn here. A live turn
+ * unclaims (checked first, since a live turn is RUNNING). An unpinned spec
+ * execution is skipped.
  */
 async function checkExecution(
   command: ExecutionCommandRow,
@@ -148,17 +168,21 @@ async function checkExecution(
   runner: IssueRunner,
   executionId: string,
   log: Logger,
+  roles: readonly ExecutionRole[],
 ): Promise<Checked> {
   if (runner.isLive(executionId)) {
     return { ok: false, outcome: await unclaim(ctx, command, log, "a turn is in flight") };
   }
   const loaded = await loadRunnerContext(ctx.db, executionId);
   if (!loaded) return skipped("execution not found");
-  if (loaded.execution.role !== "implementation") {
-    return skipped(`not an implementation execution: ${loaded.execution.role}`);
+  if (!roles.includes(loaded.execution.role)) {
+    return skipped(`${command.type} does not apply to a ${loaded.execution.role} execution`);
   }
   if (loaded.execution.state !== "WAITING_FOR_USER") {
     return skipped(`execution is ${loaded.execution.state}, not WAITING_FOR_USER`);
+  }
+  if (loaded.execution.role === "spec" && loaded.execution.host === null) {
+    return { ok: false, outcome: unpinnedSpec(command, log) };
   }
   return { ok: true, loaded };
 }
@@ -173,6 +197,7 @@ async function resumeExecution(
   log: Logger,
   runner: IssueRunner,
   input: ResumeInput,
+  role: ExecutionRole,
 ): Promise<CommandOutcome> {
   try {
     await runner.resume(input);
@@ -181,10 +206,16 @@ async function resumeExecution(
     switch (err.code) {
       case "ALREADY_LIVE":
         return unclaim(ctx, command, log, "a turn is in flight");
-      // A host null execution takes the fallback, so this is another host,
-      // or a pin that changed since the context loaded.
-      case "OTHER_HOST":
+      // An unpinned implementation execution takes the fallback, so this is
+      // another host, or a pin that changed since the context loaded. A
+      // spec execution released since then is skipped instead.
+      case "OTHER_HOST": {
+        if (role === "spec") {
+          const reloaded = await loadRunnerContext(ctx.db, input.executionId);
+          if (reloaded && reloaded.execution.host === null) return unpinnedSpec(command, log);
+        }
         return unclaim(ctx, command, log, err.message);
+      }
       case "NOT_FOUND":
       case "NOT_RESUMABLE_STATE":
         return { outcome: "skipped", reason: err.message };
@@ -242,9 +273,9 @@ function captureReply(
 // ---------------------------------------------------------------- handlers
 
 /**
- * `send_message` on an implementation execution. Registered through
- * `registerSpecHandlers`' `implementationSendMessage`, since a command type
- * has one handler and the spec role owns the spec execution's messages.
+ * `send_message` on an issue, of an implementation or a spec execution
+ * (C54). Registered through `registerSpecHandlers`' `issueSendMessage`,
+ * since a command type has one handler and the spec role owns spec chat.
  */
 export function createIssueMessageHandler(runner: IssueRunner): CommandHandler {
   return async (command, ctx) => {
@@ -260,7 +291,7 @@ export function createIssueMessageHandler(runner: IssueRunner): CommandHandler {
     }
     const { issue_id: issueId, text } = parsed.data;
 
-    const checked = await checkExecution(command, ctx, runner, executionId, log);
+    const checked = await checkExecution(command, ctx, runner, executionId, log, BOTH_ROLES);
     if (!checked.ok) return checked.outcome;
     const issue = await getIssueById(ctx.db, issueId);
     if (!issue || issue.executionId !== executionId) {
@@ -283,7 +314,7 @@ export function createIssueMessageHandler(runner: IssueRunner): CommandHandler {
       resumedPayload: { command: "send_message", issue_id: issueId },
       freshPrompt: (userPrompt) => issueMessagePrompt(issueId, author, text, userPrompt),
       conversationTurn: captureReply(checked.loaded, issueId, log),
-    });
+    }, checked.loaded.execution.role);
   };
 }
 
@@ -302,7 +333,7 @@ export function registerIssueHandlers(handlers: CommandHandlers, runner: IssueRu
     }
     const { issue_id: issueId, decision_id: decisionId } = parsed.data;
 
-    const checked = await checkExecution(command, ctx, runner, executionId, log);
+    const checked = await checkExecution(command, ctx, runner, executionId, log, BOTH_ROLES);
     if (!checked.ok) return checked.outcome;
     const decision = await getTaskDecisionById(ctx.db, decisionId);
     if (!decision || decision.issueId !== issueId || decision.taskId !== checked.loaded.task.id) {
@@ -317,7 +348,7 @@ export function registerIssueHandlers(handlers: CommandHandlers, runner: IssueRu
       expectedState: "WAITING_FOR_USER",
       resumedPayload: { command: "resume_with_decision", issue_id: issueId },
       freshPrompt: (userPrompt) => decisionResumePrompt(issueId, decision, userPrompt),
-    });
+    }, checked.loaded.execution.role);
   });
 
   handlers.registerCommandHandler("resume_with_revision", async (command, ctx) => {
@@ -333,7 +364,7 @@ export function registerIssueHandlers(handlers: CommandHandlers, runner: IssueRu
     }
     const revisionId = parsed.data.revision_id;
 
-    const checked = await checkExecution(command, ctx, runner, executionId, log);
+    const checked = await checkExecution(command, ctx, runner, executionId, log, ["implementation"]);
     if (!checked.ok) return checked.outcome;
     const { loaded } = checked;
     const previousId = loaded.execution.specRevisionId;
@@ -365,6 +396,6 @@ export function registerIssueHandlers(handlers: CommandHandlers, runner: IssueRu
       specRevisionId: revisionId,
       freshPrompt: (userPrompt) =>
         revisionResumePrompt(revised.version, before.data, after.data, userPrompt),
-    });
+    }, loaded.execution.role);
   });
 }

@@ -10,6 +10,7 @@ import type {
 import {
   SpecContentSchema,
   type EndReason,
+  type ExecutionContext,
   type ExecutionEventType,
   type ExecutionState,
   type Runtime,
@@ -145,6 +146,12 @@ export interface RunnerDeps {
      * ran on this host (C27). Without it nothing is pushed.
      */
     pushIfAhead?(input: PushIfAheadInput): Promise<PushIfAheadResult>;
+    /**
+     * A resume onto a newly approved revision rewrites the worktree's
+     * `.orchestra/context.json`, so `orchestra-review` reads that revision
+     * (GOT.47 C53). Without it the file is not rewritten.
+     */
+    writeContext?(worktreePath: string, context: ExecutionContext): Promise<void>;
   };
   /** One adapter per runtime (§7.3). A missing runtime fails the execution. */
   adapters: Partial<Record<Runtime, AgentAdapter>>;
@@ -1738,6 +1745,48 @@ export function createRunner(deps: RunnerDeps): Runner {
       // C21: the recorded worktree lives on the dead host, or is gone here.
       if (fresh !== null && !(await pathExists(worktreePath))) {
         worktreePath = await restoreEvictedWorktree(ctx, worktreePath, refuse, log);
+      }
+
+      // C53: `orchestra-review` reads the spec from the worktree's
+      // context.json, so it moves to the new revision with the execution.
+      // Written before the resume transaction, outside any row lock.
+      if (input.specRevisionId !== undefined && deps.worktrees.writeContext) {
+        try {
+          const revision = ctx.revision!;
+          const repository = ctx.repository;
+          if (!repository) throw new Error("task has no repository");
+          await deps.worktrees.writeContext(worktreePath, {
+            task: {
+              id: ctx.task.id,
+              jira_key: ctx.task.jiraKey,
+              jira_summary: ctx.task.jiraSummary,
+            },
+            spec: {
+              version: revision.version,
+              content: SpecContentSchema.parse(revision.content),
+            },
+            decisions: ctx.decisions.map((d) => ({
+              issue_id: d.issueId,
+              decision: d.decision,
+              clarification: d.clarification,
+              chosen_option: d.chosenOption,
+              decided_by: d.decidedBy,
+              decided_at: d.decidedAt.toISOString(),
+            })),
+            repository: {
+              name: repository.name,
+              default_branch: repository.defaultBranch,
+              branch: ctx.execution.branch ?? "",
+            },
+            runtime: ctx.execution.runtime,
+            review_command: testCommandFor(ctx),
+          });
+        } catch (err) {
+          refuse(
+            "WORKTREE_UNAVAILABLE",
+            `context.json could not be rewritten for the new revision: ${errMessage(err)}`,
+          );
+        }
       }
 
       if (fresh === null) {
