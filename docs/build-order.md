@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `def5818` plus this change.
+Status as of 2026-09-25, main at `7e7cf67` plus this change.
 
 ## Completed
 
@@ -34,6 +34,7 @@ Status as of 2026-09-25, main at `def5818` plus this change.
 | W6 | GOT.34 | worker: lease sweeper and dead-host release | #32 |
 | W6 | GOT.41 | web: task detail timeline and side panel | #33 |
 | W6 | GOT.35 | worker: worktree sweeper | #34 |
+| W6 | GOT.30 | worker: Jira comment write-back | #35 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -43,7 +44,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
-| W6 | GOT.30 | worker: Jira comment write-back | GOT.23 | M4 |
 | W7 | GOT.37 | worker: spec role execution | GOT.31 | M5 |
 | W7 | GOT.39 | worker: implementation role with review phase | GOT.26, 31 | M6 |
 | W7 | GOT.38 | web: spec builder split pane | GOT.22, 28, 32 | M5 |
@@ -78,6 +78,8 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.43: a FAILED execution on a NEEDS_HUMAN task keeps its worktree until rule three pushes and evicts it (C13). The retry policy's fresh execution should start from the pushed branch with `resumeFromRemote` rather than from the default branch (PR #34).
 - GOT.43: executions released from a dead host (`host` null) match no host in the worktree sweeper, so their worktrees are never swept anywhere. Reclaiming or sweeping them needs an owner (PR #32, #34).
 - Later: `repositories.name` is unique per project but the bare clone path `repos/<name>.git` is shared across projects, so two projects with one repository name share a bare clone and branch namespace (PR #34, pre-existing).
+- Later: the Jira write-back cursor lives in memory and starts at the current max event id on worker start, and a transient failure is retried five times per event (C14). A restart or a Jira outage longer than about five runs drops that window's comments with no backfill; a persisted cursor or a reconciliation sweep would close it (PR #35, accepted minor).
+- GOT.46: the write-back posts "Pull request opened" on `pull_request.created` and "CI passed. Ready for merge" on `task.state_changed` to READY_FOR_MERGE; the poller needs no Jira code of its own (PR #35).
 - GOT.43: `POST /tasks/:id/retry` moves NEEDS_HUMAN to READY even while the execution is still RUNNING (after a review-limit escalation). The claim skips READY tasks with a live execution, so the task waits, but the retry route should refuse or the escalation should end the execution (PR #24).
 - GOT.34/35: `BLOCKED → READY` (`dependency.resolved`) is not implemented; the user left it out of GOT.26 because §6.2 does not specify it.
 - GOT.37: request-review marks the spec execution COMPLETED in the database only; the worker must end the live spec session when it sees that. Send-back does not resume the session; the worker must (PR #27).
