@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `ff8273a` plus this change.
+Status as of 2026-09-25, main at `a8cc4bd` plus this change.
 
 ## Completed
 
@@ -46,16 +46,16 @@ Status as of 2026-09-25, main at `ff8273a` plus this change.
 | W8 | GOT.46 | worker: GitHub poller | #44 |
 | W7 | GOT.37 | worker: spec role execution | #45 |
 | W8 | GOT.47 | worker: issue conversation and resume commands | #46 |
+| fill-in | GOT.50 | worker: project budget cap and Codex usage pricing | #47 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
 ## Remaining
 
-Order within a wave is priority order. Critical path: GOT.48 → GOT.49; GOT.50 is a fill-in that can run before either.
+Order within a wave is priority order. Critical path: GOT.48 → GOT.49. Both need inputs from the user (below).
 
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
-| fill-in | GOT.50 | worker: project budget cap and Codex usage pricing | GOT.44, 45, 47 | M9 |
 | W9 | GOT.48 | E2E: sandbox ticket to merged PR through Claude | GOT.38 to 42, 46, 47 | M6 |
 | W9 | GOT.49 | E2E: same ticket through Codex | GOT.45, 48 | M9 |
 
@@ -75,8 +75,8 @@ GOT.45 was built early against synthesized `codex exec --json` fixtures because 
 - Later: `report_pr_created` now updates the task's single `pull_requests` row and resets it to open; the poller should key its state on `head_sha`, not on row identity (C17, C22, PR #37).
 - Later: command handlers return `handled`, `unclaimed` or `skipped` (C20). Only an execution pinned to another host unclaims. A CI resume for an unpinned execution (host null after a dead-host release) is skipped and completed, leaving the task IMPLEMENTING with a COMPLETED execution. The retry starter (GOT.43) handles only QUEUED retry rows, so the fresh-session fallback for released WAITING_FOR_USER and COMPLETED executions (D5, §6.1) is GOT.47's: on OTHER_HOST with `host` null, pin the execution to this host and start a fresh session seeded with the spec, decisions and the pending prompt (C21, PR #37, #40).
 - Later: the retry policy (PR #40) runs inside the FAILED transaction in the runner and the lease sweeper; a spec-role infrastructure failure only notifies (no task edge from SPEC_IN_PROGRESS) and the starter runs implementation rows only, so a failed spec session needs the user to start a new one. Retry rows copy `session_id`; the starter reuses a local worktree (resume when `canResume`, else a fresh session there, C31, C32) and every worktree operation after creation is keyed on the row's recorded `worktree_path` (C33). The failed row keeps `branch` and loses `worktree_path` after a takeover (C38).
-- GOT.50: `projects.max_budget_usd` exists (migration 0004, C29) but nothing reads it: the runner does not pass `maxBudgetUsd` to the adapter and no path produces `budget_exceeded`; `codex exec` has no budget flag, so the check belongs in the runner (PR #38, #43, C30).
-- GOT.50: Codex usage events carry no `costUsd` (C47) and the runner has no pricing hook: `runner.ts` records `costUsd ?? 0`, so Codex cost lands as 0 rather than NULL, and `modelFor` returns undefined for the default model so the usage row says `unknown`. Wire `apps/worker/src/pricing` into the runner's usage path and record the Codex model name (PR #43).
+- GOT.48: `projects.max_budget_usd` is a per-execution cap (C55, PR #47): the runner passes it as `maxBudgetUsd` on every start and resume, an adapter error matching the budget pattern ends the execution `budget_exceeded` (NEEDS_HUMAN), and for Codex the runner itself aborts once the execution's priced cumulative cost exceeds the cap. Confirm the cap semantics with the user before relying on it.
+- GOT.49: Codex usage is priced in the runner from `config/pricing.json` (`PRICING_FILE`, resolved against the repository root when relative); an unknown model records `cost_usd` NULL with one warning, and a bad or missing file stops the worker at startup. Claude usage keeps the adapter's own cost. Add the real Codex model names to the table before the first run (PR #47).
 - GOT.49: the Codex adapter's assumptions need one real run to verify: `-c` keys `mcp_servers.orchestra.url`, `mcp_servers.orchestra.bearer_token_env_var` and `sandbox_workspace_write.network_access` (all in `CODEX_CONFIG_KEYS`); whether Codex's default `shell_environment_policy` strips `*TOKEN*` variables, which would hide `ORCHESTRA_TOKEN` and `GITHUB_TOKEN` from `orchestra-review` and `gh`; whether `turn.completed` usage is cumulative across `exec resume` (the baseline subtraction assumes it is) and whether `input_tokens` includes `cached_input_tokens`; the flag order `exec <flags> resume <id> -` with `-` for stdin; item type names (`agent_message`, `command_execution`, `mcp_tool_call`, `file_change`, `web_search`); the session store at `$CODEX_HOME/sessions`; and whether older versions need `experimental_use_rmcp_client=true` for HTTP MCP (PR #43).
 - Later: the runner maps a Codex adapter `error` event to `adapter_error`, so a Codex process crash is not recorded as `process_crash`; and no test covers the adapter's kill-once guard (PR #43, accepted minor).
 - GOT.48: the UI labels every Claude cost "estimated" (C28, design OI2) because the api cannot tell an API-key login from a subscription login. Revisit if the host reports it.
@@ -124,4 +124,5 @@ GOT.45 was built early against synthesized `codex exec --json` fixtures because 
 - GOT.48: a spec execution stays RUNNING between turns and holds a slot while the user drafts (C42); the C48 dead-host pass fails an ASSIGNED spec execution after 15 minutes without a heartbeat; `POST /tasks/:id/spec/session` restarts from SPEC_IN_PROGRESS when no spec execution is live and no send-back resume is pending, else 409 `SPEC_SESSION_BUSY` (C49). The worktree sweeper removes a spec worktree once the task is past SPEC_REVIEW (C46); if approval picks a different repository than the C41 fallback, the prune runs in the wrong bare clone but the directory is still removed (PR #45).
 - Later: implementation executions cancelled by the api keep receiving agent events until the runner's poll notices the stop; the spec-only write gate (PR #45) does not cover them because §9.3 lets an implementation write its final message after a tool-driven COMPLETED. `recordUsage` still writes usage after request-review so spend is not lost (PR #45, accepted).
 - GOT.48: issue conversation and resumes (PR #46) live in `apps/worker/src/runner/issues.ts`. A message on an open blocking issue returns the execution to WAITING_FOR_USER; the resume transaction locks task, execution, then issue and skips with `ISSUE_NOT_OPEN` when the api resolved it first. `resume_with_revision` rewrites `.orchestra/context.json` before the adapter call (C53) so `orchestra-review` sees the new revision. Decisions and messages also reach a spec execution parked on a blocking issue (C54). An execution released from a dead host (`host` null) or whose session cannot resume gets a fresh session on this worker with the full prompt and `fresh_session: true` in `execution.resumed` (C21); spec executions have no fallback and are skipped at error level. `task_leases.worker_id` still names the dead worker after a takeover; renewal is keyed by execution id (accepted minor). `RunnerDeps.hooks.beforeFallbackPin` and `beforeTokenIssue` are test seams.
+- Later: the GOT.50 Claude two-event pricing test compares costs through `Number`, so a NULL row reads as 0 and only the no-warning assertion guards the regression (PR #47, accepted minor).
 - GOT.48 and GOT.49: need a sandbox GitHub repository, a Jira project, and credentials from the user.
