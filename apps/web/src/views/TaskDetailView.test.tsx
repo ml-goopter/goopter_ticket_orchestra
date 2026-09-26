@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router";
+import { Link, MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BoardApiClient } from "../api/client.js";
 import { ApiError } from "../api/client.js";
-import type { TimelineEvent, TimelinePage } from "../api/types.js";
+import type { SpecificationRevision, TimelineEvent, TimelinePage } from "../api/types.js";
 import type { EventSourceLike, MessageEventLike } from "../sse/useEventStream.js";
 import { makeTaskAggregate, makeTimelineEvent } from "../task/fixtures.js";
 import { TaskDetailView } from "./TaskDetailView.js";
@@ -78,6 +78,30 @@ function makeClient(options: MakeClientOptions = {}): BoardApiClient {
     getTimeline: options.getTimeline ?? vi.fn().mockResolvedValue(emptyPage()),
     cancelTask: options.cancelTask ?? vi.fn().mockResolvedValue({ from: "IMPLEMENTING", to: "CANCELLED" }),
     retryTask: options.retryTask ?? vi.fn().mockResolvedValue({ from: "NEEDS_HUMAN", to: "IMPLEMENTING" }),
+  };
+}
+
+function makeRevision(overrides: Partial<SpecificationRevision>): SpecificationRevision {
+  return {
+    id: "rev-x",
+    taskId: "task-x",
+    version: 1,
+    status: "approved",
+    content: {
+      repository: "tsk-repo",
+      objective: "objective",
+      scope: ["a"],
+      out_of_scope: [],
+      requirements: ["r1"],
+      acceptance_criteria: ["ac1"],
+      validation: ["v1"],
+      constraints: [],
+      dependencies: [],
+    },
+    createdBy: "user-1",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
   };
 }
 
@@ -381,5 +405,74 @@ describe("TaskDetailView", () => {
     const items = within(screen.getByTestId("timeline")).getAllByTestId("timeline-item");
     expect(items[0]!.textContent).toContain("i-backlog");
     expect(items[1]!.textContent).toContain("i-live");
+  });
+
+  it("resets all task-scoped state on an in-app navigation from one task to another (GOT.41-fix2, F1/F2)", async () => {
+    const aggregateA = makeTaskAggregate({
+      task: { ...makeTaskAggregate().task, id: "task-a", jiraKey: "TSK-1", jiraSummary: "Task A summary" },
+      revisions: [
+        makeRevision({ id: "rev-a1", taskId: "task-a", version: 1 }),
+        makeRevision({ id: "rev-a2", taskId: "task-a", version: 2 }),
+      ],
+    });
+    const aggregateB = makeTaskAggregate({
+      task: { ...makeTaskAggregate().task, id: "task-b", jiraKey: "TSK-2", jiraSummary: "Task B summary" },
+      revisions: [
+        makeRevision({ id: "rev-b1", taskId: "task-b", version: 5 }),
+        makeRevision({ id: "rev-b2", taskId: "task-b", version: 6 }),
+      ],
+    });
+
+    const getTask = vi.fn((taskId: string) => Promise.resolve(taskId === "task-a" ? aggregateA : aggregateB));
+    const getTimeline = vi.fn().mockResolvedValue(emptyPage());
+    const client = makeClient({ getTask, getTimeline });
+
+    render(
+      <MemoryRouter initialEntries={["/tasks/task-a"]}>
+        <Routes>
+          <Route
+            path="/tasks/:id"
+            element={
+              <>
+                <Link to="/tasks/task-b">Go to B</Link>
+                <TaskDetailView client={client} createEventSource={factory} />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("TSK-1: Task A summary")).toBeTruthy());
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+    expect(currentSource().url).toBe("/api/tasks/task-a/stream");
+    const sourceA = currentSource();
+
+    const liveEventA = makeTimelineEvent({
+      id: 900,
+      taskId: "task-a",
+      type: "issue.created",
+      payload: { issueId: "only-in-a" },
+    });
+    await act(async () => {
+      sourceA.emit("issue.created", liveEventA, "900");
+    });
+    await waitFor(() => expect(screen.getByText(/only-in-a/)).toBeTruthy());
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("link", { name: "Go to B" }));
+    });
+
+    await waitFor(() => expect(screen.getByText("TSK-2: Task B summary")).toBeTruthy());
+    expect(screen.queryByText("TSK-1: Task A summary")).toBeNull();
+    expect(screen.queryByText(/only-in-a/)).toBeNull();
+
+    expect(sourceA.closed).toBe(true);
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(2));
+    expect(currentSource().url).toBe("/api/tasks/task-b/stream");
+
+    const compareFrom = screen.getByLabelText("Compare from") as HTMLSelectElement;
+    const optionLabels = Array.from(compareFrom.options).map((option) => option.textContent);
+    expect(optionLabels).toEqual(["v5", "v6"]);
   });
 });

@@ -31,10 +31,39 @@ function formatMoney(amount: number): string {
  * C): timeline with live SSE append, family filters, a side panel with
  * spec/approval/decision/execution/PR detail, and the cancel/retry actions.
  * Replaces the GOT.38 placeholder.
+ *
+ * This routed shell only reads `id` and picks/creates the api client. All
+ * task-scoped state lives in `TaskDetailPanel`, which is remounted with
+ * `key={id}` whenever the route's task id changes (GOT.41-fix2, F1): an
+ * in-app navigation from one task to another must not leave the previous
+ * task's events, aggregate, filters, revision selectors or SSE
+ * subscription attached to the new task's page. Keying on `id` makes React
+ * tear down and recreate every hook in the panel, so there is nothing to
+ * reset by hand.
  */
 export function TaskDetailView({ client, createEventSource }: TaskDetailViewProps = {}) {
   const { id } = useParams();
   const apiClient = useMemo(() => client ?? createApiClient(), [client]);
+
+  if (!id) {
+    return (
+      <main>
+        <h1>Task detail</h1>
+        <p>Loading...</p>
+      </main>
+    );
+  }
+
+  return <TaskDetailPanel key={id} id={id} client={apiClient} createEventSource={createEventSource} />;
+}
+
+interface TaskDetailPanelProps {
+  id: string;
+  client: BoardApiClient;
+  createEventSource?: EventSourceFactory;
+}
+
+function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetailPanelProps) {
   const { begin, isCurrent } = useLatestRequest();
 
   const [loadState, setLoadState] = useState<LoadState>("loading");
