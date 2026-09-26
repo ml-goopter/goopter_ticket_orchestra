@@ -345,16 +345,23 @@ async function* runCodex(run: RunConfig): AsyncGenerator<AgentEvent> {
     },
   );
 
+  let killed = false;
+  const kill = (): void => {
+    if (exited || killed) return;
+    killed = true;
+    child.kill();
+  };
+
   let onAbort = (): void => {};
   const aborted = new Promise<typeof ABORTED>((resolve) => {
     onAbort = () => {
-      if (!exited) child.kill();
+      kill();
       resolve(ABORTED);
     };
   });
   signal.addEventListener("abort", onAbort, { once: true });
 
-  const stderr = new TailCollector(STDERR_TAIL_BYTES);
+  const stderr = new TailCollector(STDERR_TAIL_BYTES, redact);
   void stderr.drain(child.stderr);
 
   const context: StreamContext = {
@@ -386,11 +393,13 @@ async function* runCodex(run: RunConfig): AsyncGenerator<AgentEvent> {
 
     const outcome = await Promise.race([exit, aborted]);
     if (outcome === ABORTED) return;
-    // Output ended without a turn end: a crash, whatever the exit code says
-    // about the text, so it is retried as infrastructure (design.md §9.5).
+    // Output ended without a turn end: a crash whatever the exit code, even
+    // 0, and whatever stderr says, so it is retried as infrastructure
+    // (design.md §9.5). Ending quietly would let the runner read an
+    // exhausted stream as a finished turn.
     if ("error" in outcome) {
       yield errorEvent(redact(`codex failed to run: ${errorText(outcome.error)}`));
-    } else if (outcome.code !== 0) {
+    } else {
       const how =
         outcome.code !== null
           ? `exited with code ${outcome.code}`
@@ -408,7 +417,8 @@ async function* runCodex(run: RunConfig): AsyncGenerator<AgentEvent> {
     if (signal.aborted) return;
     yield errorEvent(redact(errorText(error)));
   } finally {
-    signal.removeEventListener("abort", onAbort);
+    // The abort listener stays attached through the grace wait, so a cancel
+    // during it kills the process at once rather than after `exitGraceMs`.
     if (!exited && context.ended && !signal.aborted) {
       // Keep reading so a full stdout pipe cannot stop Codex from exiting.
       void (async () => {
@@ -425,7 +435,8 @@ async function* runCodex(run: RunConfig): AsyncGenerator<AgentEvent> {
       await Promise.race([exit, graceOver, aborted]);
       clearTimeout(timer);
     }
-    if (!exited) child.kill();
+    signal.removeEventListener("abort", onAbort);
+    kill();
   }
 }
 
@@ -454,13 +465,23 @@ async function* splitLines(
   if (buffer.trim() !== "") yield buffer.replace(/\r$/, "");
 }
 
-/** Keeps the last `limit` characters of a stream, for crash messages. */
+/**
+ * Keeps the last `limit` characters of a stream, for crash messages.
+ *
+ * Redacts before it truncates. Truncating first can cut the token at the
+ * boundary and leave a fragment the whole-string redaction no longer
+ * matches. The kept text is already redacted, so a token split across two
+ * chunks is matched once its second half arrives, and any unredacted token
+ * prefix can only sit at the tail, which truncation never cuts.
+ */
 class TailCollector {
   #text = "";
   readonly #limit: number;
+  readonly #redact: (text: string) => string;
 
-  constructor(limit: number) {
+  constructor(limit: number, redact: (text: string) => string) {
     this.#limit = limit;
+    this.#redact = redact;
   }
 
   async drain(stream: AsyncIterable<string | Uint8Array>): Promise<void> {
@@ -482,7 +503,7 @@ class TailCollector {
   }
 
   #push(text: string): void {
-    this.#text = (this.#text + text).slice(-this.#limit);
+    this.#text = this.#redact(this.#text + text).slice(-this.#limit);
   }
 }
 

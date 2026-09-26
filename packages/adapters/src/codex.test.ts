@@ -79,7 +79,8 @@ function fakeCodex(
   stdout: string,
   opts: {
     exit?: CodexExit;
-    stderr?: string;
+    /** One chunk, or several to split a value across reads. */
+    stderr?: string | string[];
     hang?: boolean;
     /** Delay between stdout ending and the exit, for the grace test. */
     exitAfterMs?: number;
@@ -120,7 +121,8 @@ function fakeCodex(
       if (opts.hang) await killedP;
     }
     async function* err(): AsyncGenerator<Uint8Array> {
-      if (opts.stderr) yield new TextEncoder().encode(opts.stderr);
+      const chunks = typeof opts.stderr === "string" ? [opts.stderr] : (opts.stderr ?? []);
+      for (const chunk of chunks) yield new TextEncoder().encode(chunk);
     }
 
     const child: CodexChild = {
@@ -546,6 +548,63 @@ describe("CodexAdapter failures and redaction (design.md §9.5)", () => {
     expect((events.at(-1) as { message: string }).message).toContain("SIGSEGV");
   });
 
+  it("F3: exit code 0 with no turn end yields a retriable error, not a silent end", async () => {
+    const fake = fakeCodex(
+      '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}\n',
+    );
+    const events = await collect(
+      new CodexAdapter({ spawn: fake.spawn }).start(startRequest, neverAborted()),
+    );
+    expect(events.map((e) => e.type)).toEqual(["session", "error"]);
+    expect(events[1]).toMatchObject({ type: "error", retriable: true });
+    expect((events[1] as { message: string }).message).toContain("exited with code 0");
+  });
+
+  /** Every substring of the token longer than 8 characters. */
+  const tokenFragments = (): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i + 9 <= TOKEN.length; i++) out.push(TOKEN.slice(i, i + 9));
+    return out;
+  };
+
+  // The stderr tail keeps 4096 characters. The overflow decides where the
+  // cut lands inside the token: 1 and 10 leave 25 and 16 of its 26
+  // characters, 20 leaves 6.
+  it.each([1, 10, 20])(
+    "F1: a token cut by the stderr tail boundary (overflow %i) leaves no fragment in the message",
+    async (overflow) => {
+      const stderr = TOKEN + "x".repeat(4096 + overflow - TOKEN.length);
+      const fake = fakeCodex(fixture("crash-no-turn-end.jsonl"), {
+        exit: { code: 1, signal: null },
+        stderr,
+      });
+      const events = await collect(
+        new CodexAdapter({ spawn: fake.spawn }).start(startRequest, neverAborted()),
+      );
+      const error = events.at(-1) as Extract<AgentEvent, { type: "error" }>;
+      expect(error.type).toBe("error");
+      for (const fragment of tokenFragments()) {
+        expect(error.message).not.toContain(fragment);
+      }
+    },
+  );
+
+  it("F1: a token split across stderr chunks is still redacted", async () => {
+    const cut = 13;
+    const fake = fakeCodex(fixture("crash-no-turn-end.jsonl"), {
+      exit: { code: 1, signal: null },
+      stderr: ["x".repeat(5000) + TOKEN.slice(0, cut), TOKEN.slice(cut) + " tail"],
+    });
+    const events = await collect(
+      new CodexAdapter({ spawn: fake.spawn }).start(startRequest, neverAborted()),
+    );
+    const error = events.at(-1) as Extract<AgentEvent, { type: "error" }>;
+    expect(error.message).toContain("[redacted] tail");
+    for (const fragment of tokenFragments()) {
+      expect(error.message).not.toContain(fragment);
+    }
+  });
+
   it("redacts the token from text, tool inputs and error messages", async () => {
     const debug = vi.fn();
     const fake = fakeCodex(fixture("token-leak.jsonl"), {
@@ -640,6 +699,27 @@ describe("CodexAdapter abort (design.md §7: cancel is the AbortSignal)", () => 
     }
     await iterator.return?.();
     expect(fake.kills).toBe(0);
+  });
+
+  it("F2: an abort during the post-turn grace period kills the process promptly", async () => {
+    const fake = fakeCodex(fixture("start-session.jsonl"), { neverExit: true });
+    const controller = new AbortController();
+    const iterator = iterate(
+      new CodexAdapter({ spawn: fake.spawn, exitGraceMs: 2_000 }).start(
+        startRequest,
+        controller.signal,
+      ),
+    );
+    for (;;) {
+      const next = await iterator.next();
+      if (next.done || next.value.type === "turn_done") break;
+    }
+    const started = Date.now();
+    const closing = iterator.return?.();
+    setTimeout(() => controller.abort(), 50);
+    await closing;
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(fake.kills).toBe(1);
   });
 
   it("kills a process that has not exited within the grace period after turn_done", async () => {
