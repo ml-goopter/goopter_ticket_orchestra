@@ -1,5 +1,5 @@
 import os from "node:os";
-import { ClaudeAdapter } from "@orchestra/adapters";
+import { ClaudeAdapter, CodexAdapter } from "@orchestra/adapters";
 import { createDb, type Db } from "@orchestra/db";
 import {
   DEFAULT_AGENT_TOOLS_HOST,
@@ -11,6 +11,7 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   startHeartbeat,
 } from "./heartbeat.js";
+import { startGitHubPoller } from "./github/index.js";
 import { createJiraClient, startJiraPoller, startJiraWriteback } from "./jira/index.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PHASE_ORDER, createDefaultPhases } from "./phases/index.js";
@@ -118,12 +119,22 @@ async function main(): Promise<void> {
     config,
     logger: log.child({ component: "jira-writeback" }),
   });
+  // design.md §11.2: independent 60s-interval poller for CI status, merge
+  // and close on every open pull request. No-ops with one warning when
+  // GITHUB_TOKEN is absent; never blocks startup.
+  const stopGitHubPoller = startGitHubPoller({
+    db,
+    config,
+    workerId,
+    logger: log.child({ component: "github-poller" }),
+  });
   // design.md §7.3: claim only tasks whose runtime binary is on PATH.
   const runtimes = detectRuntimes();
   log.info({ runtimes }, "detected agent runtimes");
 
   // design.md §9: the execution runner, fed by the claim phase (§6.3) and
-  // the command consumer (§6.1). Codex has no adapter yet (build step 9).
+  // the command consumer (§6.1). A runtime is claimable when its binary is
+  // on PATH (`runtimes` above) and it has an adapter here.
   const jira =
     config.jiraBaseUrl && config.jiraEmail && config.jiraApiToken
       ? createJiraClient({
@@ -141,7 +152,15 @@ async function main(): Promise<void> {
     workerId,
     host: config.host,
     worktrees,
-    adapters: { claude: new ClaudeAdapter() },
+    adapters: {
+      claude: new ClaudeAdapter(),
+      // Codex usage carries no cost; pricing it (§9.7, C47) needs a runner
+      // hook that does not exist yet.
+      codex: new CodexAdapter({
+        debug: (reason, line) =>
+          log.debug({ component: "codex-adapter", reason, line }, "ignored codex output"),
+      }),
+    },
     toolsUrl: () => toolsServer.url,
     ...(jira ? { fetchTicket: (key: string) => jira.getIssue(key) } : {}),
     ...(config.githubToken ? { githubToken: config.githubToken } : {}),
@@ -202,6 +221,7 @@ async function main(): Promise<void> {
       await toolsServer.stop();
       await stopJiraPoller();
       await stopJiraWriteback();
+      await stopGitHubPoller();
       await stopHeartbeat();
       await closeDb(db);
     },
