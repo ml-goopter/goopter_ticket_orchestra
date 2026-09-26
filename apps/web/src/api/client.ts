@@ -1,20 +1,28 @@
-import type { ResolutionKind } from "@orchestra/core";
+import type { ResolutionKind, Runtime, SpecContent } from "@orchestra/core";
 import { z } from "zod";
 import {
+  AdminRepositorySchema,
   IssueDetailSchema,
   IssueSchema,
   NotificationSchema,
   PostIssueMessageResultSchema,
   ResolveIssueResultSchema,
+  SpecDraftResultSchema,
+  SpecMessageResultSchema,
+  SpecRevisionTransitionResultSchema,
   TaskAggregateSchema,
   TaskCardSchema,
   TaskTransitionResultSchema,
   TimelinePageSchema,
+  type AdminRepository,
   type Issue,
   type IssueDetail,
   type Notification,
   type PostIssueMessageResult,
   type ResolveIssueResult,
+  type SpecDraftResult,
+  type SpecMessageResult,
+  type SpecRevisionTransitionResult,
   type TaskAggregate,
   type TaskCard,
   type TaskTransitionResult,
@@ -162,11 +170,47 @@ export interface IssueApiClient extends BoardApiClient {
 }
 
 /**
+ * The spec builder's view of the api (GOT.38, design.md §12.3), layered on
+ * `IssueApiClient` the same way that interface is kept separate from
+ * `BoardApiClient` above: its own interface so extending it does not force
+ * an edit to `IssueApiClient` or the views typed against it.
+ * `createApiClient()` implements all three.
+ */
+export interface SpecApiClient extends IssueApiClient {
+  /**
+   * `GET /repositories?project=` (design.md §12.5), scoped to one project.
+   * The task aggregate carries only the task's own assigned repository
+   * (null before approval), so the spec builder's repository-exists check
+   * (design.md §4.3) needs this separate list of the task's project's
+   * repositories.
+   */
+  listProjectRepositories(projectId: string): Promise<AdminRepository[]>;
+  /** `POST /tasks/:id/spec/session` (design.md §12.3), only legal from `NEEDS_SPEC`. */
+  startSpecSession(taskId: string): Promise<TaskTransitionResult>;
+  /** `POST /tasks/:id/spec/messages` `{ text }` (design.md §12.3). */
+  postSpecMessage(taskId: string, text: string): Promise<SpecMessageResult>;
+  /** `PUT /tasks/:id/spec/draft` `{ content }` (design.md §12.3). */
+  saveDraft(taskId: string, content: SpecContent): Promise<SpecDraftResult>;
+  /** `POST /tasks/:id/spec/request-review` (design.md §12.3). */
+  requestReview(taskId: string): Promise<TaskTransitionResult>;
+  /** `POST /tasks/:id/spec/send-back` (design.md §12.3). */
+  sendBack(taskId: string): Promise<TaskTransitionResult>;
+  /** `POST /tasks/:id/spec/approve` `{ runtime? }` (design.md §12.3). */
+  approveSpec(taskId: string, runtime?: Runtime): Promise<SpecRevisionTransitionResult>;
+  /**
+   * `POST /tasks/:id/spec/revise` (design.md §12.3), only legal from
+   * `SPEC_APPROVED` or `READY`; 409 `DRAFT_EXISTS` when a draft already
+   * exists (docs/build-order.md GOT.38 carry-forward note).
+   */
+  reviseSpec(taskId: string): Promise<SpecRevisionTransitionResult>;
+}
+
+/**
  * Typed wrapper around the api (design.md §12.1). Cookies are httpOnly, so
  * every request is sent with `credentials: "include"` and the caller never
  * touches the session cookie directly (design.md §13).
  */
-export function createApiClient(options: ApiClientOptions = {}): IssueApiClient {
+export function createApiClient(options: ApiClientOptions = {}): SpecApiClient {
   const baseUrl = options.baseUrl ?? "/api";
   const fetchImpl = options.fetch ?? fetch;
 
@@ -271,6 +315,43 @@ export function createApiClient(options: ApiClientOptions = {}): IssueApiClient 
           chosen_option: input.chosenOption,
         },
         schema: ResolveIssueResultSchema,
+      }),
+    listProjectRepositories: (projectId) =>
+      request<AdminRepository[]>(
+        "GET",
+        `/repositories${buildQuery({ project: projectId })}`,
+        { schema: z.array(AdminRepositorySchema) },
+      ),
+    startSpecSession: (id) =>
+      request<TaskTransitionResult>("POST", `/tasks/${id}/spec/session`, {
+        schema: TaskTransitionResultSchema,
+      }),
+    postSpecMessage: (id, text) =>
+      request<SpecMessageResult>("POST", `/tasks/${id}/spec/messages`, {
+        body: { text },
+        schema: SpecMessageResultSchema,
+      }),
+    saveDraft: (id, content) =>
+      request<SpecDraftResult>("PUT", `/tasks/${id}/spec/draft`, {
+        body: { content },
+        schema: SpecDraftResultSchema,
+      }),
+    requestReview: (id) =>
+      request<TaskTransitionResult>("POST", `/tasks/${id}/spec/request-review`, {
+        schema: TaskTransitionResultSchema,
+      }),
+    sendBack: (id) =>
+      request<TaskTransitionResult>("POST", `/tasks/${id}/spec/send-back`, {
+        schema: TaskTransitionResultSchema,
+      }),
+    approveSpec: (id, runtime) =>
+      request<SpecRevisionTransitionResult>("POST", `/tasks/${id}/spec/approve`, {
+        body: runtime === undefined ? undefined : { runtime },
+        schema: SpecRevisionTransitionResultSchema,
+      }),
+    reviseSpec: (id) =>
+      request<SpecRevisionTransitionResult>("POST", `/tasks/${id}/spec/revise`, {
+        schema: SpecRevisionTransitionResultSchema,
       }),
   };
 }

@@ -250,6 +250,165 @@ describe("createApiClient", () => {
     expect(init.method).toBe("POST");
   });
 
+  const adminRepository = {
+    id: "r1",
+    project_id: "p1",
+    name: "tsk-repo",
+    git_url: "git@example.com:goopter/tsk-repo.git",
+    default_branch: "main",
+    default_runtime: "claude",
+    default_model: null,
+    max_concurrent_worktrees: 1,
+    required_capability: null,
+    setup_command: null,
+    created_at: "2026-01-01T00:00:00.000Z",
+  };
+
+  it("listProjectRepositories(id) hits GET /repositories?project=:id and validates the response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, [adminRepository]));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.listProjectRepositories("p1");
+
+    expect(result).toEqual([adminRepository]);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe("/api/repositories?project=p1");
+  });
+
+  it("startSpecSession(id) posts to /tasks/:id/spec/session with no body and validates the response", async () => {
+    const body = { from: "NEEDS_SPEC", to: "SPEC_IN_PROGRESS" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.startSpecSession("task-1");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/spec/session");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeUndefined();
+  });
+
+  it("postSpecMessage(id, text) posts { text } to /tasks/:id/spec/messages and validates the response", async () => {
+    const body = { commandId: "cmd-1", executionId: "exec-1" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.postSpecMessage("task-1", "hello");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/spec/messages");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe(JSON.stringify({ text: "hello" }));
+  });
+
+  it("saveDraft(id, content) puts { content } to /tasks/:id/spec/draft and validates the response", async () => {
+    const content = {
+      repository: "tsk-repo",
+      objective: "do it",
+      scope: ["a"],
+      out_of_scope: [],
+      requirements: ["r1"],
+      acceptance_criteria: ["ac1"],
+      validation: ["v1"],
+      constraints: [],
+      dependencies: [],
+    };
+    const body = { id: "rev-1", version: 1, status: "draft", content };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.saveDraft("task-1", content);
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/spec/draft");
+    expect(init.method).toBe("PUT");
+    expect(init.body).toBe(JSON.stringify({ content }));
+  });
+
+  it("requestReview(id) posts to /tasks/:id/spec/request-review and validates the response", async () => {
+    const body = { from: "SPEC_IN_PROGRESS", to: "SPEC_REVIEW" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.requestReview("task-1");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/spec/request-review");
+    expect(init.method).toBe("POST");
+  });
+
+  it("sendBack(id) posts to /tasks/:id/spec/send-back and validates the response", async () => {
+    const body = { from: "SPEC_REVIEW", to: "SPEC_IN_PROGRESS" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.sendBack("task-1");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/spec/send-back");
+    expect(init.method).toBe("POST");
+  });
+
+  it("approveSpec(id, runtime) posts { runtime } to /tasks/:id/spec/approve and validates the response", async () => {
+    const body = { from: "SPEC_REVIEW", to: "READY", revisionId: "rev-1" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.approveSpec("task-1", "codex");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/spec/approve");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe(JSON.stringify({ runtime: "codex" }));
+  });
+
+  it("approveSpec(id) with no runtime sends no body", async () => {
+    const body = { from: "SPEC_REVIEW", to: "READY", revisionId: "rev-1" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    await client.approveSpec("task-1");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.body).toBeUndefined();
+  });
+
+  it("reviseSpec(id) posts to /tasks/:id/spec/revise and validates the response", async () => {
+    const body = { from: "SPEC_APPROVED", to: "SPEC_IN_PROGRESS", revisionId: "rev-2" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.reviseSpec("task-1");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/spec/revise");
+    expect(init.method).toBe("POST");
+  });
+
+  it("a 409 response turns into an ApiError carrying the code (e.g. spec/revise DRAFT_EXISTS)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      fakeResponse(409, { error: { code: "DRAFT_EXISTS", message: "The task already has a draft revision." } }),
+    );
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    let caught: unknown;
+    try {
+      await client.reviseSpec("task-1");
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).code).toBe("DRAFT_EXISTS");
+  });
+
   const issueDetail = {
     issue,
     messages: [

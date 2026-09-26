@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `d7d66fa` plus this change.
+Status as of 2026-09-25, main at `6fe66d5` plus this change.
 
 ## Completed
 
@@ -41,6 +41,7 @@ Status as of 2026-09-25, main at `d7d66fa` plus this change.
 | fill-in | GOT.27 | deploy: worker service units and operator runbook | #39 |
 | W7 | GOT.43 | worker: failure classification and retry policy | #40 |
 | fill-in | GOT.29 | web: admin views for projects, repositories, users, workers | #41 |
+| W7 | GOT.38 | web: spec builder split pane | #42 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -51,7 +52,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | Wave | Task | Title | Depends on | Milestone |
 | --- | --- | --- | --- | --- |
 | W7 | GOT.37 | worker: spec role execution | GOT.31 | M5 |
-| W7 | GOT.38 | web: spec builder split pane | GOT.22, 28, 32 | M5 |
 | W8 | GOT.46 | worker: GitHub poller | GOT.39 | M6 |
 | W8 | GOT.47 | worker: issue conversation and resume commands | GOT.33, 39 | M7 |
 | W9 | GOT.48 | E2E: sandbox ticket to merged PR through Claude | GOT.38 to 42, 46, 47 | M6 |
@@ -61,6 +61,8 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 Both fill-in tasks (GOT.27, GOT.29) are done. GOT.29 ships without a user disable control (C40): the tracker asks for one, but commit 0167d86 removed the field from `PATCH /users/:id` because design §13 names no such route. Restoring it needs a user decision and is a small api change plus a toggle.
 
 GOT.27's units have not been loaded under launchd on this machine; that is an operator step recorded in `docs/runbook.md` and outside the review loop (PR #39). Plain-http localhost use needs `NODE_ENV=development` for the session cookie (C37).
+
+GOT.38 took five review rounds (cap 3, extended twice): rounds 1-3 each found one new major and round 4 a pre-existing recovery gap; round 5 was clean (PR #42).
 
 GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `codex` installed on the worker host (design OI1).
 
@@ -88,7 +90,7 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.47: `runner.resume` handles `worktree_evicted_at` by recreating the worktree at the row's recorded path from `origin/<branch>`, or from the default branch with a warning and `start_point: "default_branch"` in `worktree.prepared` when the remote branch is absent; spec executions use `prepareSpec`. A git failure during recreation is refused with WORKTREE_UNAVAILABLE and leaves no directory behind (PR #34, #40).
 - Later: executions released from a dead host (`host` null) match no host in the worktree sweeper, so their worktrees are never swept anywhere. Reclaiming or sweeping them needs an owner (PR #32, #34).
 - Later: `repositories.name` is unique per project but the bare clone path `repos/<name>.git` is shared across projects, so two projects with one repository name share a bare clone and branch namespace (PR #34, pre-existing).
-- GOT.38/44: web api client methods are layered as `ApiClient` -> `BoardApiClient` -> `IssueApiClient` in `apps/web/src/api/client.ts`; add a further layer rather than widening an existing interface, and extend `makeFakeClient` in `apps/web/src/task/fixtures.ts`. Action handlers may set state without the fetch guard, matching `TaskDetailView` (PR #33, #36, accepted minor).
+- Later: web api client methods are layered as `ApiClient` -> `BoardApiClient` -> `IssueApiClient` in `apps/web/src/api/client.ts`; add a further layer rather than widening an existing interface, and extend `makeFakeClient` in `apps/web/src/task/fixtures.ts`. Action handlers may set state without the fetch guard, matching `TaskDetailView` (PR #33, #36, accepted minor).
 - GOT.47: the issue view posts messages only while the issue is OPEN and shows the api's EXECUTION_NOT_WAITING as "the agent is busy"; the worker must return the execution to WAITING_FOR_USER after each reply (§9.3) or the composer stays disabled (PR #36).
 - Later: the Jira write-back cursor lives in memory and starts at the current max event id on worker start, and a transient failure is retried five times per event (C14). A restart or a Jira outage longer than about five runs drops that window's comments with no backfill; a persisted cursor or a reconciliation sweep would close it (PR #35, accepted minor).
 - GOT.46: the write-back posts "Pull request opened" on `pull_request.created` and "CI passed. Ready for merge" on `task.state_changed` to READY_FOR_MERGE; the poller needs no Jira code of its own (PR #35).
@@ -97,16 +99,16 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.37: request-review marks the spec execution COMPLETED in the database only; the worker must end the live spec session when it sees that. Send-back does not resume the session; the worker must (PR #27).
 - GOT.37: request-review refuses while a `start_spec_session` command is uncompleted. The worker must complete that command and create the spec execution in one transaction, or the guard has a gap (PR #27).
 - GOT.37: the scheduler's live and paused execution filters ignore `role`, so any live spec execution also blocks promotion and claim of the task (PR #24, #27).
-- GOT.38: `PUT /spec/draft` takes `{ content }`. `/spec/revise` returns 409 `DRAFT_EXISTS` when a draft already exists, and no route deletes a draft (PR #27).
+- Later: `PUT /spec/draft` takes `{ content }`. `/spec/revise` returns 409 `DRAFT_EXISTS` when a draft already exists, and no route deletes a draft (PR #27).
 - GOT.42: `GET /stream` has no publisher for `notification` events; notifications are rows in their own table and never reach `NOTIFY` (user decision Q7, PR #26). The issue views must poll or refetch.
 - GOT.47: `send_message` on an issue carries `{ issue_id, text }` and `resume_with_decision` carries `{ issue_id, decision_id }`. Both are enqueued only while the execution is WAITING_FOR_USER; a message on a non-blocking issue is refused with 409 (PR #28).
 - GOT.47: resolving as `spec_revision` leaves the execution WAITING_FOR_USER and enqueues nothing; `/spec/approve` later enqueues `resume_with_revision` (PR #27, #28).
 - GOT.42: broadcast notifications (`user_id` null) share one `read_at` across users; one user's read marks it read for all (PR #28, accepted as designed).
-- GOT.38/42: `GET /stream` has no replay (user decision Q8); every view must refetch when the stream reconnects. Reuse `apps/web/src/board/useEventReconnect.ts` and the `useLatestRequest` stale-response guard from PR #30 (PR #26, #30).
-- GOT.38/42: never put `?after=` in the URL given to `useEventStream`; the hook appends its own `after=` on reconnect and the api rejects a doubled param with 400. Subscribe with the bare URL before loading pages and merge by event id, as `TaskDetailView` does (PR #33). Pass `types` explicitly (PR #18).
-- GOT.38/42: a routed view that keeps state must key its stateful panel on the route param, or in-app navigation between two ids keeps the old state; see `TaskDetailView` (PR #33).
-- GOT.38/42: the web api client's typed methods live in `apps/web/src/api/types.ts` and `client.ts` (`BoardApiClient`); extend them there and update the typed fake in `apps/web/src/task/fixtures.ts`. `AppLayout` owns the client instance. Run `cd apps/web && npx tsc --noEmit -p tsconfig.json` as well as the root typecheck: the root build excludes web test files (PR #30, #33).
-- GOT.38: `@orchestra/prompts` is a web dependency for `renderSpecMarkdown` and `diffSpecs` (user decision Q13, PR #33).
+- Later: `GET /stream` has no replay (user decision Q8); every view must refetch when the stream reconnects. Reuse `apps/web/src/board/useEventReconnect.ts` and the `useLatestRequest` stale-response guard from PR #30 (PR #26, #30).
+- Later: never put `?after=` in the URL given to `useEventStream`; the hook appends its own `after=` on reconnect and the api rejects a doubled param with 400. Subscribe with the bare URL before loading pages and merge by event id, as `TaskDetailView` does (PR #33). Pass `types` explicitly (PR #18).
+- Later: a routed view that keeps state must key its stateful panel on the route param, or in-app navigation between two ids keeps the old state; see `TaskDetailView` (PR #33).
+- Later: the web api client's typed methods live in `apps/web/src/api/types.ts` and `client.ts` (`BoardApiClient`); extend them there and update the typed fake in `apps/web/src/task/fixtures.ts`. `AppLayout` owns the client instance. Run `cd apps/web && npx tsc --noEmit -p tsconfig.json` as well as the root typecheck: the root build excludes web test files (PR #30, #33).
+- Later: `@orchestra/prompts` is a web dependency for `renderSpecMarkdown` and `diffSpecs` (user decision Q13, PR #33).
 - GOT.39: `StartRequest.testCommand` carries the repository test command to the review role and must be a single plain command. The wrapper reads it from `context.review_command`; where that value comes from is design OI3 and needs a decision.
 - GOT.39: the runner must prepend `packages/review-wrapper/bin` to the agent's PATH (user decision Q7, no bundler) and invoke `orchestra-review --round N` after `report_review_started(N)`. Read the exit code, not stdout, for the outcome: 0 clean, 1 findings, 2 ask_user, 3 error. The round-limit stop instruction from `report_review_result` reaches the agent only on the wrapper's stderr (PR #29).
 - GOT.39: the wrapper calls `report_review_result` itself, so the implementing agent must not call it again for the same round (PR #29).

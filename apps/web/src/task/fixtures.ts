@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import type { IssueApiClient } from "../api/client.js";
+import type { SpecApiClient } from "../api/client.js";
 import type {
   Execution,
   Issue,
@@ -312,12 +312,13 @@ export function makeTimelineEvent(overrides: Partial<TimelineEvent>): TimelineEv
 }
 
 /**
- * A fully-typed `IssueApiClient` double (a `BoardApiClient` plus the
- * GOT.42 issue detail methods) with every method a no-op `vi.fn()`, so a
- * test only has to override the handful of methods it exercises rather
- * than restate the whole interface (GOT.41-fix0).
+ * A fully-typed `SpecApiClient` double (a `BoardApiClient` plus the
+ * GOT.42 issue detail methods and the GOT.38 spec builder methods) with
+ * every method a no-op `vi.fn()`, so a test only has to override the
+ * handful of methods it exercises rather than restate the whole interface
+ * (GOT.41-fix0).
  */
-export function makeFakeClient(overrides: Partial<IssueApiClient> = {}): IssueApiClient {
+export function makeFakeClient(overrides: Partial<SpecApiClient> = {}): SpecApiClient {
   return {
     request: vi.fn(),
     login: vi.fn(),
@@ -335,6 +336,14 @@ export function makeFakeClient(overrides: Partial<IssueApiClient> = {}): IssueAp
     getIssue: vi.fn().mockResolvedValue(makeIssueDetail()),
     postIssueMessage: vi.fn(),
     resolveIssue: vi.fn(),
+    listProjectRepositories: vi.fn().mockResolvedValue([]),
+    startSpecSession: vi.fn(),
+    postSpecMessage: vi.fn(),
+    saveDraft: vi.fn(),
+    requestReview: vi.fn(),
+    sendBack: vi.fn(),
+    approveSpec: vi.fn(),
+    reviseSpec: vi.fn(),
     ...overrides,
   };
 }
