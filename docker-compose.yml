@@ -43,7 +43,7 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-orchestra}:${POSTGRES_PASSWORD:-orchestra}@db:5432/${POSTGRES_DB:-orchestra}
       SESSION_SECRET: ${SESSION_SECRET}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
-      # `development`/`test` drop the session cookie's Secure flag (apps/api/src/plugins/auth.ts);
+      # `development`/`test` drop the session cookie's Secure flag (apps/api/src/routes/auth.ts);
       # keep this `production` for anything reachable off the machine (see .env.example).
       NODE_ENV: ${NODE_ENV:-production}
     expose:

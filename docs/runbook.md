@@ -47,7 +47,7 @@ listens (`apps/api/src/index.ts`, `apps/api/src/app.ts`) rather than exiting
 immediately.
 
 `.env`'s `NODE_ENV` defaults to `production`, which marks the session
-cookie `Secure` (`apps/api/src/plugins/auth.ts`); set it to `development`
+cookie `Secure` (`apps/api/src/routes/auth.ts`); set it to `development`
 for logging in over plain `http://localhost` instead of TLS, and keep it
 `production` behind TLS for anything reachable off this machine.
 
@@ -178,7 +178,7 @@ From `apps/worker/src/config.ts` (the source of truth; `.env.example` and
 | `GITHUB_TOKEN` | none (optional) | exported into every agent's environment |
 | `ANTHROPIC_API_KEY` | none (optional) | omit to rely on the host's `claude` CLI login |
 | `OPENAI_API_KEY` | none (optional) | required for Codex-runtime repositories |
-| `LOG_LEVEL` | `info` | one of `fatal, error, warn, info, debug, trace, silent`; not listed in `.env.example` today, only in `deploy/worker.env.example` |
+| `LOG_LEVEL` | `info` | one of `fatal, error, warn, info, debug, trace, silent` |
 
 Then either:
 
