@@ -377,21 +377,38 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   // ------------------------------------------------------------ db writes
 
-  /** Event-only write: task, then execution, KEY SHARE (as agent-tools does). */
+  /**
+   * Event-only write: task, then execution, KEY SHARE (as agent-tools does).
+   * A spec execution only leaves ASSIGNED or RUNNING through the api or a
+   * sweeper (request-review, cancel), never through its own tools, so for
+   * the spec role a non-live state under the lock means the execution is no
+   * longer this runner's: nothing is written and false is returned (GOT.37
+   * F5). The key-share lock blocks a concurrent state move until commit.
+   * An implementation execution ends through its own tools mid-turn
+   * (report_pr_created, report_failed) and keeps its trailing events (§9.3).
+   */
   async function appendRunEvent(
     ctx: RunnerContext,
     type: ExecutionEventType,
     payload: unknown,
-  ): Promise<void> {
-    await db.transaction(async (tx) => {
+  ): Promise<boolean> {
+    return db.transaction(async (tx) => {
       await lockTaskForTool(tx, ctx.task.id, "key share");
-      await lockExecutionForTool(tx, ctx.execution.id, "key share");
+      const row = await lockExecutionForTool(tx, ctx.execution.id, "key share");
+      if (
+        ctx.execution.role === "spec" &&
+        row?.state !== "ASSIGNED" &&
+        row?.state !== "RUNNING"
+      ) {
+        return false;
+      }
       await appendEvent(tx, {
         taskId: ctx.task.id,
         executionId: ctx.execution.id,
         type,
         payload,
       });
+      return true;
     });
   }
 
@@ -554,6 +571,14 @@ export function createRunner(deps: RunnerDeps): Runner {
   ): Promise<void> {
     const executionId = ctx.execution.id;
     const writes = createWriteQueue(log);
+    /** `appendRunEvent`; a write refused as not live is the gone signal (F5). */
+    const appendLive = async (type: ExecutionEventType, payload: unknown): Promise<void> => {
+      if (await appendRunEvent(ctx, type, payload)) return;
+      if (state.stopReason === null) {
+        log.info({ type }, "spec execution left RUNNING, event dropped, aborting the session");
+      }
+      state.stop("gone");
+    };
     const timeouts = new Set<NodeJS.Timeout>();
     const intervals = new Set<NodeJS.Timeout>();
     let quietTimer: NodeJS.Timeout | undefined;
@@ -646,7 +671,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         const text = redact(buffer);
         buffer = "";
         return writes.push("agent.message.delta", () =>
-          appendRunEvent(ctx, "agent.message.delta", { text }),
+          appendLive("agent.message.delta", { text }),
         );
       };
 
@@ -703,7 +728,7 @@ export function createRunner(deps: RunnerDeps): Runner {
             if (!event.name.startsWith(ORCHESTRA_TOOL_PREFIX)) {
               const payload = redact({ name: event.name, input: event.input });
               await writes.push("agent.tool_call", () =>
-                appendRunEvent(ctx, "agent.tool_call", payload),
+                appendLive("agent.tool_call", payload),
               );
             }
           } else if (event.type === "usage") {
@@ -731,6 +756,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         // The execution left the live states under us (C44 request-review,
         // a cancel): its buffered text and the turn's message are dropped,
         // so it gets no further runner writes.
+        // C52: every role. A gone execution is no longer this runner's, the same class of write F5 forbids.
         cancel(flushTimer);
         flushTimer = undefined;
         buffer = "";
@@ -745,7 +771,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         if (message !== "") {
           const text = redact(message);
           void writes.push("agent.message", () =>
-            appendRunEvent(ctx, "agent.message", { text }),
+            appendLive("agent.message", { text }),
           );
         }
       }

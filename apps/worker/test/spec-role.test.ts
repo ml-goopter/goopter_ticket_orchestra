@@ -46,7 +46,7 @@ import {
 import { createWorktreeSweeperPhase } from "../src/sweeper/index.js";
 import type { TickContext } from "../src/tick.js";
 import { WorktreeManager, type PrepareSpecInput } from "../src/worktrees/index.js";
-import { startTestDb, waitFor, type TestDb } from "./harness.js";
+import { sleep, startTestDb, waitFor, type TestDb } from "./harness.js";
 
 /**
  * GOT.37: the spec role end to end (design.md §5.2, §8, §9.1, §9.3, §12.3,
@@ -344,6 +344,7 @@ interface HarnessOptions {
   host?: string;
   workerId?: string;
   flushMs?: number;
+  blockingPollMs?: number;
   beforeTokenIssue?: (executionId: string) => Promise<void>;
 }
 
@@ -373,7 +374,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     basePath: "/usr/bin:/bin",
     timings: {
       leaseRenewMs: 60_000,
-      blockingPollMs: 50,
+      blockingPollMs: options.blockingPollMs ?? 50,
       ...(options.flushMs !== undefined ? { flushMs: options.flushMs } : {}),
     },
     ...(options.beforeTokenIssue ? { hooks: { beforeTokenIssue: options.beforeTokenIssue } } : {}),
@@ -1006,5 +1007,37 @@ describe("review round 1 (GOT.37 F1-F4)", () => {
     expect(records).toContainEqual(
       expect.objectContaining({ msg: "execution is no longer live, not opening the session" }),
     );
+  });
+});
+
+describe("review round 2 (GOT.37 F5)", () => {
+  it("F5: an event emitted after request-review commits, before the poll notices, is not written and aborts the session", async () => {
+    const s = await seedSpecTask();
+    const id = await seedSpecExecution(s.taskId, "RUNNING");
+    // The C44 poll never fires within this test: only the write gate can stop it.
+    const h = makeHarness({ blockingPollMs: 60_000 });
+    let before: number | undefined;
+    h.adapter.resumeScripts.push(async function* (_req, signal) {
+      await requestReview(s.taskId);
+      before = (await eventsOf(s.taskId)).length;
+      yield { type: "tool_call", name: "Read", input: { file_path: "README.md" } };
+      await Promise.race([aborted(signal), sleep(1_000)]);
+      yield { type: "turn_done", finalText: "" };
+    });
+    await enqueue(s.taskId, "send_message", id, { text: "look again" });
+    await consume(h.runner);
+    await idle(h.runner, id);
+
+    expect(before).toBeDefined();
+    const after = await eventsOf(s.taskId);
+    expect(after).toHaveLength(before!);
+    expect(after.some((e) => e.type === "agent.tool_call")).toBe(false);
+    expect(h.adapter.signals[0]!.aborted).toBe(true);
+    expect(records).toContainEqual(
+      expect.objectContaining({ msg: "spec execution left RUNNING, event dropped, aborting the session" }),
+    );
+    const row = await execution(id);
+    expect(row.state).toBe("COMPLETED");
+    expect(row.toolsTokenHash).toBeNull();
   });
 });
