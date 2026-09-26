@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the orchestra worker (docs/design.md §15.2). Installed by
+  deploy/launchd/install.sh, which substitutes the three placeholders below
+  (__CHECKOUT_DIR__, __LOG_DIR__, __PATH__) before copying this file to
+  ~/Library/LaunchAgents. Do not load this template as-is; run install.sh.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.goopter.orchestra-worker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__CHECKOUT_DIR__/deploy/launchd/run-worker.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__CHECKOUT_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+
+  <!-- Restart on a non-zero exit (crash); a clean `exit 0` (graceful
+       SIGTERM, see apps/worker/src/shutdown.ts) is not restarted. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- Minimum seconds between restarts, so a fast crash loop cannot spin. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/orchestra-worker.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/orchestra-worker.err.log</string>
+</dict>
+</plist>

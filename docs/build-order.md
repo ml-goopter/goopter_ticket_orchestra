@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `b71d7fa` plus this change.
+Status as of 2026-09-25, main at `2341134` plus this change.
 
 ## Completed
 
@@ -38,6 +38,7 @@ Status as of 2026-09-25, main at `b71d7fa` plus this change.
 | W7 | GOT.42 | web: issue detail view | #36 |
 | W7 | GOT.39 | worker: implementation role with review phase | #37 |
 | W7 | GOT.44 | cost: pricing table, /costs route, costs view | #38 |
+| fill-in | GOT.27 | deploy: worker service units and operator runbook | #39 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -56,7 +57,9 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | W9 | GOT.45 | adapters: Codex implementation | GOT.14 | M9 |
 | W9 | GOT.49 | E2E: same ticket through Codex | GOT.45, 48 | M9 |
 
-Fill-in tasks with dependencies already met, run when a slot would otherwise sit idle: GOT.27 deploy units and runbook (GOT.17, 19), GOT.29 web admin views (GOT.20, 22).
+Fill-in task with dependencies already met, run when a slot would otherwise sit idle: GOT.29 web admin views (GOT.20, 22).
+
+GOT.27's units have not been loaded under launchd on this machine; that is an operator step recorded in `docs/runbook.md` and outside the review loop (PR #39). Plain-http localhost use needs `NODE_ENV=development` for the session cookie (C37).
 
 GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `codex` installed on the worker host (design OI1).
 
