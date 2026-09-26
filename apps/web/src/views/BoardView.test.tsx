@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BoardApiClient } from "../api/client.js";
 import type { TaskCard } from "../api/types.js";
 import type { EventSourceLike, MessageEventLike } from "../sse/useEventStream.js";
+import { makeFakeClient } from "../task/fixtures.js";
 import { BoardView } from "./BoardView.js";
 
 afterEach(cleanup);
@@ -70,17 +71,7 @@ function makeCard(overrides: Partial<TaskCard>): TaskCard {
 }
 
 function makeClient(listTasksImpl: () => Promise<TaskCard[]>): BoardApiClient {
-  return {
-    request: vi.fn(),
-    login: vi.fn(),
-    logout: vi.fn(),
-    me: vi.fn(),
-    health: vi.fn(),
-    listTasks: vi.fn(listTasksImpl),
-    listIssues: vi.fn().mockResolvedValue([]),
-    listNotifications: vi.fn().mockResolvedValue([]),
-    markNotificationRead: vi.fn(),
-  };
+  return makeFakeClient({ listTasks: vi.fn(listTasksImpl) });
 }
 
 const NOW = () => new Date("2026-01-01T12:00:00.000Z");

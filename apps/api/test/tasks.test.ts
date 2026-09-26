@@ -13,11 +13,16 @@ import {
   findExecutionById,
   listAuditEventsForEntity,
   listExecutionEventsForTask,
+  seedApproval,
   seedDependency,
   seedExecution,
   seedFixtures,
+  seedIssue,
+  seedReviewResult,
+  seedRevision,
   seedSession,
   seedTask,
+  seedTaskDecision,
   sessionCookieHeader,
   startTestDb,
 } from "./harness.js";
@@ -248,6 +253,136 @@ describe("GET /api/tasks/:id (AC2)", () => {
       headers: { cookie },
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+describe("GET /api/tasks/:id widened aggregate (GOT.41, design.md §12.2, §14)", () => {
+  let taskId: string;
+  let revisionV1: string;
+  let revisionV2: string;
+  let specExecutionId: string;
+  let implExecutionId: string;
+  let issueId: string;
+
+  beforeAll(async () => {
+    taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-70",
+      state: "IMPLEMENTING",
+      priority: 5,
+    });
+
+    revisionV1 = await seedRevision(h.db, taskId, 1, "superseded", {
+      repository: "tsk-repo",
+      objective: "v1 objective",
+      scope: ["a"],
+      out_of_scope: [],
+      requirements: ["r1"],
+      acceptance_criteria: ["ac1"],
+      validation: ["v1"],
+      constraints: [],
+      dependencies: [],
+    });
+    revisionV2 = await seedRevision(h.db, taskId, 2, "approved", {
+      repository: "tsk-repo",
+      objective: "v2 objective",
+      scope: ["a", "b"],
+      out_of_scope: [],
+      requirements: ["r1", "r2"],
+      acceptance_criteria: ["ac1"],
+      validation: ["v1"],
+      constraints: [],
+      dependencies: [],
+    });
+
+    await seedApproval(h.db, revisionV2, {
+      approvedBy: fx.userId,
+      approvedAt: new Date("2026-01-02T00:00:00Z"),
+    });
+    // `seedRevision`'s `status: "approved"` sets the revision row only;
+    // `tasks.approved_revision_id` is a separate column the real approve
+    // route sets (design.md §12.3, out of scope here), so it is set
+    // directly via the raw client rather than importing drizzle (design.md
+    // §3: apps/api never imports drizzle).
+    await h.sql`update tasks set approved_revision_id = ${revisionV2} where id = ${taskId}`;
+
+    specExecutionId = await seedExecution(h.db, taskId, {
+      role: "spec",
+      attempt: 1,
+      state: "COMPLETED",
+      createdAt: new Date("2026-01-01T01:00:00Z"),
+    });
+    implExecutionId = await seedExecution(h.db, taskId, {
+      role: "implementation",
+      attempt: 1,
+      state: "RUNNING",
+      sessionId: "session-70",
+      branch: "tsk-70",
+      createdAt: new Date("2026-01-01T02:00:00Z"),
+    });
+
+    issueId = await seedIssue(h.db, {
+      taskId,
+      executionId: implExecutionId,
+      blocking: true,
+      status: "RESOLVED",
+    });
+    await seedTaskDecision(h.db, {
+      taskId,
+      issueId,
+      decidedBy: fx.userId,
+      decidedAt: new Date("2026-01-02T01:00:00Z"),
+    });
+
+    await seedReviewResult(h.db, implExecutionId, {
+      round: 1,
+      createdAt: new Date("2026-01-02T02:00:00Z"),
+    });
+  });
+
+  it("returns revisions, approvals, executions, issues, decisions and reviewResults in order, existing fields unchanged", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/tasks/${taskId}`,
+      headers: { cookie },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+
+    // Existing fields untouched.
+    expect(body.task.id).toBe(taskId);
+    expect(body.project).toBeDefined();
+    expect(body.repository).toBeDefined();
+    expect(body.approvedRevision.id).toBe(revisionV2);
+    expect(body.latestExecutions.spec.id).toBe(specExecutionId);
+    expect(body.latestExecutions.implementation.id).toBe(implExecutionId);
+    expect(body.openIssueCount).toBe(0);
+    expect(body.pullRequest).toBeNull();
+    expect(body.dependencies).toEqual([]);
+    expect(typeof body.cost.costUsd).toBe("number");
+
+    // New collections, in the stated order.
+    expect(body.revisions.map((r: { id: string }) => r.id)).toEqual([
+      revisionV1,
+      revisionV2,
+    ]);
+
+    expect(body.approvals).toHaveLength(1);
+    expect(body.approvals[0].revisionId).toBe(revisionV2);
+    expect(body.approvals[0].approvedBy).toBe(fx.userId);
+
+    expect(body.executions.map((e: { id: string }) => e.id)).toEqual([
+      specExecutionId,
+      implExecutionId,
+    ]);
+
+    expect(body.issues.map((i: { id: string }) => i.id)).toEqual([issueId]);
+
+    expect(body.decisions).toHaveLength(1);
+    expect(body.decisions[0].issueId).toBe(issueId);
+
+    expect(body.reviewResults).toHaveLength(1);
+    expect(body.reviewResults[0].executionId).toBe(implExecutionId);
+    expect(body.reviewResults[0].round).toBe(1);
   });
 });
 

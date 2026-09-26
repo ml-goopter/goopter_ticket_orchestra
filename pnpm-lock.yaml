@@ -224,6 +224,9 @@ importers:
       '@orchestra/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@orchestra/prompts':
+        specifier: workspace:*
+        version: link:../../packages/prompts
       react:
         specifier: 19.3.0
         version: 19.3.0

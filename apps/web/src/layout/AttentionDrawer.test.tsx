@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BoardApiClient } from "../api/client.js";
 import type { Issue, Notification, TaskCard } from "../api/types.js";
 import type { EventSourceLike, MessageEventLike } from "../sse/useEventStream.js";
+import { makeFakeClient } from "../task/fixtures.js";
 import { AttentionDrawer } from "./AttentionDrawer.js";
 
 class FakeEventSource implements EventSourceLike {
@@ -113,12 +114,7 @@ interface Fixtures {
 }
 
 function makeClient(fixtures: Fixtures): BoardApiClient {
-  return {
-    request: vi.fn(),
-    login: vi.fn(),
-    logout: vi.fn(),
-    me: vi.fn(),
-    health: vi.fn(),
+  return makeFakeClient({
     listIssues: vi.fn(() => Promise.resolve(fixtures.issues)),
     listTasks: vi.fn(() => Promise.resolve(fixtures.tasks)),
     listNotifications: vi.fn(() => Promise.resolve(fixtures.notifications)),
@@ -127,7 +123,7 @@ function makeClient(fixtures: Fixtures): BoardApiClient {
       const updated = { ...(found ?? makeNotification({ id })), readAt: "2026-01-02T00:00:00.000Z" };
       return Promise.resolve(updated);
     }),
-  };
+  });
 }
 
 function renderDrawer(client: BoardApiClient) {
@@ -274,17 +270,9 @@ describe("AttentionDrawer", () => {
   });
 
   it("renders visible error text when a fetch fails (AC7)", async () => {
-    const client: BoardApiClient = {
-      request: vi.fn(),
-      login: vi.fn(),
-      logout: vi.fn(),
-      me: vi.fn(),
-      health: vi.fn(),
+    const client: BoardApiClient = makeFakeClient({
       listIssues: vi.fn(() => Promise.reject(new Error("network down"))),
-      listTasks: vi.fn().mockResolvedValue([]),
-      listNotifications: vi.fn().mockResolvedValue([]),
-      markNotificationRead: vi.fn(),
-    };
+    });
     renderDrawer(client);
     await openDrawer();
 
