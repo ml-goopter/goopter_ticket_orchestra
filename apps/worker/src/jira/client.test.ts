@@ -250,6 +250,74 @@ describe("createJiraClient.getIssue (design.md §9.2, Q3, C8)", () => {
   });
 });
 
+describe("createJiraClient.addComment (design.md §11.1, C10-C12)", () => {
+  it("POSTs to the comment endpoint with Basic auth and the exact ADF body: one paragraph per line", async () => {
+    let receivedBody: unknown;
+    const requests: Array<{
+      method: string | undefined;
+      path: string;
+      headers: http.IncomingHttpHeaders;
+    }> = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        requests.push({
+          method: req.method,
+          path: req.url ?? "",
+          headers: req.headers,
+        });
+        if (chunks.length > 0) {
+          receivedBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        }
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "10001" }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    cleanup = () => new Promise((resolve) => server.close(() => resolve()));
+
+    const client = createJiraClient({
+      baseUrl: `http://127.0.0.1:${port}`,
+      email: "bot@goopter.dev",
+      apiToken: "secret-token",
+    });
+
+    await client.addComment("GOOP-1", "Pull request opened: https://x\n[orchestra:pr_created:task-1]");
+
+    expect(requests[0]!.method).toBe("POST");
+    expect(requests[0]!.path).toBe("/rest/api/3/issue/GOOP-1/comment");
+    const expectedAuth = `Basic ${Buffer.from("bot@goopter.dev:secret-token").toString("base64")}`;
+    expect(requests[0]!.headers.authorization).toBe(expectedAuth);
+    expect(receivedBody).toEqual({
+      body: {
+        type: "doc",
+        version: 1,
+        content: [
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Pull request opened: https://x" }],
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "[orchestra:pr_created:task-1]" }],
+          },
+        ],
+      },
+    });
+  });
+
+  it("throws JiraApiError on a non-2xx status, 404 included", async () => {
+    const { baseUrl } = await setUp(() => ({ status: 404 }));
+    const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
+
+    const err = await client.addComment("GOOP-1", "text").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(JiraApiError);
+    expect((err as InstanceType<typeof JiraApiError>).status).toBe(404);
+  });
+});
+
 describe("createJiraClient.getIssue: non-paragraph listItem children and taskList (F1 regression)", () => {
   it("renders a codeBlock inside a listItem and a taskItem's text instead of dropping them", async () => {
     const { baseUrl } = await setUp(() => ({

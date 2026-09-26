@@ -82,6 +82,12 @@ export interface JiraClient {
   issueExists(key: string): Promise<boolean>;
   /** Full ticket content, ADF fields rendered to plain text (design.md §9.2, Q3). */
   getIssue(key: string): Promise<TicketContext>;
+  /**
+   * Posts one comment to `key` (design.md §11.1 write-back table). `bodyText`
+   * is rendered as one ADF paragraph per line. Throws `JiraApiError` on any
+   * non-2xx status, 404 included; callers decide what a 404 means.
+   */
+  addComment(key: string, bodyText: string): Promise<void>;
 }
 
 const SEARCH_FIELDS = "summary,priority,created";
@@ -120,6 +126,23 @@ interface JiraIssueApiResponse {
 /** `2026-01-15T10:30:00.000+0000` -> `2026-01-15`, matching `TicketComment.createdAt`. */
 function toDateOnly(iso: string): string {
   return iso.slice(0, 10);
+}
+
+/**
+ * Builds the ADF document `addComment` posts (design.md §11.1 write-back
+ * table): one paragraph per line of `bodyText`, including the trailing
+ * `[orchestra:...]` marker line so the dedupe check in `writeback.ts` finds
+ * it on the next `getIssue`.
+ */
+function bodyTextToAdfDoc(bodyText: string): unknown {
+  return {
+    type: "doc",
+    version: 1,
+    content: bodyText.split("\n").map((line) => ({
+      type: "paragraph",
+      content: line.length > 0 ? [{ type: "text", text: line }] : [],
+    })),
+  };
 }
 
 export function createJiraClient(config: JiraClientConfig): JiraClient {
@@ -233,6 +256,29 @@ export function createJiraClient(config: JiraClientConfig): JiraClient {
         comments,
       };
       return ticket;
+    },
+
+    async addComment(key, bodyText) {
+      const url = new URL(
+        `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
+        config.baseUrl,
+      );
+      const res = await fetchImpl(url, {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ body: bodyTextToAdfDoc(bodyText) }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) {
+        throw new JiraApiError(
+          res.status,
+          `Jira add comment for ${key} failed with status ${res.status}`,
+        );
+      }
     },
   };
 }
