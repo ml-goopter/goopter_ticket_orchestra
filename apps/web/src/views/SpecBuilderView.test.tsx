@@ -136,6 +136,59 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("Task not found."));
   });
 
+  it(
+    "recovers from a failed initial load once a reconnect refetch succeeds (F1, review round 4)",
+    async () => {
+      const getTask = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("network blip"))
+        .mockResolvedValue(aggregateInProgress());
+      const client = makeFakeClient({ getTask });
+      renderSpecBuilder(client);
+
+      await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+      expect(screen.queryByTestId("task-state")).toBeNull();
+
+      await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+      await act(async () => {
+        currentSource().onopen?.();
+      });
+      await act(async () => {
+        currentSource().onerror?.(new Event("error"));
+      });
+
+      await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(1), { timeout: 3000 });
+
+      await act(async () => {
+        currentSource().onopen?.();
+      });
+
+      await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByTestId("task-state")).toBeTruthy());
+      expect(screen.queryByRole("alert")).toBeNull();
+    },
+    10000,
+  );
+
+  it("retries the initial load from the error screen's Retry button", async () => {
+    const getTask = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("network blip"))
+      .mockResolvedValue(aggregateInProgress());
+    const client = makeFakeClient({ getTask });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    });
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("task-state")).toBeTruthy());
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("disables Approve and shows the first failing rule when the draft has an empty required list", async () => {
     const client = makeFakeClient({
       getTask: vi.fn().mockResolvedValue(

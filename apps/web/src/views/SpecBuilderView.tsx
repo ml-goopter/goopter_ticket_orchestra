@@ -162,6 +162,12 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
    */
   function applyAggregate(next: TaskAggregate, promptIfDirty: boolean) {
     setAggregate(next);
+    // F1, GOT.38 review round 4: every successful fetch (the initial load or
+    // a later `refetch`, e.g. a reconnect catch-up) clears a stuck error
+    // screen. Without this, an initial `loadInitial` failure left
+    // `loadState` at "error" forever, even once a later `refetch` succeeded
+    // and populated `aggregate`.
+    setLoadState("loaded");
     const draft = next.revisions.find((revision) => revision.status === "draft") ?? null;
     const newContent = draft ? draft.content : null;
     setDraftRevision(draft);
@@ -208,7 +214,6 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
       const loadedAggregate = await apiClient.getTask(id);
       if (!isCurrent(generation)) return;
       applyAggregate(loadedAggregate, false);
-      setLoadState("loaded");
       try {
         const repos = await apiClient.listProjectRepositories(loadedAggregate.project.id);
         if (isCurrent(generation)) setProjectRepositories(repos);
@@ -522,6 +527,9 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
       <main>
         <h1>Spec builder</h1>
         <p role="alert">{loadError ?? "Failed to load the task."}</p>
+        <button type="button" onClick={() => void loadInitial()}>
+          Retry
+        </button>
       </main>
     );
   }
