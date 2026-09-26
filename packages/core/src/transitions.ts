@@ -27,8 +27,9 @@ import { TaskState, ExecutionState } from "./enums.js";
  *  - `execution.assigned`    QUEUED -> ASSIGNED
  *  - `execution.started`     ASSIGNED -> RUNNING
  *  - `execution.waiting`     RUNNING -> WAITING_FOR_USER
- *  - `execution.resumed`     WAITING_FOR_USER -> RUNNING
- *  - `execution.completed`   RUNNING -> COMPLETED
+ *  - `execution.resumed`     WAITING_FOR_USER -> RUNNING, and COMPLETED ->
+ *    RUNNING for a spec execution sent back from review (§5.2, GOT.37 C45)
+ *  - `execution.completed`  RUNNING -> COMPLETED
  *  - `execution.failed`      ASSIGNED/RUNNING -> FAILED
  *  - `execution.cancelled`   QUEUED/ASSIGNED/RUNNING/WAITING_FOR_USER -> CANCELLED
  *
@@ -117,9 +118,11 @@ export const EXECUTION_TRANSITIONS = [
   { entity: "execution", from: ExecutionState.ASSIGNED, trigger: "execution.cancelled", to: ExecutionState.CANCELLED },
   { entity: "execution", from: ExecutionState.RUNNING, trigger: "execution.cancelled", to: ExecutionState.CANCELLED },
   { entity: "execution", from: ExecutionState.WAITING_FOR_USER, trigger: "execution.cancelled", to: ExecutionState.CANCELLED },
-  // The one backward edge (design.md §5.2 prose): CI feedback resumes the
-  // same execution instead of creating a new one.
+  // Backward edges (design.md §5.2 prose): CI feedback resumes the same
+  // execution instead of creating a new one, and "sending the spec back to
+  // draft resumes it" (GOT.37 C45). Each keeps its own trigger.
   { entity: "execution", from: ExecutionState.COMPLETED, trigger: "resume_with_ci_failure", to: ExecutionState.RUNNING },
+  { entity: "execution", from: ExecutionState.COMPLETED, trigger: "execution.resumed", to: ExecutionState.RUNNING },
 ] as const satisfies readonly {
   entity: "execution";
   from: ExecutionState;

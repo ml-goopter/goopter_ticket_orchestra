@@ -57,8 +57,9 @@ const EXPECTED_EDGES: {
   { entity: "execution", from: "ASSIGNED", trigger: "execution.cancelled", to: "CANCELLED" },
   { entity: "execution", from: "RUNNING", trigger: "execution.cancelled", to: "CANCELLED" },
   { entity: "execution", from: "WAITING_FOR_USER", trigger: "execution.cancelled", to: "CANCELLED" },
-  // the one backward edge
+  // the backward edges (§5.2 prose): CI feedback, and a spec sent back (GOT.37 C45)
   { entity: "execution", from: "COMPLETED", trigger: "resume_with_ci_failure", to: "RUNNING" },
+  { entity: "execution", from: "COMPLETED", trigger: "execution.resumed", to: "RUNNING" },
 ];
 
 describe("TRANSITIONS covers every §5.1/§5.2 edge", () => {
@@ -83,6 +84,23 @@ describe("TRANSITIONS covers every §5.1/§5.2 edge", () => {
           r.to === "RUNNING",
       ),
     ).toBe(true);
+  });
+
+  it("includes the spec send-back COMPLETED -> RUNNING edge on execution.resumed (GOT.37 C45)", () => {
+    expect(resolveTransition("execution", "COMPLETED", "execution.resumed")).toEqual({
+      ok: true,
+      to: "RUNNING",
+    });
+  });
+
+  it("COMPLETED has exactly the two back edges to RUNNING", () => {
+    const fromCompleted = TRANSITIONS.filter(
+      (r) => r.entity === "execution" && r.from === "COMPLETED",
+    ).map((r) => `${r.trigger}->${r.to}`);
+    expect(fromCompleted.sort()).toEqual([
+      "execution.resumed->RUNNING",
+      "resume_with_ci_failure->RUNNING",
+    ]);
   });
 
   it("includes SPEC_APPROVED -> IMPLEMENTING (approve with paused execution)", () => {

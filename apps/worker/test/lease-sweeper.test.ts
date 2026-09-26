@@ -724,3 +724,94 @@ describe("phase registry (AC9)", () => {
     await expectSwept(ids, me.id, other.id, "IMPLEMENTING");
   });
 });
+
+describe("orphaned ASSIGNED spec executions on a dead host (GOT.37 C48)", () => {
+  /** A spec execution in `state`; spec sessions hold no lease. */
+  async function seedSpec(
+    taskId: string,
+    state: ExecutionState,
+    worker: { id: string; host: string },
+  ): Promise<string> {
+    const [row] = await db
+      .insert(executions)
+      .values({
+        taskId,
+        role: "spec",
+        attempt: 1,
+        state,
+        runtime: "claude",
+        model: "default",
+        workerId: worker.id,
+        host: worker.host,
+        toolsTokenHash: `token-hash-${++seq}`,
+      })
+      .returning({ id: executions.id });
+    return row!.id;
+  }
+
+  const notificationsFor = (taskId: string) =>
+    db.query.notifications.findMany({ where: (t, { eq }) => eq(t.taskId, taskId) });
+
+  it("fails an ASSIGNED spec execution on a dead host with process_crash and leaves one on a live host", async () => {
+    const me = await sweeper();
+    const dead = await seedWorker({ heartbeatAt: at(-16 * MINUTE) });
+    const alive = await seedWorker({ heartbeatAt: at(-5 * MINUTE) });
+    const deadTask = await seedTask("SPEC_IN_PROGRESS");
+    const aliveTask = await seedTask("SPEC_IN_PROGRESS");
+    const orphan = await seedSpec(deadTask, "ASSIGNED", dead);
+    const live = await seedSpec(aliveTask, "ASSIGNED", alive);
+
+    await createLeaseSweeperPhase().run(ctx(me.id));
+
+    const row = await execution(orphan);
+    expect(row.state).toBe("FAILED");
+    expect(row.endReason).toBe("process_crash");
+    expect(row.endDetail).toContain(dead.host);
+    expect(row.endedAt).toEqual(NOW);
+    expect(row.toolsTokenHash).toBeNull();
+    const audit = await auditFor(orphan);
+    expect(audit.map((a) => [a.fromState, a.trigger, a.toState, a.actorId])).toEqual([
+      ["ASSIGNED", "execution.failed", "FAILED", me.id],
+    ]);
+    // §9.5 for a spec execution: no retry row, the task is not moved, a
+    // needs_human notification is the record.
+    expect(await taskState(deadTask)).toBe("SPEC_IN_PROGRESS");
+    expect(
+      await db.query.executions.findMany({ where: (t, { eq }) => eq(t.taskId, deadTask) }),
+    ).toHaveLength(1);
+    expect((await notificationsFor(deadTask)).map((n) => n.kind)).toEqual(["needs_human"]);
+
+    const untouched = await execution(live);
+    expect(untouched.state).toBe("ASSIGNED");
+    expect(untouched.host).toBe(alive.host);
+    expect(untouched.toolsTokenHash).not.toBeNull();
+    expect(await auditFor(live)).toEqual([]);
+    expect(await notificationsFor(aliveTask)).toEqual([]);
+
+    // A second run changes nothing.
+    await createLeaseSweeperPhase().run(ctx(me.id));
+    expect(await auditFor(orphan)).toHaveLength(1);
+  });
+
+  it("leaves RUNNING spec executions and ASSIGNED implementation executions on a dead host to their own rules", async () => {
+    const me = await sweeper();
+    const dead = await seedWorker({ heartbeatAt: at(-16 * MINUTE) });
+    const running = await seedSpec(await seedTask("SPEC_IN_PROGRESS"), "RUNNING", dead);
+    // Implementation executions hold a lease; the lease pass owns them.
+    const impl = await seedLeased({ state: "ASSIGNED", worker: dead, expiresAt: at(MINUTE) });
+
+    await createLeaseSweeperPhase().run(ctx(me.id));
+
+    expect((await execution(running)).state).toBe("RUNNING");
+    expect((await execution(impl.executionId)).state).toBe("ASSIGNED");
+    expect(await auditFor(running)).toEqual([]);
+    expect(await auditFor(impl.executionId)).toEqual([]);
+  });
+
+  it("never fails this worker's own ASSIGNED spec execution, even with a stale heartbeat row", async () => {
+    const me = await seedWorker({ heartbeatAt: at(-60 * MINUTE) });
+    const mine = await seedSpec(await seedTask("SPEC_IN_PROGRESS"), "ASSIGNED", me);
+    await createLeaseSweeperPhase().run(ctx(me.id));
+    expect((await execution(mine)).state).toBe("ASSIGNED");
+  });
+});

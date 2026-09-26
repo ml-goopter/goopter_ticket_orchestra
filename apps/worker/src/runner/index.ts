@@ -10,6 +10,13 @@ export {
 } from "./commands.js";
 export { registerCiFailureHandler } from "./ci.js";
 export {
+  SPEC_MESSAGE_HEADER,
+  SPEC_SENT_BACK_HEADER,
+  registerSpecHandlers,
+  specMessagePrompt,
+  specSentBackPrompt,
+} from "./spec.js";
+export {
   DEFAULT_REVIEW_WRAPPER_BIN,
   DEFAULT_RUNNER_SHUTDOWN_TIMEOUT_MS,
   DEFAULT_RUNNER_TIMINGS,

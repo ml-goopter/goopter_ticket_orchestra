@@ -2,9 +2,12 @@ import fs from "node:fs/promises";
 import {
   appendEvent,
   clearExecutionWorktree,
+  listApprovedSpecWorktrees,
   listWorktreeCandidates,
+  lockApprovedSpecWorktree,
   lockWorktreeCandidate,
   markWorktreeEvicted,
+  type ApprovedSpecWorktree,
   type Db,
   type WorktreeCandidate,
   type WorktreeSweepClass,
@@ -65,6 +68,11 @@ const errMessage = (err: unknown): string =>
 /**
  * design.md §6.6, one pass. Rules in order, each over its own candidates:
  *
+ * 0. a `COMPLETED` spec execution whose task is past `SPEC_REVIEW` (any
+ *    state but `NEEDS_SPEC`, `SPEC_IN_PROGRESS`, `SPEC_REVIEW`): remove,
+ *    with no age threshold (§9.1 "removed when the spec is approved",
+ *    GOT.37 C46). The sweeper runs hourly, so removal can lag approval by
+ *    up to an hour; that latency is accepted.
  * 1. task `DONE` or `CANCELLED`, execution ended over 24 h ago: remove.
  * 2. execution `FAILED`, no retry pending, ended over 24 h ago: remove.
  * 3. execution `WAITING_FOR_USER` or task `NEEDS_HUMAN`, idle over 14
@@ -215,6 +223,49 @@ export async function sweepWorktrees(
       return false;
     }
   };
+
+  /**
+   * Rule zero for one candidate: holding the repository lock, a transaction
+   * locks the task and execution rows, re-checks the rule, removes the
+   * detached worktree at its recorded path (C33) and clears
+   * `worktree_path`. Never throws.
+   */
+  const removeSpec = async (candidate: ApprovedSpecWorktree): Promise<void> => {
+    const fields = {
+      executionId: candidate.executionId,
+      taskId: candidate.taskId,
+      kind: "approved_spec",
+      action: "remove",
+    };
+    try {
+      const repositoryName = candidate.repositoryName;
+      if (repositoryName === null) throw new Error("execution's project has no repository");
+      const outcome = await worktrees.withRepositoryLock(repositoryName, (repo) =>
+        db.transaction(async (tx) => {
+          const row = await lockApprovedSpecWorktree(tx, {
+            host,
+            executionId: candidate.executionId,
+            taskId: candidate.taskId,
+          });
+          if (!row || row.repositoryName !== repositoryName) return "gone" as const;
+          await repo.remove(row.worktreePath, { branch: null });
+          await clearExecutionWorktree(tx, row.executionId);
+          return "done" as const;
+        }),
+      );
+      if (outcome === "done") logger.info(fields, "spec worktree removed");
+    } catch (err) {
+      logger.error({ ...fields, err: errMessage(err) }, "worktree sweep failed");
+    }
+  };
+
+  let specCandidates: ApprovedSpecWorktree[] = [];
+  try {
+    specCandidates = await listApprovedSpecWorktrees(db, host);
+  } catch (err) {
+    logger.error({ kind: "approved_spec", err: errMessage(err) }, "worktree candidate list failed");
+  }
+  for (const candidate of specCandidates) await removeSpec(candidate);
 
   const retention = new Date(now.getTime() - FINISHED_RETENTION_MS);
   const idleCutoff = new Date(now.getTime() - IDLE_EVICTION_MS);

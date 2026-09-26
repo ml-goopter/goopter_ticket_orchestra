@@ -34,12 +34,13 @@ describe("resolveTransition: documented illegal moves (design.md §5)", () => {
     expect(result.ok).toBe(false);
   });
 
-  it("execution COMPLETED on any trigger other than resume_with_ci_failure is illegal", () => {
+  // The two back edges, resume_with_ci_failure and execution.resumed (spec
+  // send-back, GOT.37 C45), are pinned in transitions.test.ts.
+  it("execution COMPLETED on any trigger other than its two back edges is illegal", () => {
     for (const trigger of [
       "execution.assigned",
       "execution.started",
       "execution.waiting",
-      "execution.resumed",
       "execution.completed",
       "execution.failed",
       "execution.cancelled",
