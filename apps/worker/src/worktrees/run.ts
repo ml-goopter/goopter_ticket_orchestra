@@ -60,27 +60,71 @@ function gitEnv(): NodeJS.ProcessEnv {
   return { ...process.env, GIT_TERMINAL_PROMPT: "0" };
 }
 
-/** Runs `git <args>` in `cwd`. Throws `GitCommandError` on a non-zero exit. */
-export function runGit(cwd: string, args: readonly string[]): Promise<string> {
+export interface RunGitOptions {
+  /**
+   * Kill git and its children after this many milliseconds and reject with
+   * `GitCommandError`. Unset means no limit.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Runs `git <args>` in `cwd`. Throws `GitCommandError` on a non-zero exit or
+ * when `options.timeoutMs` elapses first.
+ */
+export function runGit(
+  cwd: string,
+  args: readonly string[],
+  options: RunGitOptions = {},
+): Promise<string> {
+  const { timeoutMs } = options;
   return new Promise((resolve, reject) => {
+    // A timed call runs in its own process group so the kill also reaches
+    // what git spawned (ssh, a transport helper, a remote hook).
     const child = spawn("git", args, {
       cwd,
       env: gitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
+      detached: timeoutMs !== undefined,
     });
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        try {
+          if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+        // Rejects now: a grandchild holding the pipes open must not delay it.
+        settle(() =>
+          reject(
+            new GitCommandError(args, null, `timed out after ${timeoutMs} ms`),
+          ),
+        );
+      }, timeoutMs);
+    }
     const stdout: Buffer[] = [];
     const stderr = new TailBuffer(SETUP_OUTPUT_TAIL_BYTES);
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.on("error", (err) =>
-      reject(new GitCommandError(args, null, err.message)),
+      settle(() => reject(new GitCommandError(args, null, err.message))),
     );
     child.on("close", (code) => {
-      if (code === 0) {
-        resolve(Buffer.concat(stdout).toString("utf8"));
-      } else {
-        reject(new GitCommandError(args, code, stderr.toString()));
-      }
+      settle(() => {
+        if (code === 0) {
+          resolve(Buffer.concat(stdout).toString("utf8"));
+        } else {
+          reject(new GitCommandError(args, code, stderr.toString()));
+        }
+      });
     });
   });
 }

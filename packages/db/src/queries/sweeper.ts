@@ -275,7 +275,9 @@ export async function releaseExecutionsOnDeadHosts(
  * - `finished`: rule one. Task `DONE` or `CANCELLED`, execution ended.
  * - `failed`: rule two. Execution `FAILED` and ended, no retry pending: no
  *   execution of the task is `QUEUED`, `ASSIGNED`, `RUNNING` or
- *   `WAITING_FOR_USER`, and the task is not `READY` (GOT.35 C8).
+ *   `WAITING_FOR_USER`, and the task is not `READY` (GOT.35 C8). A task in
+ *   `NEEDS_HUMAN` is excluded: its worktree is rule three's, so it is
+ *   pushed before removal (GOT.35 C13).
  * - `idle`: rule three. Execution `WAITING_FOR_USER`, or its task
  *   `NEEDS_HUMAN`, and the execution is not live.
  *
@@ -347,7 +349,7 @@ function kindCondition(db: DbOrTx, kind: WorktreeSweepClass): SQL | undefined {
       return and(
         eq(executions.state, "FAILED"),
         isNotNull(executions.endedAt),
-        ne(tasks.state, "READY"),
+        notInArray(tasks.state, ["READY", "NEEDS_HUMAN"]),
         notExists(
           db
             .select({ one: sql`1` })
@@ -484,5 +486,25 @@ export async function markWorktreeEvicted(
   await tx
     .update(executions)
     .set({ worktreeEvictedAt: now })
+    .where(eq(executions.id, executionId));
+}
+
+/**
+ * Resume after eviction (§6.6): the worktree was recreated from the remote
+ * branch. Records it and clears `worktree_evicted_at`, so the execution is a
+ * sweeper candidate again.
+ */
+export async function restoreEvictedWorktree(
+  tx: Tx,
+  executionId: string,
+  worktree: { worktreePath: string; branch: string | null },
+): Promise<void> {
+  await tx
+    .update(executions)
+    .set({
+      worktreePath: worktree.worktreePath,
+      branch: worktree.branch,
+      worktreeEvictedAt: null,
+    })
     .where(eq(executions.id, executionId));
 }

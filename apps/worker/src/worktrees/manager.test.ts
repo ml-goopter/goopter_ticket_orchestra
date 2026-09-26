@@ -723,6 +723,7 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
       await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
         pushed: true,
         ahead: 1,
+        tip: head,
       });
     } finally {
       spy.restore();
@@ -747,13 +748,14 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
     await expect(manager.pushIfAhead(pushInput())).resolves.toEqual({
       pushed: true,
       ahead: 2,
+      tip: head,
     });
     expect(remoteTip(BRANCH)).toBe(head);
   });
 
   it("P3: does not push a branch with no commits beyond the default branch", async () => {
     const manager = new WorktreeManager({ workspaceRoot });
-    await manager.prepareImplementation(implInput("exec-1"));
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
     const spy = spyPushes();
 
     try {
@@ -761,6 +763,7 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
         pushed: false,
         ahead: 0,
         reason: "not_ahead",
+        tip: git(prepared.worktreePath, "rev-parse", "HEAD"),
       });
     } finally {
       spy.restore();
@@ -772,7 +775,7 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
   it("P4: does not push when the remote branch already has every local commit", async () => {
     const manager = new WorktreeManager({ workspaceRoot });
     const prepared = await manager.prepareImplementation(implInput("exec-1"));
-    commitIn(prepared.worktreePath, "a.txt");
+    const head = commitIn(prepared.worktreePath, "a.txt");
     await manager.pushIfAhead(pushInput());
     const spy = spyPushes();
 
@@ -781,6 +784,7 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
         pushed: false,
         ahead: 0,
         reason: "not_ahead",
+        tip: head,
       });
     } finally {
       spy.restore();
@@ -793,7 +797,7 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
     const prepared = await manager.prepareImplementation(implInput("exec-1"));
     commitIn(prepared.worktreePath, "a.txt");
     await manager.pushIfAhead(pushInput());
-    commitIn(prepared.worktreePath, "local.txt");
+    const localHead = commitIn(prepared.worktreePath, "local.txt");
     // Someone else advances the remote branch from its current tip.
     git(seed, "fetch", "-q", "origin");
     git(seed, "checkout", "-q", "-B", BRANCH, `origin/${BRANCH}`);
@@ -805,6 +809,7 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
         pushed: false,
         ahead: 1,
         reason: "diverged",
+        tip: localHead,
       });
     } finally {
       spy.restore();
@@ -822,6 +827,7 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
       pushed: false,
       ahead: 0,
       reason: "no_local_branch",
+      tip: null,
     });
     expect(remoteHas(BRANCH)).toBe(false);
   });
@@ -831,5 +837,93 @@ describe("WorktreeManager.pushIfAhead (design.md §6.6 rule three)", () => {
     await expect(
       manager.pushIfAhead({ ...pushInput(), branch: "--force" }),
     ).rejects.toThrow(/invalid branch/);
+  });
+
+  it("F2: a push that exceeds networkTimeoutMs fails with GitCommandError and pushes nothing", async () => {
+    const manager = new WorktreeManager({ workspaceRoot, networkTimeoutMs: 300 });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    const hook = path.join(remote, "hooks", "pre-receive");
+    await fs.writeFile(hook, "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
+
+    const started = Date.now();
+    const err = await manager.pushIfAhead(pushInput()).catch((e: unknown) => e);
+
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(err).toBeInstanceOf(GitCommandError);
+    expect((err as GitCommandError).args[0]).toBe("push");
+    expect((err as GitCommandError).message).toMatch(/timed out after 300 ms/);
+    expect(remoteHas(BRANCH)).toBe(false);
+    // The repo lock was released: the next call on the repository runs.
+    await fs.rm(hook);
+    await expect(manager.pushIfAhead(pushInput())).resolves.toMatchObject({
+      pushed: true,
+    });
+  });
+
+  it("F2: a fetch that exceeds networkTimeoutMs fails with GitCommandError", async () => {
+    const manager = new WorktreeManager({ workspaceRoot, networkTimeoutMs: 300 });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    commitIn(prepared.worktreePath, "a.txt");
+    // Local transport runs this in place of git-upload-pack.
+    git(bareClonePath(), "config", "remote.origin.uploadpack", "sleep 30; git-upload-pack");
+
+    const started = Date.now();
+    const err = await manager.pushIfAhead(pushInput()).catch((e: unknown) => e);
+
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(err).toBeInstanceOf(GitCommandError);
+    expect((err as GitCommandError).args[0]).toBe("fetch");
+    expect((err as GitCommandError).message).toMatch(/timed out after 300 ms/);
+  });
+});
+
+describe("WorktreeManager.remove with expectedTip (F2)", () => {
+  it("removes when the local branch is still at expectedTip", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    const tip = git(prepared.worktreePath, "rev-parse", "HEAD");
+
+    await expect(
+      manager.remove("exec-1", {
+        repositoryName: repository.name,
+        branch: BRANCH,
+        expectedTip: tip,
+      }),
+    ).resolves.toEqual({ branchDeleted: true });
+    expect(existsSync(prepared.worktreePath)).toBe(false);
+  });
+
+  it("keeps the worktree and branch when the tip moved", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    const tip = git(prepared.worktreePath, "rev-parse", "HEAD");
+    writeFileSyncIn(prepared.worktreePath, "late.txt", "late");
+    git(prepared.worktreePath, "add", "late.txt");
+    git(prepared.worktreePath, "commit", "-q", "-m", "late");
+
+    await expect(
+      manager.remove("exec-1", {
+        repositoryName: repository.name,
+        branch: BRANCH,
+        expectedTip: tip,
+      }),
+    ).resolves.toEqual({ branchDeleted: false, tipMoved: true });
+    expect(existsSync(prepared.worktreePath)).toBe(true);
+    expect(gitOk(bareClonePath(), "rev-parse", "--verify", `refs/heads/${BRANCH}`)).toBe(true);
+  });
+
+  it("keeps the worktree when expectedTip is null but a local branch now exists", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+
+    await expect(
+      manager.remove("exec-1", {
+        repositoryName: repository.name,
+        branch: BRANCH,
+        expectedTip: null,
+      }),
+    ).resolves.toEqual({ branchDeleted: false, tipMoved: true });
+    expect(existsSync(prepared.worktreePath)).toBe(true);
   });
 });

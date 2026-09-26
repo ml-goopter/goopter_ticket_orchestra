@@ -7,9 +7,11 @@ import type { ExecutionState, TaskState } from "@orchestra/core";
 import {
   executionEvents,
   executions,
+  lockTaskForTool,
   projects,
   repositories,
   tasks,
+  transition,
   type Db,
 } from "@orchestra/db";
 import {
@@ -36,7 +38,7 @@ import {
   WorktreeManager,
   workingBranchName,
 } from "../src/worktrees/manager.js";
-import { startTestDb, type TestDb } from "./harness.js";
+import { sleep, startTestDb, type TestDb } from "./harness.js";
 
 /**
  * design.md §6.6 worktree sweeper against a real Postgres and real git: a
@@ -333,7 +335,14 @@ async function expectEvicted(s: Seeded, pushed: boolean): Promise<void> {
  * test fail one or react to it.
  */
 function recordingOps(
-  hooks: { onRemove?: (executionId: string) => void } = {},
+  hooks: {
+    onRemove?: (executionId: string) => void;
+    /** Runs before the real push; may block or throw. */
+    onPush?: (branch: string) => Promise<void>;
+    /** Runs after the real push returns. */
+    afterPush?: (branch: string) => Promise<void>;
+  } = {},
+  target: WorktreeManager = manager,
 ): WorktreeOps & { removed: string[]; pushes: string[] } {
   const removed: string[] = [];
   const pushes: string[] = [];
@@ -342,12 +351,14 @@ function recordingOps(
     pushes,
     async remove(executionId, options) {
       hooks.onRemove?.(executionId);
-      const result = await manager.remove(executionId, options);
-      removed.push(executionId);
+      const result = await target.remove(executionId, options);
+      if (result.tipMoved !== true) removed.push(executionId);
       return result;
     },
     async pushIfAhead(input) {
-      const result = await manager.pushIfAhead(input);
+      await hooks.onPush?.(input.branch);
+      const result = await target.pushIfAhead(input);
+      await hooks.afterPush?.(input.branch);
       if (result.pushed) pushes.push(input.branch);
       return result;
     },
@@ -478,6 +489,54 @@ describe("rule two: FAILED, no retry pending, ended over 24 h ago (§6.6, C8)", 
     });
     await sweep();
     await expectUntouched(failed);
+  });
+
+  it("F4: leaves one whose task has a WAITING_FOR_USER or an ASSIGNED execution", async () => {
+    const withWaiting = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "FAILED",
+      endedAt: at(-25 * HOUR),
+    });
+    await insertExecution({ taskId: withWaiting.taskId, state: "WAITING_FOR_USER" });
+    const withAssigned = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "FAILED",
+      endedAt: at(-25 * HOUR),
+    });
+    await insertExecution({ taskId: withAssigned.taskId, state: "ASSIGNED" });
+
+    await sweep();
+
+    await expectUntouched(withWaiting);
+    await expectUntouched(withAssigned);
+  });
+
+  it("F1 (C13): leaves a FAILED execution of a NEEDS_HUMAN task to rule three, keeping its local commit", async () => {
+    const failed = await seedWithWorktree({
+      taskState: "NEEDS_HUMAN",
+      state: "FAILED",
+      endedAt: at(-25 * HOUR),
+    });
+    commitIn(failed.worktreePath, "unpushed.txt");
+
+    await sweep();
+
+    await expectUntouched(failed);
+    expect(remoteTip(failed.branch)).toBeNull();
+  });
+
+  it("F1 (C13): pushes and evicts a FAILED execution of a NEEDS_HUMAN task idle 15 days", async () => {
+    const failed = await seedWithWorktree({
+      taskState: "NEEDS_HUMAN",
+      state: "FAILED",
+      endedAt: at(-15 * DAY),
+    });
+    const head = commitIn(failed.worktreePath, "unpushed.txt");
+
+    await sweep();
+
+    expect(remoteTip(failed.branch)).toBe(head);
+    await expectEvicted(failed, true);
   });
 });
 
@@ -695,6 +754,166 @@ describe("failure isolation (§6.6)", () => {
         fields: expect.objectContaining({
           executionId: first.executionId,
           err: "rm exploded",
+        }),
+      }),
+    );
+  });
+
+  it("F4: a push that throws keeps the worktree and is logged", async () => {
+    const waiting = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "WAITING_FOR_USER",
+      lastEventAt: at(-15 * DAY),
+    });
+    commitIn(waiting.worktreePath, "work.txt");
+    const ops = recordingOps({
+      onPush: async () => {
+        throw new Error("push exploded");
+      },
+    });
+
+    await sweep({ worktrees: ops });
+
+    expect(ops.removed).toEqual([]);
+    await expectUntouched(waiting);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          executionId: waiting.executionId,
+          err: "push exploded",
+        }),
+      }),
+    );
+  });
+
+  it("F4: a disk usage probe that throws is logged and rule four is skipped", async () => {
+    const failedYoung = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "FAILED",
+      endedAt: at(-1 * HOUR),
+    });
+    const ops = recordingOps();
+
+    await createWorktreeSweeperPhase({
+      worktrees: ops,
+      diskUsage: async () => {
+        throw new Error("statfs exploded");
+      },
+    }).run(ctx(85));
+
+    expect(ops.removed).toEqual([]);
+    await expectUntouched(failedYoung);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({ err: "statfs exploded" }),
+      }),
+    );
+  });
+});
+
+describe("git network calls run outside the row locks (F2)", () => {
+  it("a pending push holds no task or execution lock, and the re-check keeps a worktree resumed meanwhile", async () => {
+    const waiting = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "WAITING_FOR_USER",
+      lastEventAt: at(-15 * DAY),
+    });
+    const head = commitIn(waiting.worktreePath, "work.txt");
+    let entered!: () => void;
+    const inPush = new Promise<void>((resolve) => (entered = resolve));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const ops = recordingOps({
+      onPush: async () => {
+        entered();
+        await gate;
+      },
+    });
+
+    const sweeping = sweep({ worktrees: ops });
+    await inPush;
+    // A resume moves the execution while the push is still pending.
+    const moved = db.transaction(async (tx) => {
+      await lockTaskForTool(tx, waiting.taskId);
+      await transition(tx, {
+        entity: "execution",
+        id: waiting.executionId,
+        trigger: "execution.resumed",
+        actor: { kind: "worker", id: "w-other" },
+      });
+    });
+    const outcome = await Promise.race([
+      moved.then(() => "moved" as const),
+      sleep(3_000).then(() => "blocked" as const),
+    ]);
+    release();
+    await sweeping;
+    await moved;
+
+    expect(outcome).toBe("moved");
+    // The push ran; the eviction did not, because the row is now RUNNING.
+    expect(remoteTip(waiting.branch)).toBe(head);
+    expect(ops.removed).toEqual([]);
+    await expectUntouched(waiting);
+    expect((await execution(waiting.executionId)).state).toBe("RUNNING");
+  });
+
+  it("keeps the worktree when the branch tip moved after the push", async () => {
+    const waiting = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "WAITING_FOR_USER",
+      lastEventAt: at(-15 * DAY),
+    });
+    const pushedHead = commitIn(waiting.worktreePath, "work.txt");
+    let late = "";
+    const ops = recordingOps({
+      afterPush: async () => {
+        late = commitIn(waiting.worktreePath, "late.txt");
+      },
+    });
+
+    await sweep({ worktrees: ops });
+
+    expect(remoteTip(waiting.branch)).toBe(pushedHead);
+    expect(ops.removed).toEqual([]);
+    await expectUntouched(waiting);
+    expect(git(waiting.worktreePath, "rev-parse", "HEAD")).toBe(late);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        fields: expect.objectContaining({ executionId: waiting.executionId }),
+      }),
+    );
+  });
+
+  it("a push that exceeds the network timeout fails with a git error and keeps the worktree", async () => {
+    const waiting = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "WAITING_FOR_USER",
+      lastEventAt: at(-15 * DAY),
+    });
+    commitIn(waiting.worktreePath, "work.txt");
+    const hook = path.join(remote, "hooks", "pre-receive");
+    await fs.writeFile(hook, "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
+    const slow = new WorktreeManager({ workspaceRoot, networkTimeoutMs: 500 });
+    const started = Date.now();
+    try {
+      await sweep({ worktrees: recordingOps({}, slow) });
+    } finally {
+      await fs.rm(hook, { force: true });
+    }
+
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(remoteTip(waiting.branch)).toBeNull();
+    await expectUntouched(waiting);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({
+          executionId: waiting.executionId,
+          err: expect.stringMatching(/git push .*timed out/),
         }),
       }),
     );

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -60,6 +61,7 @@ import { claimNextTask } from "../src/scheduler/index.js";
 import type { TickContext } from "../src/tick.js";
 import {
   SetupFailedError,
+  WorktreeManager,
   type PrepareImplementationInput,
 } from "../src/worktrees/index.js";
 import { sleep, startTestDb, waitFor, type TestDb } from "./harness.js";
@@ -349,6 +351,8 @@ function makeRunner(
     adapters?: RunnerDeps["adapters"];
     /** Runs inside `prepareImplementation`, before it returns. */
     onPrepare?: (input: PrepareImplementationInput) => Promise<void>;
+    /** A real manager to delegate to instead of the fake one. */
+    worktrees?: RunnerDeps["worktrees"];
     workerId: string;
   },
 ): Harness {
@@ -364,6 +368,7 @@ function makeRunner(
     worktrees: {
       async prepareImplementation(input) {
         prepared.push(input);
+        if (options.worktrees) return options.worktrees.prepareImplementation(input);
         if (options.prepareError) throw options.prepareError;
         await options.onPrepare?.(input);
         const worktreePath = path.join(workRoot, "work", input.executionId);
@@ -1170,6 +1175,165 @@ describe("resume primitive (§9.3, §9.7)", () => {
 
     expect(err).toBeInstanceOf(ResumeError);
     expect((err as ResumeError).code).toBe("NOT_RESUMABLE_STATE");
+    expect(await writeSnapshot(s.executionId)).toEqual(before);
+    expect(h.adapter.resumes).toHaveLength(0);
+    expect(h.runner.isLive(s.executionId)).toBe(false);
+  });
+});
+
+describe("resume after eviction (§6.6, F3)", () => {
+  const TEST_GIT_FLAGS = [
+    "-c",
+    "user.name=Orchestra Test",
+    "-c",
+    "user.email=test@example.com",
+    "-c",
+    "commit.gpgsign=false",
+  ];
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", [...TEST_GIT_FLAGS, ...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+
+  let remote: string;
+  let workspaceRoot: string;
+  let manager: WorktreeManager;
+
+  beforeAll(async () => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(workRoot, "evicted-")));
+    remote = path.join(root, "remote.git");
+    const seed = path.join(root, "seed");
+    git(root, "init", "-q", "--bare", "-b", "main", remote);
+    git(root, "clone", "-q", remote, seed);
+    git(seed, "checkout", "-q", "-B", "main");
+    await fs.writeFile(path.join(seed, "README.md"), "one");
+    git(seed, "add", "README.md");
+    git(seed, "commit", "-q", "-m", "initial");
+    git(seed, "push", "-q", "origin", "main:main");
+    workspaceRoot = path.join(root, "workspace");
+    manager = new WorktreeManager({ workspaceRoot });
+  });
+
+  /**
+   * A WAITING_FOR_USER execution whose real worktree has one commit, then
+   * evicted as the sweeper does: optionally pushed, worktree and local
+   * branch removed, `worktree_evicted_at` stamped.
+   */
+  async function evictedExecution(options: { pushed: boolean }) {
+    const s = await seedClaimed();
+    await db.$client.unsafe(
+      "update repositories set git_url = $1, setup_command = null where id = (select repository_id from tasks where id = $2)",
+      [remote, s.taskId],
+    );
+    const h = makeRunner({ workerId: s.workerId, worktrees: manager });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-ev" };
+      h.registry.get(executionId)!.blockingPending = true;
+      yield { type: "turn_done", finalText: "waiting" };
+    };
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("WAITING_FOR_USER");
+    const worktreePath = row.worktreePath!;
+    const branch = row.branch!;
+    await fs.writeFile(path.join(worktreePath, "work.txt"), "work");
+    git(worktreePath, "add", "work.txt");
+    git(worktreePath, "commit", "-q", "-m", "work");
+    const head = git(worktreePath, "rev-parse", "HEAD");
+    const [repo] = await db.$client.unsafe<{ name: string }[]>(
+      "select r.name from repositories r join tasks t on t.repository_id = r.id where t.id = $1",
+      [s.taskId],
+    );
+    const repositoryName = repo!.name;
+    if (options.pushed) {
+      await manager.pushIfAhead({ repositoryName, branch, defaultBranch: "main" });
+    }
+    await manager.remove(s.executionId, { repositoryName, branch });
+    await db.$client.unsafe(
+      "update executions set worktree_evicted_at = now() where id = $1",
+      [s.executionId],
+    );
+    return { s, h, worktreePath, branch, head };
+  }
+
+  it("recreates the worktree from origin/<branch>, clears worktree_evicted_at and writes worktree.prepared before resuming", async () => {
+    const { s, h, worktreePath, branch, head } = await evictedExecution({ pushed: true });
+    const preparedBefore = (await eventTypes(s.executionId)).filter(
+      (t) => t === "worktree.prepared",
+    ).length;
+    let during: { head: string; branch: string } | undefined;
+    h.adapter.script = async function* ({ executionId }) {
+      during = {
+        head: git(worktreePath, "rev-parse", "HEAD"),
+        branch: git(worktreePath, "branch", "--show-current"),
+      };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "done" };
+    };
+
+    const { done } = await h.runner.resume({ executionId: s.executionId, prompt: "answer" });
+    await done;
+
+    const call = h.prepared.at(-1)!;
+    expect(call.executionId).toBe(s.executionId);
+    expect(call.resumeFromRemote).toBe(true);
+    expect(call.spec.version).toBe(2);
+    expect(h.adapter.resumes[0]!.cwd).toBe(worktreePath);
+    expect(h.adapter.resumes[0]!.sessionId).toBe("sess-ev");
+    expect(during).toEqual({ head, branch });
+    const row = await execution(s.executionId);
+    expect(row.worktreeEvictedAt).toBeNull();
+    expect(row.worktreePath).toBe(worktreePath);
+    expect(row.branch).toBe(branch);
+    const types = await eventTypes(s.executionId);
+    expect(types.filter((t) => t === "worktree.prepared")).toHaveLength(preparedBefore + 1);
+    expect(types.lastIndexOf("worktree.prepared")).toBeLessThan(
+      types.indexOf("execution.resumed"),
+    );
+  });
+
+  it("rejects with a typed error and writes nothing when the remote branch is missing", async () => {
+    const { s, h } = await evictedExecution({ pushed: false });
+    const before = await writeSnapshot(s.executionId);
+
+    const err = await h.runner
+      .resume({ executionId: s.executionId, prompt: "answer" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResumeError);
+    expect((err as ResumeError).code).toBe("WORKTREE_UNAVAILABLE");
+    expect(await writeSnapshot(s.executionId)).toEqual(before);
+    expect((await execution(s.executionId)).worktreeEvictedAt).not.toBeNull();
+    expect(h.adapter.resumes).toHaveLength(0);
+    expect(h.runner.isLive(s.executionId)).toBe(false);
+  });
+
+  it("refuses a resume whose worktree the sweeper evicted after the context loaded", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-race" };
+      h.registry.get(executionId)!.blockingPending = true;
+      yield { type: "turn_done", finalText: "waiting" };
+    };
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+    let before: Awaited<ReturnType<typeof writeSnapshot>> | undefined;
+    h.adapter.onCanResume = async () => {
+      await db.$client.unsafe(
+        "update executions set worktree_evicted_at = now() where id = $1",
+        [s.executionId],
+      );
+      before = await writeSnapshot(s.executionId);
+    };
+
+    const err = await h.runner
+      .resume({ executionId: s.executionId, prompt: "answer" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResumeError);
+    expect((err as ResumeError).code).toBe("WORKTREE_UNAVAILABLE");
     expect(await writeSnapshot(s.executionId)).toEqual(before);
     expect(h.adapter.resumes).toHaveLength(0);
     expect(h.runner.isLive(s.executionId)).toBe(false);

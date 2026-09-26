@@ -71,10 +71,18 @@ export interface RemoveOptions {
    * has it checked out.
    */
   branch?: string | null;
+  /**
+   * When set, remove only if the local `branch` is still at this commit
+   * (`null`: still absent), checked under the repository lock. Otherwise
+   * nothing is removed and the result has `tipMoved`. Needs `branch`.
+   */
+  expectedTip?: string | null;
 }
 
 export interface RemoveResult {
   branchDeleted: boolean;
+  /** Set when `expectedTip` did not match: nothing was removed. */
+  tipMoved?: true;
 }
 
 export interface PushIfAheadInput {
@@ -103,11 +111,25 @@ export interface PushIfAheadResult {
   ahead: number;
   /** Set only when `pushed` is false. */
   reason?: PushSkipReason;
+  /**
+   * Commit the local branch was at when this call checked it, `null` when
+   * there is no local branch. Pass to `remove` as `expectedTip`.
+   */
+  tip: string | null;
 }
+
+/** Default bound on one git network call (fetch, push). */
+export const DEFAULT_NETWORK_TIMEOUT_MS = 120_000;
 
 export interface WorktreeManagerOptions {
   /** `WorkerConfig.workspaceRoot`. */
   workspaceRoot: string;
+  /**
+   * Bound on each git fetch and push. A call that runs longer is killed
+   * and fails with `GitCommandError`. Defaults to
+   * `DEFAULT_NETWORK_TIMEOUT_MS`.
+   */
+  networkTimeoutMs?: number;
 }
 
 /** Line added to the shared `info/exclude` so `context.json` stays untracked. */
@@ -180,6 +202,20 @@ async function refExists(gitDir: string, ref: string): Promise<boolean> {
   return out.trim() === ref;
 }
 
+/** Commit `ref` (a full ref name) points at, or null when it does not exist. */
+async function refTip(gitDir: string, ref: string): Promise<string | null> {
+  const out = await runGit(gitDir, [
+    "for-each-ref",
+    "--format=%(refname) %(objectname)",
+    ref,
+  ]);
+  for (const line of out.split("\n")) {
+    const space = line.indexOf(" ");
+    if (space !== -1 && line.slice(0, space) === ref) return line.slice(space + 1);
+  }
+  return null;
+}
+
 interface WorktreeRecord {
   path: string;
   head?: string;
@@ -213,9 +249,12 @@ async function listWorktrees(barePath: string): Promise<WorktreeRecord[]> {
 
 export class WorktreeManager {
   private readonly workspaceRoot: string;
+  private readonly networkTimeoutMs: number;
 
   constructor(options: WorktreeManagerOptions) {
     this.workspaceRoot = path.resolve(options.workspaceRoot);
+    this.networkTimeoutMs =
+      options.networkTimeoutMs ?? DEFAULT_NETWORK_TIMEOUT_MS;
   }
 
   /**
@@ -340,6 +379,9 @@ export class WorktreeManager {
     assertSafe(options.repositoryName, SAFE_SEGMENT, "repository name");
     const branch = options.branch ?? null;
     if (branch !== null) assertSafe(branch, SAFE_BRANCH, "branch");
+    if (options.expectedTip !== undefined && branch === null) {
+      throw new Error("expectedTip needs a branch");
+    }
     const barePath = path.join(
       this.workspaceRoot,
       "repos",
@@ -347,6 +389,14 @@ export class WorktreeManager {
     );
 
     return withRepoLock(barePath, async () => {
+      if (options.expectedTip !== undefined) {
+        const current = (await exists(barePath))
+          ? await refTip(barePath, `refs/heads/${branch}`)
+          : null;
+        if (current !== options.expectedTip) {
+          return { branchDeleted: false, tipMoved: true };
+        }
+      }
       await fs.rm(worktreePath, { recursive: true, force: true });
       if (!(await exists(barePath))) return { branchDeleted: false };
       await runGit(barePath, ["worktree", "prune"]);
@@ -373,7 +423,8 @@ export class WorktreeManager {
    *
    * Never force-pushes. A remote branch with commits the local branch lacks
    * is reported as `diverged` and left alone. Runs under the same
-   * per-repository lock as `prepareImplementation` and `remove`.
+   * per-repository lock as `prepareImplementation` and `remove`. The fetch
+   * and the push are each bounded by `networkTimeoutMs`.
    */
   async pushIfAhead(input: PushIfAheadInput): Promise<PushIfAheadResult> {
     const { repositoryName, branch, defaultBranch } = input;
@@ -390,28 +441,38 @@ export class WorktreeManager {
     const count = async (range: string): Promise<number> =>
       Number((await runGit(barePath, ["rev-list", "--count", range])).trim());
 
+    const network = { timeoutMs: this.networkTimeoutMs };
+
     return withRepoLock(barePath, async () => {
-      if (!(await exists(barePath)) || !(await refExists(barePath, local))) {
-        return { pushed: false, ahead: 0, reason: "no_local_branch" };
+      const tip = (await exists(barePath)) ? await refTip(barePath, local) : null;
+      if (tip === null) {
+        return { pushed: false, ahead: 0, reason: "no_local_branch", tip };
       }
-      await runGit(barePath, ["fetch", "--quiet", "--prune", "origin"]);
+      await runGit(barePath, ["fetch", "--quiet", "--prune", "origin"], network);
 
       let ahead: number;
       if (await refExists(barePath, tracking)) {
-        ahead = await count(`${tracking}..${local}`);
-        const behind = await count(`${local}..${tracking}`);
+        ahead = await count(`${tracking}..${tip}`);
+        const behind = await count(`${tip}..${tracking}`);
         if (behind > 0 && ahead > 0) {
-          return { pushed: false, ahead, reason: "diverged" };
+          return { pushed: false, ahead, reason: "diverged", tip };
         }
       } else {
-        ahead = await count(`refs/remotes/origin/${defaultBranch}..${local}`);
+        ahead = await count(`refs/remotes/origin/${defaultBranch}..${tip}`);
       }
-      if (ahead === 0) return { pushed: false, ahead: 0, reason: "not_ahead" };
+      if (ahead === 0) {
+        return { pushed: false, ahead: 0, reason: "not_ahead", tip };
+      }
 
       // A plain refspec: git refuses a non-fast-forward, so a remote that
       // moved after the fetch fails the push instead of being overwritten.
-      await runGit(barePath, ["push", "--quiet", "origin", `${local}:${local}`]);
-      return { pushed: true, ahead };
+      // Pushing the sha, not the ref, pins what `tip` reports.
+      await runGit(
+        barePath,
+        ["push", "--quiet", "origin", `${tip}:${local}`],
+        network,
+      );
+      return { pushed: true, ahead, tip };
     });
   }
 
@@ -459,7 +520,9 @@ export class WorktreeManager {
     // fetch, not only at creation. Runs under the caller's repo lock, same
     // as the fetch below.
     await runGit(barePath, ["remote", "set-url", "origin", gitUrl]);
-    await runGit(barePath, ["fetch", "--quiet", "--prune", "origin"]);
+    await runGit(barePath, ["fetch", "--quiet", "--prune", "origin"], {
+      timeoutMs: this.networkTimeoutMs,
+    });
   }
 
   /**

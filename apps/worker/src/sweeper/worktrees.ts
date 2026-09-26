@@ -102,9 +102,13 @@ export async function sweepWorktrees(
   };
 
   /**
-   * Applies `action` to one candidate under the task and execution row
-   * locks, re-checking its rule first. Returns true when the worktree was
-   * removed. Never throws.
+   * Applies `action` to one candidate. An eviction pushes first, holding no
+   * row lock, so a slow remote never blocks a transition or a resume. Then,
+   * under the task and execution row locks, the rule is re-checked, the
+   * branch must be the one pushed and its local tip unchanged since the
+   * push (checked by `remove` under the repository lock), and only then is
+   * the worktree removed and the row written. Returns true when the
+   * worktree was removed. Never throws.
    */
   const apply = async (
     candidate: WorktreeCandidate,
@@ -119,6 +123,32 @@ export async function sweepWorktrees(
       action,
     };
     try {
+      if (candidate.repositoryName === null || candidate.defaultBranch === null) {
+        throw new Error("execution's task has no repository");
+      }
+      const repositoryName = candidate.repositoryName;
+
+      let pushed = false;
+      /** Local tip the push saw; `undefined` when nothing was pushed or checked. */
+      let expectedTip: string | null | undefined;
+      if (action === "evict" && candidate.branch !== null) {
+        const push = await worktrees.pushIfAhead({
+          repositoryName,
+          branch: candidate.branch,
+          defaultBranch: candidate.defaultBranch,
+        });
+        if (push.reason === "diverged") {
+          // Removing the local branch would lose commits the remote lacks.
+          logger.warn(
+            { ...fields, branch: candidate.branch, ahead: push.ahead },
+            "remote branch diverged, worktree kept",
+          );
+          return false;
+        }
+        pushed = push.pushed;
+        expectedTip = push.tip;
+      }
+
       const outcome = await db.transaction(async (tx) => {
         const row = await lockWorktreeCandidate(tx, {
           host,
@@ -127,26 +157,17 @@ export async function sweepWorktrees(
           executionId: candidate.executionId,
           taskId: candidate.taskId,
         });
-        if (!row) return null;
-        if (row.repositoryName === null || row.defaultBranch === null) {
-          throw new Error("execution's task has no repository");
+        if (!row) return "gone" as const;
+        if (row.branch !== candidate.branch || row.repositoryName !== repositoryName) {
+          return "gone" as const;
         }
 
-        let pushed = false;
-        if (action === "evict" && row.branch !== null) {
-          const push = await worktrees.pushIfAhead({
-            repositoryName: row.repositoryName,
-            branch: row.branch,
-            defaultBranch: row.defaultBranch,
-          });
-          if (push.reason === "diverged") return { diverged: true, ahead: push.ahead };
-          pushed = push.pushed;
-        }
-
-        await worktrees.remove(row.executionId, {
-          repositoryName: row.repositoryName,
+        const removed = await worktrees.remove(row.executionId, {
+          repositoryName,
           branch: row.branch,
+          ...(expectedTip !== undefined ? { expectedTip } : {}),
         });
+        if (removed.tipMoved) return "tip_moved" as const;
         if (action === "remove") {
           await clearExecutionWorktree(tx, row.executionId);
         } else {
@@ -162,20 +183,19 @@ export async function sweepWorktrees(
             },
           });
         }
-        return { diverged: false, pushed };
+        return "done" as const;
       });
 
-      if (outcome === null) return false;
-      if (outcome.diverged) {
-        // Removing the local branch would lose commits the remote lacks.
+      if (outcome === "gone") return false;
+      if (outcome === "tip_moved") {
         logger.warn(
-          { ...fields, branch: candidate.branch, ahead: outcome.ahead },
-          "remote branch diverged, worktree kept",
+          { ...fields, branch: candidate.branch },
+          "branch moved after the push, worktree kept",
         );
         return false;
       }
       logger.info(
-        { ...fields, ...(action === "evict" ? { pushed: outcome.pushed } : {}) },
+        { ...fields, ...(action === "evict" ? { pushed } : {}) },
         action === "evict" ? "worktree evicted" : "worktree removed",
       );
       return true;
