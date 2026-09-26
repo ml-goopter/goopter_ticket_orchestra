@@ -98,6 +98,28 @@ export async function touchPullRequestPolled(
 }
 
 /**
+ * The poller's own first observation of zero check runs on the PR's current
+ * sha (design.md §11.2, C50). Records `pending_since = now` in `ci_detail`
+ * so the 2-minute grace period counts from here, never from
+ * `pull_requests.created_at` — a row can reach zero check runs long after
+ * it was created (`report_pr_created` resets it on every new push), so
+ * `created_at` is never a valid stand-in for "since when has this had no
+ * checks".
+ */
+export async function recordNoChecksPending(
+  tx: Tx,
+  input: { pullRequestId: string; now: Date },
+): Promise<void> {
+  await tx
+    .update(pullRequests)
+    .set({
+      ciDetail: { pending_since: input.now.toISOString() },
+      lastPolledAt: input.now,
+    })
+    .where(eq(pullRequests.id, input.pullRequestId));
+}
+
+/**
  * A new head sha at the PR's current open state (design.md §11.2): the row
  * moves to that sha, CI resets to pending with a fresh `pending_since`, and
  * no task transition happens. `report_pr_created` already reset the row for
@@ -127,6 +149,8 @@ export interface MarkPullRequestMergedInput {
   taskState: TaskState;
   mergedAt: Date;
   actor: Actor;
+  /** The poll's own clock (F6): distinct from `mergedAt`, which is GitHub's. */
+  now: Date;
 }
 
 /**
@@ -145,6 +169,11 @@ export async function markPullRequestMerged(
       id: input.taskId,
       trigger: "ci.passed",
       actor: input.actor,
+      // F4 (C51): a human merged before CI finished, so this ci.passed ->
+      // READY_FOR_MERGE never actually observed CI passing. The marker lets
+      // the Jira write-back selector (packages/db/src/queries/jira.ts) skip
+      // announcing "CI passed" for a task that was merged without it.
+      eventPayload: { via: "merged_externally" },
     });
     await appendEvent(tx, {
       taskId: input.taskId,
@@ -169,7 +198,7 @@ export async function markPullRequestMerged(
 
   await tx
     .update(pullRequests)
-    .set({ state: "merged", mergedAt: input.mergedAt })
+    .set({ state: "merged", mergedAt: input.mergedAt, lastPolledAt: input.now })
     .where(eq(pullRequests.id, input.pullRequestId));
 }
 
@@ -202,6 +231,7 @@ export async function markPullRequestClosed(
       id: input.taskId,
       trigger: "pull_request.closed",
       actor: input.actor,
+      set: { needsHumanReason: CLOSED_UNMERGED_REASON },
     });
   } else {
     await transition(tx, {
@@ -222,7 +252,7 @@ export async function markPullRequestClosed(
 
   await tx
     .update(pullRequests)
-    .set({ state: "closed" })
+    .set({ state: "closed", lastPolledAt: input.now })
     .where(eq(pullRequests.id, input.pullRequestId));
 
   await insertNotification(tx, {

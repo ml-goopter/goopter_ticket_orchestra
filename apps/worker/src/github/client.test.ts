@@ -132,6 +132,7 @@ describe("createGitHubClient (design.md §11.2)", () => {
 
   it("listCheckRuns pages through every check run", async () => {
     const page1 = Array.from({ length: 100 }, (_, i) => ({
+      id: i,
       name: `check-${i}`,
       status: "completed",
       conclusion: "success",
@@ -142,6 +143,7 @@ describe("createGitHubClient (design.md §11.2)", () => {
     }));
     const page2 = [
       {
+        id: 555,
         name: "check-100",
         status: "completed",
         conclusion: "failure",
@@ -165,6 +167,7 @@ describe("createGitHubClient (design.md §11.2)", () => {
 
     expect(runs).toHaveLength(101);
     expect(runs[100]).toEqual({
+      id: 555,
       name: "check-100",
       status: "completed",
       conclusion: "failure",
@@ -183,5 +186,18 @@ describe("createGitHubClient (design.md §11.2)", () => {
     const text = await client.getJobLog("goopter", "repo", "999");
 
     expect(text).toBe("line1\nline2\n");
+  });
+
+  it("F7 regression: getJobLog caps the body at the last 1 MiB", async () => {
+    const marker = "END-OF-LOG-MARKER";
+    const body = "a".repeat(1024 * 1024 * 2) + `\n${marker}\n`;
+    const fetchImpl = vi.fn(async () => new Response(body));
+    const client = createGitHubClient({ token: "t", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const text = await client.getJobLog("goopter", "repo", "999");
+
+    expect(text.length).toBeLessThanOrEqual(1024 * 1024);
+    expect(text).toContain(marker);
+    expect(text.length).toBeLessThan(body.length);
   });
 });

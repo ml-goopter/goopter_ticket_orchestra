@@ -25,6 +25,13 @@ export interface GitHubPullRequest {
 }
 
 export interface GitHubCheckRun {
+  /**
+   * The check run's own id (design.md §11.2, F1). For a run GitHub Actions
+   * created, this is the same numeric id as its workflow job, which is what
+   * the job-logs endpoint wants — `external_id` is a UUID Actions sets and
+   * is not usable as a job id.
+   */
+  id: number;
   name: string;
   status: "queued" | "in_progress" | "completed" | string;
   conclusion:
@@ -63,12 +70,55 @@ export interface GitHubClient {
 /** Bound on every request; a slow or hanging GitHub must not stall the poller forever. */
 export const DEFAULT_GITHUB_REQUEST_TIMEOUT_MS = 30_000;
 
+/** design.md §11.2, F7: a job log is streamed rather than buffered whole, kept to this many trailing bytes. */
+export const MAX_JOB_LOG_BYTES = 1024 * 1024;
+
 const DEFAULT_BASE_URL = "https://api.github.com";
 const CHECK_RUNS_PAGE_SIZE = 100;
+
+/**
+ * Reads `res`'s body keeping only the last `maxBytes`, so a many-megabyte
+ * Actions log never sits fully in memory just to keep its last 200 lines
+ * (F7). Trims from the front of the buffered chunks as they arrive; falls
+ * back to a plain `.text()` read (still sliced) when the runtime hands back
+ * a response with no readable stream, which the fake responses tests build
+ * sometimes do.
+ */
+async function readTail(res: Response, maxBytes: number): Promise<string> {
+  const body = res.body;
+  if (!body) {
+    const text = await res.text();
+    return text.length > maxBytes ? text.slice(text.length - maxBytes) : text;
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    chunks.push(value);
+    total += value.byteLength;
+    while (chunks.length > 1 && total - chunks[0]!.byteLength >= maxBytes) {
+      total -= chunks.shift()!.byteLength;
+    }
+  }
+
+  const buffer = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buffer.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const decoded = new TextDecoder().decode(buffer);
+  return decoded.length > maxBytes ? decoded.slice(decoded.length - maxBytes) : decoded;
+}
 
 interface CheckRunsApiResponse {
   total_count: number;
   check_runs: Array<{
+    id: number;
     name: string;
     status: string;
     conclusion: string | null;
@@ -150,6 +200,7 @@ export function createGitHubClient(config: GitHubClientConfig): GitHubClient {
         const body = (await res.json()) as CheckRunsApiResponse;
         for (const run of body.check_runs) {
           runs.push({
+            id: run.id,
             name: run.name,
             status: run.status,
             conclusion: run.conclusion as GitHubCheckRun["conclusion"],
@@ -170,7 +221,7 @@ export function createGitHubClient(config: GitHubClientConfig): GitHubClient {
       if (res.status === 404) {
         throw new GitHubApiError(404, `job log ${owner}/${repo}#${jobId} not found`);
       }
-      return res.text();
+      return readTail(res, MAX_JOB_LOG_BYTES);
     },
   };
 }

@@ -5,6 +5,7 @@ import {
   markPullRequestCi,
   markPullRequestClosed,
   markPullRequestMerged,
+  recordNoChecksPending,
   touchPullRequestPolled,
   updatePullRequestHead,
   type Actor,
@@ -76,6 +77,7 @@ type Decision =
   | { type: "new_sha"; headSha: string }
   | { type: "not_actionable" }
   | { type: "wait" }
+  | { type: "record_no_checks_pending" }
   | { type: "ci"; decision: CiPollDecision };
 
 interface PollOneOptions {
@@ -139,12 +141,22 @@ async function pollOnePullRequest(options: PollOneOptions): Promise<{ rateLimite
     } else if (evaluation.outcome === "in_progress") {
       decision = { type: "wait" };
     } else if (evaluation.outcome === "no_checks") {
-      const pendingSince = parsePendingSince(row.ciDetail) ?? row.createdAt;
-      const elapsed = now().getTime() - pendingSince.getTime();
-      decision =
-        elapsed >= NO_CHECKS_GRACE_MS
-          ? { type: "ci", decision: { outcome: "passed", noChecks: true } }
-          : { type: "wait" };
+      // design.md §11.2, C50: never falls back to `created_at`. A row can
+      // be at zero check runs with no `pending_since` yet (a fresh open PR,
+      // or one `report_pr_created` just reset) for reasons that have
+      // nothing to do with how long the task has existed — the grace period
+      // only ever counts from the poller's own first observation of "zero
+      // checks" on this sha.
+      const pendingSince = parsePendingSince(row.ciDetail);
+      if (!pendingSince) {
+        decision = { type: "record_no_checks_pending" };
+      } else {
+        const elapsed = now().getTime() - pendingSince.getTime();
+        decision =
+          elapsed >= NO_CHECKS_GRACE_MS
+            ? { type: "ci", decision: { outcome: "passed", noChecks: true } }
+            : { type: "wait" };
+      }
     } else {
       const checks: CiFailedCheck[] = [];
       for (const failing of evaluation.failing) {
@@ -165,6 +177,9 @@ async function pollOnePullRequest(options: PollOneOptions): Promise<{ rateLimite
       pullRequestId: row.pullRequestId,
     });
     if (!locked || locked.headSha !== row.headSha || locked.prState !== "open") {
+      // F6: still record that this row was polled this run, even though the
+      // row was superseded and nothing else about it changes.
+      if (locked) await touchPullRequestPolled(tx, row.pullRequestId, now());
       return { kind: "stale" as const };
     }
 
@@ -184,6 +199,7 @@ async function pollOnePullRequest(options: PollOneOptions): Promise<{ rateLimite
           taskState: locked.taskState,
           mergedAt: decision.mergedAt,
           actor,
+          now: now(),
         });
         return { kind: "applied" as const };
       }
@@ -220,6 +236,13 @@ async function pollOnePullRequest(options: PollOneOptions): Promise<{ rateLimite
       }
       case "wait": {
         await touchPullRequestPolled(tx, row.pullRequestId, now());
+        return { kind: "waiting" as const };
+      }
+      case "record_no_checks_pending": {
+        // design.md §11.2, C50: the poller's own first observation of zero
+        // check runs on this sha; the 2-minute grace starts here, never at
+        // `created_at`.
+        await recordNoChecksPending(tx, { pullRequestId: row.pullRequestId, now: now() });
         return { kind: "waiting" as const };
       }
       case "ci": {

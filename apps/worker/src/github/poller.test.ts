@@ -66,6 +66,7 @@ afterEach(() => {
 
 describe("evaluateCheckRuns (design.md §11.2)", () => {
   const run = (over: Partial<Parameters<typeof evaluateCheckRuns>[0][number]>) => ({
+    id: 1,
     name: "check",
     status: "completed",
     conclusion: "success",

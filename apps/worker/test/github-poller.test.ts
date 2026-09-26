@@ -270,8 +270,11 @@ function createFakeGitHub() {
   };
 }
 
+let checkRunSeq = 0;
+
 function successCheck(name: string, conclusion = "success") {
   return {
+    id: ++checkRunSeq,
     name,
     status: "completed",
     conclusion,
@@ -282,14 +285,21 @@ function successCheck(name: string, conclusion = "success") {
   };
 }
 
+/**
+ * A real-shaped GitHub Actions check run (design.md §11.2, F1): a UUID
+ * `external_id` and a `details_url` of the singular `/job/N` form. The check
+ * run's own `id` is what the job-logs endpoint actually wants and is what
+ * matches `jobId`.
+ */
 function failingActionsCheck(name: string, jobId: string) {
   return {
+    id: Number(jobId),
     name,
     status: "completed",
     conclusion: "failure",
-    details_url: `https://github.com/x/y/actions/runs/1/jobs/${jobId}`,
+    details_url: `https://github.com/x/y/actions/runs/1/job/${jobId}`,
     html_url: null,
-    external_id: jobId,
+    external_id: "b4b6b6b0-3e3a-4b0a-9b0a-5f5f5f5f5f5f",
     app: { slug: "github-actions" },
   };
 }
@@ -353,7 +363,7 @@ describe("AC2: a failed check", () => {
     const pr = await pullRequestRow(s.pullRequestId);
     expect(pr.ciState).toBe("failed");
     expect(pr.ciDetail).toMatchObject({
-      failed: [{ name: "unit", url: "https://github.com/x/y/actions/runs/1/jobs/555" }],
+      failed: [{ name: "unit", url: "https://github.com/x/y/actions/runs/1/job/555" }],
     });
 
     const [command] = await commandsFor(s.taskId);
@@ -412,7 +422,11 @@ describe("AC2: a failed check", () => {
         createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl }).getJobLog(owner, repo, jobId),
     };
 
-    await run(client);
+    // F6 regression: a stale poll still records that this row was polled,
+    // just nothing else — use a distinct `now` so a no-op write is
+    // observable against the seeded `lastPolledAt` (both otherwise NOW).
+    const polledAt = new Date(NOW.getTime() + 60_000);
+    await run(client, () => polledAt);
 
     expect((await taskRow(s.taskId)).state).toBe("CI_RUNNING");
     expect((await executionRow(s.executionId)).ciRounds).toBe(0);
@@ -420,7 +434,100 @@ describe("AC2: a failed check", () => {
     expect(await commandsFor(s.taskId)).toEqual([]);
     const pr = await pullRequestRow(s.pullRequestId);
     expect(pr.headSha).toBe("sha-4-newer");
-    expect(pr.lastPolledAt.toISOString()).toBe(NOW.toISOString());
+    expect(pr.lastPolledAt.toISOString()).toBe(polledAt.toISOString());
+  });
+});
+
+describe("F3 regression: stale head sha guard covers the passed and merged paths too", () => {
+  it("a stale head sha during listCheckRuns applies nothing for an all-success outcome", async () => {
+    const s = await seedOpenPullRequest({ headSha: "sha-passed-stale" });
+    const gh = createFakeGitHub();
+    gh.setPr(s.owner, s.repo, s.number, {
+      state: "open",
+      merged: false,
+      merged_at: null,
+      head_sha: "sha-passed-stale",
+    });
+    gh.setCheckRuns(s.owner, s.repo, "sha-passed-stale", [successCheck("unit")]);
+    // Simulate a concurrent report_pr_created committing a new sha for the
+    // same task after the poller already fetched the pull request but before
+    // it locks the row: the check runs it evaluates are still for the old
+    // sha, so the "passed" decision it reaches must never be applied.
+    const client: GitHubClient = {
+      async getPullRequest(owner, repo, number) {
+        return createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl }).getPullRequest(
+          owner,
+          repo,
+          number,
+        );
+      },
+      async listCheckRuns(owner, repo, sha) {
+        const runs = await createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl }).listCheckRuns(
+          owner,
+          repo,
+          sha,
+        );
+        await db.$client.unsafe("update pull_requests set head_sha = $1 where id = $2", [
+          "sha-passed-stale-newer",
+          s.pullRequestId,
+        ]);
+        return runs;
+      },
+      getJobLog: (owner, repo, jobId) =>
+        createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl }).getJobLog(owner, repo, jobId),
+    };
+
+    // F6 regression: stale still records last_polled_at.
+    const polledAt = new Date(NOW.getTime() + 60_000);
+    await run(client, () => polledAt);
+
+    expect((await taskRow(s.taskId)).state).toBe("CI_RUNNING");
+    expect(await eventsOf(s.taskId, "ci.passed")).toEqual([]);
+    expect(await notificationsFor(s.taskId)).toEqual([]);
+    const pr = await pullRequestRow(s.pullRequestId);
+    expect(pr.headSha).toBe("sha-passed-stale-newer");
+    expect(pr.ciState).toBe("pending");
+    expect(pr.lastPolledAt.toISOString()).toBe(polledAt.toISOString());
+  });
+
+  it("a stale head sha during getPullRequest applies nothing for a merged outcome", async () => {
+    const s = await seedOpenPullRequest({ taskState: "READY_FOR_MERGE", headSha: "sha-merged-stale" });
+    const gh = createFakeGitHub();
+    gh.setPr(s.owner, s.repo, s.number, {
+      state: "closed",
+      merged: true,
+      merged_at: "2026-09-25T09:00:00.000Z",
+      head_sha: "sha-merged-stale",
+    });
+    // Same race, on the merged path: someone pushed a new commit to the same
+    // open PR (which the outer poller loop had already listed with the old
+    // sha) between the GitHub fetch and the lock.
+    const client: GitHubClient = {
+      async getPullRequest(owner, repo, number) {
+        const real = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
+        const pr = await real.getPullRequest(owner, repo, number);
+        await db.$client.unsafe("update pull_requests set head_sha = $1 where id = $2", [
+          "sha-merged-stale-newer",
+          s.pullRequestId,
+        ]);
+        return pr;
+      },
+      listCheckRuns: (owner, repo, sha) =>
+        createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl }).listCheckRuns(owner, repo, sha),
+      getJobLog: (owner, repo, jobId) =>
+        createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl }).getJobLog(owner, repo, jobId),
+    };
+
+    // F6 regression: stale still records last_polled_at.
+    const polledAt = new Date(NOW.getTime() + 60_000);
+    await run(client, () => polledAt);
+
+    expect((await taskRow(s.taskId)).state).toBe("READY_FOR_MERGE");
+    expect(await eventsOf(s.taskId, "pull_request.merged")).toEqual([]);
+    const pr = await pullRequestRow(s.pullRequestId);
+    expect(pr.state).toBe("open");
+    expect(pr.headSha).toBe("sha-merged-stale-newer");
+    expect(pr.lastPolledAt.toISOString()).toBe(polledAt.toISOString());
   });
 });
 
@@ -459,13 +566,16 @@ describe("AC4: merged", () => {
     });
     const client = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
 
-    await run(client);
+    // F6 regression: a merged poll updates last_polled_at too.
+    const polledAt = new Date(NOW.getTime() + 60_000);
+    await run(client, () => polledAt);
 
     expect((await taskRow(s.taskId)).state).toBe("DONE");
     const pr = await pullRequestRow(s.pullRequestId);
     expect(pr.state).toBe("merged");
     expect(pr.mergedAt?.toISOString()).toBe("2026-09-25T09:00:00.000Z");
     expect(await eventsOf(s.taskId, "pull_request.merged")).toHaveLength(1);
+    expect(pr.lastPolledAt.toISOString()).toBe(polledAt.toISOString());
   });
 
   it("CI_RUNNING -> ci.passed then DONE in one transaction", async () => {
@@ -489,6 +599,9 @@ describe("AC4: merged", () => {
       "READY_FOR_MERGE",
       "DONE",
     ]);
+    // F4 regression (C51): the READY_FOR_MERGE state_changed event is marked
+    // so the Jira write-back selector skips announcing "CI passed" for it.
+    expect(stateChanges[0]!.payload).toMatchObject({ via: "merged_externally" });
   });
 });
 
@@ -504,13 +617,19 @@ describe("AC5: closed unmerged", () => {
     });
     const client = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
 
-    await run(client);
+    // F6 regression: a closed poll updates last_polled_at too.
+    const polledAt = new Date(NOW.getTime() + 60_000);
+    await run(client, () => polledAt);
 
     const t = await taskRow(s.taskId);
     expect(t.state).toBe("NEEDS_HUMAN");
+    // F5 regression: the READY_FOR_MERGE path must record the same
+    // closed-unmerged reason the CI_RUNNING/task.escalated path already does.
+    expect(t.needsHumanReason).toBe("pull request closed unmerged");
     expect(await eventsOf(s.taskId, "pull_request.closed")).toHaveLength(1);
     const pr = await pullRequestRow(s.pullRequestId);
     expect(pr.state).toBe("closed");
+    expect(pr.lastPolledAt.toISOString()).toBe(polledAt.toISOString());
     const notes = await notificationsFor(s.taskId);
     expect(notes.some((n) => n.kind === "needs_human")).toBe(true);
   });
@@ -535,17 +654,76 @@ describe("AC5: closed unmerged", () => {
   });
 });
 
-describe("AC6: zero check runs", () => {
-  it("does nothing within the 2-minute grace period", async () => {
-    const s = await seedOpenPullRequest({ headSha: "sha-9", createdAt: NOW });
+describe("AC6 / F2 (C50): zero check runs never fall back to created_at", () => {
+  it(
+    "F2 regression: a row reset by report_pr_created (ci_detail null, " +
+      "created_at 10 minutes ago) with zero check runs waits on the first " +
+      "poll and passes on a poll 2 minutes later",
+    async () => {
+      const tenMinutesAgo = new Date(NOW.getTime() - 10 * 60_000);
+      const s = await seedOpenPullRequest({
+        headSha: "sha-9",
+        createdAt: tenMinutesAgo,
+        ciDetail: null,
+      });
+      const gh = createFakeGitHub();
+      gh.setPr(s.owner, s.repo, s.number, {
+        state: "open",
+        merged: false,
+        merged_at: null,
+        head_sha: "sha-9",
+      });
+      gh.setCheckRuns(s.owner, s.repo, "sha-9", []);
+      const client = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
+
+      // First poll: no `pending_since` on the row yet. Even though
+      // `created_at` is already 10 minutes old (well past the grace
+      // period), the poller must not treat that as elapsed time — it
+      // records `pending_since = now` and waits.
+      await run(client, () => NOW);
+
+      expect((await taskRow(s.taskId)).state).toBe("CI_RUNNING");
+      let pr = await pullRequestRow(s.pullRequestId);
+      expect(pr.ciDetail).toEqual({ pending_since: NOW.toISOString() });
+      expect(pr.ciState).not.toBe("passed");
+      expect(pr.lastPolledAt.toISOString()).toBe(NOW.toISOString());
+      expect(await eventsOf(s.taskId, "ci.passed")).toEqual([]);
+
+      // A poll before 2 minutes have passed since that recorded
+      // `pending_since` still waits.
+      const oneMinuteLater = new Date(NOW.getTime() + 60_000);
+      await run(client, () => oneMinuteLater);
+      expect((await taskRow(s.taskId)).state).toBe("CI_RUNNING");
+      pr = await pullRequestRow(s.pullRequestId);
+      expect(pr.ciDetail).toEqual({ pending_since: NOW.toISOString() });
+      expect(pr.lastPolledAt.toISOString()).toBe(oneMinuteLater.toISOString());
+
+      // A poll 2 minutes after `pending_since` (not `created_at`) passes.
+      const twoMinutesLater = new Date(NOW.getTime() + 2 * 60_000);
+      await run(client, () => twoMinutesLater);
+
+      expect((await taskRow(s.taskId)).state).toBe("READY_FOR_MERGE");
+      pr = await pullRequestRow(s.pullRequestId);
+      expect(pr.ciState).toBe("passed");
+      expect(pr.ciDetail).toEqual({ no_checks: true });
+      expect(await eventsOf(s.taskId, "ci.passed")).toHaveLength(1);
+    },
+  );
+
+  it("does nothing within the 2-minute grace period once pending_since is recorded", async () => {
+    const s = await seedOpenPullRequest({
+      headSha: "sha-9b",
+      createdAt: NOW,
+      ciDetail: { pending_since: NOW.toISOString() },
+    });
     const gh = createFakeGitHub();
     gh.setPr(s.owner, s.repo, s.number, {
       state: "open",
       merged: false,
       merged_at: null,
-      head_sha: "sha-9",
+      head_sha: "sha-9b",
     });
-    gh.setCheckRuns(s.owner, s.repo, "sha-9", []);
+    gh.setCheckRuns(s.owner, s.repo, "sha-9b", []);
     const client = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
     const oneMinuteLater = new Date(NOW.getTime() + 60_000);
 
@@ -553,12 +731,16 @@ describe("AC6: zero check runs", () => {
 
     expect((await taskRow(s.taskId)).state).toBe("CI_RUNNING");
     const pr = await pullRequestRow(s.pullRequestId);
-    expect(pr.ciState).toBe("pending");
+    expect(pr.ciDetail).toEqual({ pending_since: NOW.toISOString() });
     expect(pr.lastPolledAt.toISOString()).toBe(oneMinuteLater.toISOString());
   });
 
-  it("treats zero check runs older than 2 minutes as passed, with no_checks", async () => {
-    const s = await seedOpenPullRequest({ headSha: "sha-10", createdAt: NOW });
+  it("treats zero check runs as passed once 2 minutes have elapsed since pending_since", async () => {
+    const s = await seedOpenPullRequest({
+      headSha: "sha-10",
+      createdAt: NOW,
+      ciDetail: { pending_since: NOW.toISOString() },
+    });
     const gh = createFakeGitHub();
     gh.setPr(s.owner, s.repo, s.number, {
       state: "open",
@@ -568,9 +750,9 @@ describe("AC6: zero check runs", () => {
     });
     gh.setCheckRuns(s.owner, s.repo, "sha-10", []);
     const client = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
-    const threeMinutesLater = new Date(NOW.getTime() + 3 * 60_000);
+    const twoMinutesLater = new Date(NOW.getTime() + 2 * 60_000);
 
-    await run(client, () => threeMinutesLater);
+    await run(client, () => twoMinutesLater);
 
     expect((await taskRow(s.taskId)).state).toBe("READY_FOR_MERGE");
     const pr = await pullRequestRow(s.pullRequestId);
@@ -590,7 +772,7 @@ describe("AC7: in-progress checks and non-actionable states", () => {
       head_sha: "sha-11",
     });
     gh.setCheckRuns(s.owner, s.repo, "sha-11", [
-      { name: "unit", status: "in_progress", conclusion: null, details_url: null, html_url: null, external_id: null, app: null },
+      { id: 1, name: "unit", status: "in_progress", conclusion: null, details_url: null, html_url: null, external_id: null, app: null },
     ]);
     const client = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
     const later = new Date(NOW.getTime() + 1000);

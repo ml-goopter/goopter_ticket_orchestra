@@ -3,18 +3,19 @@ import type { GitHubCheckRun, GitHubClient } from "./client.js";
 /** design.md §9.2: the resume prompt keeps up to 200 lines per failing check. */
 export const LOG_EXCERPT_MAX_LINES = 200;
 
-const NUMERIC = /^\d+$/;
-const JOB_ID_IN_URL = /\/jobs\/(\d+)/;
+/** Matches both the plural `/jobs/123` and the real singular `/job/123` (F1). */
+const JOB_ID_IN_URL = /\/jobs?\/(\d+)/;
 
 /**
  * The GitHub Actions job id behind a failing check run, or `undefined` when
  * it cannot be determined (a third-party check, or a shape this cannot
- * parse). Tries `external_id` first, since GitHub Actions sets it to the
- * numeric job id; falls back to the job id embedded in `details_url` or
- * `html_url`.
+ * parse). A check run GitHub Actions created has its own `id` equal to the
+ * job's id (design.md §11.2, F1) — `external_id` is a UUID Actions sets and
+ * is never a usable job id, so it is not consulted here. The url match is a
+ * defensive fallback for a response shape that somehow omits `id`.
  */
 function jobIdFor(check: GitHubCheckRun): string | undefined {
-  if (check.externalId && NUMERIC.test(check.externalId)) return check.externalId;
+  if (typeof check.id === "number" && Number.isFinite(check.id)) return String(check.id);
   for (const url of [check.detailsUrl, check.htmlUrl]) {
     if (!url) continue;
     const match = JOB_ID_IN_URL.exec(url);
