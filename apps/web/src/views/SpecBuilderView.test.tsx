@@ -254,6 +254,121 @@ describe("SpecBuilderView", () => {
     expect(screen.getByTestId("chat-message").textContent).toBe("Spec chat");
   });
 
+  it("buffers live chat events until the aggregate's spec-execution id set is known, then keeps only the one from the spec execution (F1, review round 2)", async () => {
+    let resolveGetTask!: (aggregate: TaskAggregate) => void;
+    const getTaskPromise = new Promise<TaskAggregate>((resolve) => {
+      resolveGetTask = resolve;
+    });
+    const getTask = vi.fn().mockReturnValue(getTaskPromise);
+    const client = makeFakeClient({ getTask });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    // Both arrive while the first aggregate is still loading, so neither
+    // execution id is known to be (or not be) the spec execution's yet.
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({
+          id: 1,
+          executionId: "exec-impl-1",
+          type: "agent.message",
+          payload: { text: "Implementation chatter" },
+        }),
+        "1",
+      );
+    });
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({ id: 2, executionId: "exec-spec-1", type: "agent.message", payload: { text: "Spec chat" } }),
+        "2",
+      );
+    });
+
+    expect(screen.queryByTestId("chat-message")).toBeNull();
+
+    await act(async () => {
+      resolveGetTask(aggregateInProgress());
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId("chat-message")).toHaveLength(1));
+    expect(screen.getByTestId("chat-message").textContent).toBe("Spec chat");
+  });
+
+  it("buffers a live chat event from an unknown execution, refetches once, and renders it only once the refreshed aggregate confirms it's a spec execution (F2, review round 2)", async () => {
+    const initialAggregate = aggregateInProgress();
+    const newSpecExecution = { ...initialAggregate.executions[0]!, id: "exec-spec-2" };
+    const refreshedAggregate: TaskAggregate = {
+      ...initialAggregate,
+      executions: [...initialAggregate.executions, newSpecExecution],
+      latestExecutions: { ...initialAggregate.latestExecutions, spec: newSpecExecution },
+    };
+    const getTask = vi
+      .fn()
+      .mockResolvedValueOnce(initialAggregate)
+      .mockResolvedValueOnce(refreshedAggregate)
+      .mockResolvedValue(refreshedAggregate);
+    const client = makeFakeClient({ getTask });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state")).toBeTruthy());
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    // "exec-spec-2" is not yet in the loaded aggregate's executions (e.g. a
+    // retry started it after the last fetch): buffer and refetch once.
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({
+          id: 1,
+          executionId: "exec-spec-2",
+          type: "agent.message",
+          payload: { text: "New spec execution chat" },
+        }),
+        "1",
+      );
+    });
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getAllByTestId("chat-message")).toHaveLength(1));
+    expect(screen.getByTestId("chat-message").textContent).toBe("New spec execution chat");
+
+    // A second unknown execution id, still absent from the refreshed
+    // aggregate, triggers exactly one more refetch and is then dropped for
+    // good rather than rendered.
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({ id: 2, executionId: "exec-unknown", type: "agent.message", payload: { text: "Never belongs" } }),
+        "2",
+      );
+    });
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(3));
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(1);
+  });
+
+  it("refetches the aggregate on a live execution.started/execution.resumed event, even with no accompanying chat row (F2, review round 2)", async () => {
+    const getTask = vi.fn().mockResolvedValue(aggregateInProgress());
+    const client = makeFakeClient({ getTask });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    await act(async () => {
+      currentSource().emit(
+        "execution.started",
+        makeTimelineEvent({ id: 1, executionId: "exec-spec-2", type: "execution.started", payload: {} }),
+        "1",
+      );
+    });
+
+    await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+  });
+
   it("loads the chat backlog from GET /tasks/:id/timeline on mount, and a live event with an overlapping id is not duplicated", async () => {
     const backlogEvent = makeTimelineEvent({
       id: 7,

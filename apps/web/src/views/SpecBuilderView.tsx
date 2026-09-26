@@ -20,7 +20,7 @@ import { changedSpecFields, emptySpecContent, specContentEquals } from "../spec/
 import {
   isLiveExecutionState,
   isSpecChatBacklogEvent,
-  isSpecChatLiveEvent,
+  isSpecChatEventType,
   specRoleExecutionIds,
   SPEC_STREAM_EVENT_TYPES,
 } from "../spec/specSession.js";
@@ -112,6 +112,20 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const formContentRef = useRef<SpecContent | null>(null);
   const formBaselineRef = useRef<SpecContent | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Live chat events (`agent.message`/`.delta`/`agent.tool_call`) whose
+  // execution id isn't (yet) known to be the spec execution's: buffered
+  // rather than rendered or dropped outright (F1/F2, GOT.38 review round 2).
+  // `pendingChatEventsRef` holds them until the drain effect below re-checks
+  // them against a freshly-loaded `specExecutionIds`; `pendingRefetchRef`
+  // debounces the refetch that refreshes it to one in flight at a time;
+  // `foreignExecutionIdsRef` remembers an execution id a refetch already
+  // confirmed does not belong (an execution's role never changes), so a
+  // chatty non-spec execution (e.g. a paused implementation execution) does
+  // not re-trigger a refetch for every message it emits.
+  const pendingChatEventsRef = useRef<TimelineEvent[]>([]);
+  const pendingRefetchRef = useRef(false);
+  const foreignExecutionIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     formContentRef.current = formContent;
@@ -247,13 +261,37 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const eventSourceAvailable = createEventSource !== undefined || typeof EventSource !== "undefined";
 
   // Same spec-role execution id set the backlog load filters by (F1, GOT.38
-  // review round 1). `null` before the first `getTask` resolves; an event
-  // arriving in that narrow window passes through unfiltered rather than
-  // being dropped before we know which executions belong to this task.
+  // review round 1). `null` before the first `getTask` resolves.
   const specExecutionIds = useMemo(
     () => (aggregate ? specRoleExecutionIds(aggregate.executions) : null),
     [aggregate],
   );
+
+  // Re-checks buffered chat events against a freshly-known/refreshed
+  // `specExecutionIds` (F1/F2, GOT.38 review round 2): runs once after the
+  // first aggregate loads (specExecutionIds goes from `null` to a `Set`)
+  // and again after every refetch the buffering below triggers. A match is
+  // finally rendered; a miss means a real aggregate fetch has now confirmed
+  // the execution id is foreign, so it is dropped for good.
+  useEffect(() => {
+    if (specExecutionIds === null) return;
+    const pending = pendingChatEventsRef.current;
+    if (pending.length === 0) return;
+    pendingChatEventsRef.current = [];
+    pendingRefetchRef.current = false;
+
+    const matching: TimelineEvent[] = [];
+    for (const pendingEvent of pending) {
+      if (pendingEvent.executionId !== null && specExecutionIds.has(pendingEvent.executionId)) {
+        matching.push(pendingEvent);
+      } else if (pendingEvent.executionId !== null) {
+        foreignExecutionIdsRef.current.add(pendingEvent.executionId);
+      }
+    }
+    if (matching.length > 0) {
+      setEvents((prev) => mergeTimelineEvents(prev, matching));
+    }
+  }, [specExecutionIds]);
 
   // Bare URL (C23, docs/build-order.md GOT.38/42 note): the hook appends its
   // own `after=` on reconnect, so passing one here would duplicate the param
@@ -265,17 +303,42 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
     onEvent: (event) => {
       const parsed = TimelineEventSchema.safeParse(event.data);
       if (!parsed.success) return;
-      if (specExecutionIds && !isSpecChatLiveEvent(parsed.data, specExecutionIds)) {
-        // Another execution's chat noise sharing this task's stream (e.g. a
-        // paused implementation execution, design.md §10.4): not this
-        // pane's chat, and not a signal to refetch either.
-        return;
+
+      if (isSpecChatEventType(parsed.data.type)) {
+        const executionId = parsed.data.executionId;
+        const knownForeign = executionId !== null && foreignExecutionIdsRef.current.has(executionId);
+        const belongs =
+          !knownForeign &&
+          specExecutionIds !== null &&
+          executionId !== null &&
+          specExecutionIds.has(executionId);
+
+        if (!belongs) {
+          if (!knownForeign) {
+            // Either the spec-execution id set isn't known yet (F1: still
+            // loading the first aggregate) or this id isn't in the set we
+            // do know (F2: e.g. a retry started a new spec execution after
+            // our last fetch). Buffer it rather than rendering or dropping
+            // it on a set that might be stale; the drain effect above
+            // re-checks it once the aggregate refreshes. Debounced to one
+            // refetch at a time, and only once the set is known at all —
+            // the initial load already covers the F1 case.
+            pendingChatEventsRef.current = [...pendingChatEventsRef.current, parsed.data];
+            if (specExecutionIds !== null && !pendingRefetchRef.current) {
+              pendingRefetchRef.current = true;
+              void refetch(true);
+            }
+          }
+          return;
+        }
       }
+
       setEvents((prev) => mergeTimelineEvents(prev, [parsed.data]));
-      if (parsed.data.type !== "agent.message.delta" && parsed.data.type !== "agent.message" && parsed.data.type !== "agent.tool_call") {
-        // spec.proposed / spec.revised / spec.review_requested /
-        // spec.sent_back / spec.approved / task.state_changed: none of these
-        // are rendered directly in the chat, they all mean "go refetch".
+      if (!isSpecChatEventType(parsed.data.type)) {
+        // execution.started / execution.resumed / spec.proposed /
+        // spec.revised / spec.review_requested / spec.sent_back /
+        // spec.approved / task.state_changed: none of these are rendered
+        // directly in the chat, they all mean "go refetch".
         void refetch(true);
       }
     },
