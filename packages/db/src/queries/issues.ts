@@ -210,6 +210,79 @@ export async function insertIssueMessage(
   return row;
 }
 
+export interface InsertAgentIssueMessageInput {
+  issueId: string;
+  body: string;
+  now: Date;
+}
+
+/**
+ * Inserts one agent `issue_messages` row: the agent's reply to a user
+ * message on an open issue (design.md §9.3, §10.2). No `user_id`.
+ */
+export async function insertAgentIssueMessage(
+  tx: Tx,
+  input: InsertAgentIssueMessageInput,
+): Promise<{ id: string }> {
+  const [row] = await tx
+    .insert(issueMessages)
+    .values({
+      issueId: input.issueId,
+      authorKind: "agent",
+      userId: null,
+      body: input.body,
+      createdAt: input.now,
+    })
+    .returning({ id: issueMessages.id });
+  if (!row) throw new Error("insertAgentIssueMessage: insert returned no row");
+  return row;
+}
+
+/** One issue, unlocked. `null` for an unknown issue. */
+export async function getIssueById(
+  db: DbOrTx,
+  issueId: string,
+): Promise<IssueRow | null> {
+  const [row] = await db.select().from(issues).where(eq(issues.id, issueId)).limit(1);
+  return row ?? null;
+}
+
+/** One `task_decisions` row, unlocked. `null` when it does not exist. */
+export async function getTaskDecisionById(
+  db: DbOrTx,
+  decisionId: string,
+): Promise<TaskDecisionRow | null> {
+  const [row] = await db
+    .select()
+    .from(taskDecisions)
+    .where(eq(taskDecisions.id, decisionId))
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * True when the execution has an `OPEN` blocking issue: what keeps it in
+ * `WAITING_FOR_USER` after an issue conversation turn (design.md §9.3).
+ * Call with the execution row locked.
+ */
+export async function hasOpenBlockingIssue(
+  tx: Tx,
+  executionId: string,
+): Promise<boolean> {
+  const [row] = await tx
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.executionId, executionId),
+        eq(issues.status, "OPEN"),
+        eq(issues.blocking, true),
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
+}
+
 export interface ResolveIssueInput {
   issueId: string;
   resolutionKind: "clarification" | "spec_revision";

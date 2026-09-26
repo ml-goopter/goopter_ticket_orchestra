@@ -358,7 +358,7 @@ export class WorktreeManager {
       }
     }
 
-    const context = ExecutionContextSchema.parse({
+    await this.writeContextFile(worktreePath, {
       task: {
         id: input.task.id,
         jira_key: input.task.jiraKey,
@@ -373,16 +373,40 @@ export class WorktreeManager {
       },
       runtime: input.runtime,
       review_command: input.reviewCommand ?? null,
-    } satisfies ExecutionContext);
-    const contextFile = path.join(worktreePath, EXECUTION_CONTEXT_PATH);
-    await fs.mkdir(path.dirname(contextFile), { recursive: true });
-    await fs.writeFile(contextFile, `${JSON.stringify(context, null, 2)}\n`);
+    });
 
     return {
       worktreePath,
       branch,
       startPoint: fromRemote ? "remote_branch" : "default_branch",
     };
+  }
+
+  /**
+   * Rewrites `.orchestra/context.json` in an existing worktree at its
+   * recorded path (C33), in the format `prepareImplementation` writes:
+   * `resume_with_revision` moves the execution to a newly approved revision,
+   * and `orchestra-review` reads the spec from this file (§9.8, GOT.47 C53).
+   * Throws when `context` is invalid or the path is not a recorded worktree
+   * path.
+   */
+  async writeContext(worktreePath: string, context: ExecutionContext): Promise<void> {
+    await this.writeContextFile(this.recordedWorktreePath(worktreePath), context);
+  }
+
+  /**
+   * Validates `context` and writes it to `.orchestra/context.json` under
+   * `worktreePath`: the one context writer behind `prepareImplementation`
+   * and `writeContext`.
+   */
+  private async writeContextFile(
+    worktreePath: string,
+    context: ExecutionContext,
+  ): Promise<void> {
+    const parsed = ExecutionContextSchema.parse(context);
+    const contextFile = path.join(worktreePath, EXECUTION_CONTEXT_PATH);
+    await fs.mkdir(path.dirname(contextFile), { recursive: true });
+    await fs.writeFile(contextFile, `${JSON.stringify(parsed, null, 2)}\n`);
   }
 
   /**

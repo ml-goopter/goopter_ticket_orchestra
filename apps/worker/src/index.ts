@@ -18,9 +18,11 @@ import { PHASE_ORDER, createDefaultPhases } from "./phases/index.js";
 import { registerWorker } from "./registration.js";
 import {
   createCommandHandlers,
+  createIssueMessageHandler,
   createRunner,
   registerCancelHandler,
   registerCiFailureHandler,
+  registerIssueHandlers,
   registerSpecHandlers,
   startRetryStarter,
 } from "./runner/index.js";
@@ -171,7 +173,13 @@ async function main(): Promise<void> {
   // design.md §11.2: CI feedback resumes the same execution (GOT.39).
   registerCiFailureHandler(commands, runner);
   // design.md §12.3, D8: spec sessions start and chat by command (GOT.37).
-  registerSpecHandlers(commands, runner);
+  // A send_message on an issue is the issue conversation (§9.3, GOT.47),
+  // on an implementation or a spec execution (C54).
+  registerSpecHandlers(commands, runner, {
+    issueSendMessage: createIssueMessageHandler(runner),
+  });
+  // design.md §10.3, §10.4: issue resolution resumes the execution (GOT.47).
+  registerIssueHandlers(commands, runner);
 
   const loop = createTickLoop({
     db,

@@ -21,3 +21,4 @@ export * from "./costs.js";
 export * from "./github.js";
 export * from "./retry.js";
 export * from "./spec-execution.js";
+export * from "./issue-resume.js";

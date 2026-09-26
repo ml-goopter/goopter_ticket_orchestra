@@ -10,6 +10,7 @@ import type {
 import {
   SpecContentSchema,
   type EndReason,
+  type ExecutionContext,
   type ExecutionEventType,
   type ExecutionState,
   type Runtime,
@@ -21,21 +22,27 @@ import {
   appendEvent,
   getExecutionState,
   getRevisionByStatus,
+  getSpecRevisionById,
   getTaskState,
   hasLiveSpecExecution,
   insertExecutionUsage,
   loadRunnerContext,
   lockExecutionForTool,
+  lockIssue,
   lockTaskForTool,
   markExecutionEnded,
+  mergeExecutionEventPayload,
+  pinExecutionToHost,
   resolveSpecRepository,
   restoreEvictedWorktree as restoreEvictedWorktreeRow,
   setExecutionPlacement,
+  setExecutionSessionId,
   setExecutionWorktree,
   sumSessionUsageByModel,
   transition,
   type Db,
   type RunnerContext,
+  type Tx,
 } from "@orchestra/db";
 import {
   buildResumePrompt,
@@ -140,6 +147,12 @@ export interface RunnerDeps {
      * ran on this host (C27). Without it nothing is pushed.
      */
     pushIfAhead?(input: PushIfAheadInput): Promise<PushIfAheadResult>;
+    /**
+     * A resume onto a newly approved revision rewrites the worktree's
+     * `.orchestra/context.json`, so `orchestra-review` reads that revision
+     * (GOT.47 C53). Without it the file is not rewritten.
+     */
+    writeContext?(worktreePath: string, context: ExecutionContext): Promise<void>;
   };
   /** One adapter per runtime (§7.3). A missing runtime fails the execution. */
   adapters: Partial<Record<Runtime, AgentAdapter>>;
@@ -167,6 +180,12 @@ export interface RunnerDeps {
      * token is issued. Tests use it to interleave a state move.
      */
     beforeTokenIssue?: (executionId: string) => Promise<void>;
+    /**
+     * Runs after the fresh-session fallback decided to pin a released
+     * execution and before its pin transaction (C21). Tests use it to pin
+     * the execution elsewhere in between.
+     */
+    beforeFallbackPin?: (executionId: string) => Promise<void>;
   };
 }
 
@@ -179,11 +198,13 @@ export type ResumeErrorCode =
   | "NO_ADAPTER"
   | "CANNOT_RESUME"
   | "WORKTREE_UNAVAILABLE"
+  | "ISSUE_NOT_OPEN"
   | "SHUT_DOWN";
 
 /**
  * `runner.resume` refused. Nothing was written, except that a worktree
- * recreated after eviction is recorded before any later refusal.
+ * recreated after eviction is recorded before any later refusal, and a
+ * fresh-session fallback's pin to this host (C21) stays.
  */
 export class ResumeError extends Error {
   readonly code: ResumeErrorCode;
@@ -202,11 +223,54 @@ export interface ResumeInput {
   prompt: string;
   usageKind?: Extract<UsageKind, "resume">;
   /**
-   * Spec role only (GOT.37): the state the command handler saw. The resume
-   * refuses `NOT_RESUMABLE_STATE` when the row is in another state by the
-   * time it is locked.
+   * The state the command handler saw (GOT.37, GOT.47). The resume refuses
+   * `NOT_RESUMABLE_STATE` when the row is in another state by the time it
+   * is locked.
    */
   expectedState?: ExecutionState;
+  /**
+   * GOT.47: fields merged into the payload of the `execution.resumed` event
+   * the resume transition writes, such as the command and the issue.
+   */
+  resumedPayload?: Record<string, unknown>;
+  /**
+   * §10.4: the newly approved revision. The resume sets
+   * `executions.spec_revision_id` to it in the resume transaction and keeps
+   * the old value in `execution.resumed` as `previous_spec_revision_id`.
+   */
+  specRevisionId?: string;
+  /**
+   * GOT.47 C21 (D5, §6.1): enables the fresh-session fallback for an
+   * implementation execution whose `host` is null (released by the
+   * dead-host sweeper) or whose session `canResume` refuses. Receives the
+   * full user prompt and returns the prompt of the fresh session. Without
+   * it, those cases refuse OTHER_HOST and CANNOT_RESUME.
+   */
+  freshPrompt?: (userPrompt: string) => string;
+  /**
+   * GOT.47 §9.3 issue conversation: runs in the after-turn transaction,
+   * under the task, then execution, row locks, when the turn ended with the
+   * execution still RUNNING. `finalText` is the agent's final text of the
+   * turn, redacted. Returning true ends the turn in WAITING_FOR_USER instead
+   * of a protocol violation.
+   */
+  /**
+   * GOT.47 F1: the issue a conversation turn answers. The resume transaction
+   * locks it after the task and execution rows and refuses
+   * `ISSUE_NOT_OPEN` when a resolve has closed it since the handler read it.
+   */
+  openIssueId?: string;
+  conversationTurn?: (tx: Tx, turn: { finalText: string }) => Promise<boolean>;
+}
+
+/** Why a resume started a fresh session (C21). */
+export type FreshSessionReason = "host_released" | "cannot_resume";
+
+/** Per-turn options of `runSession`. */
+interface TurnOptions {
+  /** A fresh session on a RUNNING execution: store its session id (C21). */
+  replaceSession?: boolean;
+  conversationTurn?: ResumeInput["conversationTurn"];
 }
 
 /**
@@ -282,8 +346,11 @@ export interface Runner {
    * on `execution.resumed` (C45); both need the task in SPEC_IN_PROGRESS.
    * Resolves once it is RUNNING; `done` resolves when the turn has been handled.
    * An evicted worktree is first recreated from the remote branch (§6.6).
+   * With `freshPrompt`, an implementation execution released from a dead
+   * host, or whose session cannot be resumed, is pinned here and starts a
+   * fresh session in its recorded worktree instead (C21).
    * Rejects with `ResumeError` without writing anything otherwise, except
-   * that a recreated worktree stays recorded.
+   * that a recreated worktree and a fallback pin stay recorded.
    */
   resume(input: ResumeInput): Promise<{ done: Promise<void> }>;
   /** Aborts the live run of `executionId`. False when none runs here. */
@@ -568,6 +635,7 @@ export function createRunner(deps: RunnerDeps): Runner {
     usageKind: "main" | "resume",
     log: Logger,
     open: (token: string, signal: AbortSignal) => AsyncIterable<AgentEvent>,
+    turnOptions: TurnOptions = {},
   ): Promise<void> {
     const executionId = ctx.execution.id;
     const writes = createWriteQueue(log);
@@ -718,7 +786,7 @@ export function createRunner(deps: RunnerDeps): Runner {
 
           if (event.type === "session") {
             await writes.push("session", () =>
-              onSession(state, ctx, event.sessionId, log),
+              onSession(state, ctx, event.sessionId, log, turnOptions.replaceSession === true),
             );
           } else if (event.type === "text") {
             buffer += event.delta;
@@ -777,7 +845,11 @@ export function createRunner(deps: RunnerDeps): Runner {
       }
       await writes.drain();
 
-      await afterTurn(ctx, entry, end, log);
+      // §9.3 issue conversation: the agent's final text of the turn.
+      const finalText = redact(
+        end.kind === "turn_done" && end.finalText !== "" ? end.finalText : turnText,
+      );
+      await afterTurn(ctx, entry, end, log, finalText, turnOptions.conversationTurn);
     } finally {
       cancel(quietTimer);
       cancel(flushTimer);
@@ -788,12 +860,17 @@ export function createRunner(deps: RunnerDeps): Runner {
     }
   }
 
-  /** `session` event: store the id and move ASSIGNED -> RUNNING (§9.3). */
+  /**
+   * `session` event: store the id and move ASSIGNED -> RUNNING (§9.3). With
+   * `replaceSession`, a fresh session on a RUNNING execution (C21) also
+   * stores its id, so the next resume uses it.
+   */
   async function onSession(
     state: RunState,
     ctx: RunnerContext,
     sessionId: string,
     log: Logger,
+    replaceSession: boolean,
   ): Promise<void> {
     const outcome = await db.transaction(async (tx) => {
       await lockTaskForTool(tx, ctx.task.id);
@@ -809,7 +886,9 @@ export function createRunner(deps: RunnerDeps): Runner {
         });
         return "started" as const;
       }
-      return row.state === "RUNNING" ? ("running" as const) : ("gone" as const);
+      if (row.state !== "RUNNING") return "gone" as const;
+      if (replaceSession) await setExecutionSessionId(tx, ctx.execution.id, sessionId);
+      return "running" as const;
     });
     if (outcome === "gone") {
       log.info({}, "session started for an execution that is no longer live, aborting");
@@ -861,12 +940,19 @@ export function createRunner(deps: RunnerDeps): Runner {
     });
   }
 
-  /** §9.3 after the loop, §8 blocking handling, §9.4 liveness. */
+  /**
+   * §9.3 after the loop, §8 blocking handling, §9.4 liveness. An issue
+   * conversation turn (`conversationTurn`, GOT.47) on a RUNNING execution
+   * stores the agent's reply and returns to WAITING_FOR_USER while an issue
+   * still holds it there.
+   */
   async function afterTurn(
     ctx: RunnerContext,
     entry: LiveExecution,
     end: TurnEnd,
     log: Logger,
+    finalText: string,
+    conversationTurn?: ResumeInput["conversationTurn"],
   ): Promise<void> {
     switch (end.kind) {
       case "stopped":
@@ -900,7 +986,11 @@ export function createRunner(deps: RunnerDeps): Runner {
       await lockTaskForTool(tx, ctx.task.id);
       const row = await lockExecutionForTool(tx, ctx.execution.id);
       if (!row) return "gone";
-      if (entry.blockingPending && row.state === "RUNNING") {
+      const holding =
+        row.state === "RUNNING" && conversationTurn
+          ? await conversationTurn(tx, { finalText })
+          : false;
+      if ((entry.blockingPending || holding) && row.state === "RUNNING") {
         await transition(tx, {
           entity: "execution",
           id: ctx.execution.id,
@@ -953,6 +1043,38 @@ export function createRunner(deps: RunnerDeps): Runner {
       log.warn({ err: errMessage(err) }, "Jira ticket fetch failed, prompting without it");
       return fallback;
     }
+  }
+
+  /**
+   * §9.2 implementation user prompt: ticket, approved spec, every decision
+   * on the task, repository block. `ctx.repository` must be set.
+   */
+  async function implementationUserPrompt(
+    ctx: RunnerContext,
+    spec: { version: number; content: ReturnType<typeof SpecContentSchema.parse> },
+    workingBranch: string | null,
+    log: Logger,
+  ): Promise<string> {
+    return buildUserPrompt({
+      role: "implementation",
+      ticket: await loadTicket(ctx, log),
+      approvedSpec: spec,
+      decisions: ctx.decisions.map((d) => ({
+        issueId: d.issueId,
+        decision: d.decision,
+        clarification: d.clarification,
+        chosenOption: d.chosenOption,
+        author: d.decidedBy,
+        decidedAt: d.decidedAt.toISOString().slice(0, 10),
+      })),
+      repository: {
+        name: ctx.repository!.name,
+        defaultBranch: ctx.repository!.defaultBranch,
+        workingBranch,
+        setupCommand: ctx.repository!.setupCommand,
+        testCommand: testCommandFor(ctx),
+      },
+    });
   }
 
   async function startBody(
@@ -1229,26 +1351,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       path.join(prepared.worktreePath, NO_MISTAKES_MARKER),
     );
     const systemPrompt = systemPromptFor("implementation", { noMistakes });
-    const startPrompt = buildUserPrompt({
-      role: "implementation",
-      ticket: await loadTicket(ctx, log),
-      approvedSpec: spec,
-      decisions: ctx.decisions.map((d) => ({
-        issueId: d.issueId,
-        decision: d.decision,
-        clarification: d.clarification,
-        chosenOption: d.chosenOption,
-        author: d.decidedBy,
-        decidedAt: d.decidedAt.toISOString().slice(0, 10),
-      })),
-      repository: {
-        name: ctx.repository!.name,
-        defaultBranch: ctx.repository!.defaultBranch,
-        workingBranch: prepared.branch,
-        setupCommand: ctx.repository!.setupCommand,
-        testCommand,
-      },
-    });
+    const startPrompt = await implementationUserPrompt(ctx, spec, prepared.branch, log);
     const prompt = retryOf
       ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure", reuse !== null, nudge)}\n\n${startPrompt}`
       : startPrompt;
@@ -1551,7 +1654,28 @@ export function createRunner(deps: RunnerDeps): Runner {
     let adapter: AgentAdapter;
     let sessionId: string;
     let worktreePath: string;
-    let baseline: UsageBaseline;
+    const baseline: UsageBaseline = {};
+    // C21: set when this resume starts a fresh session instead.
+    let fresh: FreshSessionReason | null = null;
+    let freshSpec: { version: number; content: ReturnType<typeof SpecContentSchema.parse> } | null =
+      null;
+    /**
+     * What a fresh session needs beyond the recorded worktree: the task's
+     * repository, the branch and valid spec content at the execution's
+     * revision. Checked before any write; a gap refuses NO_SESSION.
+     */
+    const freshContext = (c: RunnerContext) => {
+      if (!c.repository) return refuse("NO_SESSION", "fresh session: task has no repository");
+      if (!c.execution.branch) return refuse("NO_SESSION", "fresh session: execution has no branch");
+      if (!c.revision) {
+        return refuse("NO_SESSION", "fresh session: no approved specification revision");
+      }
+      const parsed = SpecContentSchema.safeParse(c.revision.content);
+      if (!parsed.success) {
+        return refuse("NO_SESSION", "fresh session: specification revision is not valid spec content");
+      }
+      return { version: c.revision.version, content: parsed.data };
+    };
     try {
       const loaded = await loadRunnerContext(db, executionId);
       if (!loaded) return refuse("NOT_FOUND", "execution not found");
@@ -1576,7 +1700,23 @@ export function createRunner(deps: RunnerDeps): Runner {
       if (spec && ctx.repository === null) {
         ctx = { ...ctx, repository: await resolveSpecRepository(db, ctx.task.id) };
       }
-      if (execution.host !== host) refuse("OTHER_HOST", "execution is pinned to another host");
+      // §10.4: the resume runs against the newly approved revision.
+      if (input.specRevisionId !== undefined) {
+        const revision = await getSpecRevisionById(db, input.specRevisionId);
+        if (!revision || revision.taskId !== ctx.task.id) {
+          return refuse("NOT_FOUND", "specification revision not found on the task");
+        }
+        ctx = { ...ctx, revision };
+      }
+      const canFallBack =
+        input.freshPrompt !== undefined && execution.role === "implementation";
+      if (execution.host !== host) {
+        // C21: released from a dead host, so no worker holds the session.
+        if (execution.host !== null || !canFallBack) {
+          refuse("OTHER_HOST", "execution is pinned to another host");
+        }
+        fresh = "host_released";
+      }
       if (!execution.sessionId || !execution.worktreePath) {
         refuse("NO_SESSION", "execution has no session or worktree");
       }
@@ -1585,23 +1725,100 @@ export function createRunner(deps: RunnerDeps): Runner {
       const found = deps.adapters[execution.runtime];
       if (!found) return refuse("NO_ADAPTER", `${execution.runtime} adapter not available`);
       adapter = found;
+
+      let expectedWorkerId = execution.workerId;
+      if (fresh !== null) {
+        freshSpec = freshContext(ctx);
+        await deps.hooks?.beforeFallbackPin?.(executionId);
+        // C21: pin here before touching the worktree, so two workers
+        // handling commands for the same released execution never both
+        // take it over. No adapter or git call under the lock.
+        await db.transaction(async (tx) => {
+          await lockTaskForTool(tx, ctx.task.id);
+          const row = await lockExecutionForTool(tx, executionId);
+          if (row?.state !== execution.state) {
+            refuse("NOT_RESUMABLE_STATE", `execution is ${row?.state ?? "gone"}`);
+          }
+          const pinned = (await loadRunnerContext(tx, executionId))?.execution;
+          if (pinned?.host != null) {
+            refuse("OTHER_HOST", "execution was pinned to a host since the context loaded");
+          }
+          await pinExecutionToHost(tx, executionId, { workerId, host });
+        });
+        expectedWorkerId = workerId;
+        log.info({ reason: fresh }, "released execution pinned to this host for a fresh session");
+      }
+
       if (execution.worktreeEvictedAt !== null) {
         worktreePath = await restoreEvictedWorktree(ctx, worktreePath, refuse, log);
       }
-      if (!(await adapter.canResume(sessionId, worktreePath))) {
-        refuse("CANNOT_RESUME", "session cannot be resumed");
+      if (fresh === null && !(await adapter.canResume(sessionId, worktreePath))) {
+        if (!canFallBack) refuse("CANNOT_RESUME", "session cannot be resumed");
+        freshSpec = freshContext(ctx);
+        fresh = "cannot_resume";
+      }
+      // C21: the recorded worktree lives on the dead host, or is gone here.
+      if (fresh !== null && !(await pathExists(worktreePath))) {
+        worktreePath = await restoreEvictedWorktree(ctx, worktreePath, refuse, log);
       }
 
-      baseline = {};
-      for (const row of await sumSessionUsageByModel(db, executionId)) {
-        baseline[row.model] = {
-          input: row.inputTokens,
-          cached: row.cachedInputTokens,
-          output: row.outputTokens,
-          costUsd: row.costUsd,
-        };
+      // C53: `orchestra-review` reads the spec from the worktree's
+      // context.json, so it moves to the new revision with the execution.
+      // Written before the resume transaction, outside any row lock.
+      if (input.specRevisionId !== undefined && deps.worktrees.writeContext) {
+        try {
+          const revision = ctx.revision!;
+          const repository = ctx.repository;
+          if (!repository) throw new Error("task has no repository");
+          await deps.worktrees.writeContext(worktreePath, {
+            task: {
+              id: ctx.task.id,
+              jira_key: ctx.task.jiraKey,
+              jira_summary: ctx.task.jiraSummary,
+            },
+            spec: {
+              version: revision.version,
+              content: SpecContentSchema.parse(revision.content),
+            },
+            decisions: ctx.decisions.map((d) => ({
+              issue_id: d.issueId,
+              decision: d.decision,
+              clarification: d.clarification,
+              chosen_option: d.chosenOption,
+              decided_by: d.decidedBy,
+              decided_at: d.decidedAt.toISOString(),
+            })),
+            repository: {
+              name: repository.name,
+              default_branch: repository.defaultBranch,
+              branch: ctx.execution.branch ?? "",
+            },
+            runtime: ctx.execution.runtime,
+            review_command: testCommandFor(ctx),
+          });
+        } catch (err) {
+          refuse(
+            "WORKTREE_UNAVAILABLE",
+            `context.json could not be rewritten for the new revision: ${errMessage(err)}`,
+          );
+        }
       }
 
+      if (fresh === null) {
+        for (const row of await sumSessionUsageByModel(db, executionId)) {
+          baseline[row.model] = {
+            input: row.inputTokens,
+            cached: row.cachedInputTokens,
+            output: row.outputTokens,
+            costUsd: row.costUsd,
+          };
+        }
+      }
+
+      const resumedPayload: Record<string, unknown> = {
+        ...input.resumedPayload,
+        ...(fresh !== null ? { fresh_session: true, reason: fresh } : {}),
+      };
       await db.transaction(async (tx) => {
         await lockTaskForTool(tx, ctx.task.id);
         const row = await lockExecutionForTool(tx, executionId);
@@ -1611,12 +1828,20 @@ export function createRunner(deps: RunnerDeps): Runner {
         // §6.1: the dead-host release may have cleared the pin since the
         // context loaded. Re-read it under the execution lock.
         const pinned = (await loadRunnerContext(tx, executionId))?.execution;
-        if (pinned?.host !== host || pinned.workerId !== execution.workerId) {
+        if (pinned?.host !== host || pinned.workerId !== expectedWorkerId) {
           refuse("OTHER_HOST", "execution is no longer pinned to this host");
         }
         // §6.6: the worktree sweeper may have evicted it since then.
         if (pinned?.worktreeEvictedAt != null) {
           refuse("WORKTREE_UNAVAILABLE", "worktree was evicted after the context loaded");
+        }
+        // F1: an api resolve may have closed the issue since the handler
+        // read it. Issue last, after task and execution (the api's order).
+        if (input.openIssueId !== undefined) {
+          const issue = await lockIssue(tx, input.openIssueId);
+          if (issue?.status !== "OPEN") {
+            refuse("ISSUE_NOT_OPEN", `issue is ${issue?.status ?? "gone"}, not OPEN`);
+          }
         }
         // GOT.37: a spec chat turn or a send-back only while the user is
         // drafting. Request-review or cancel may have moved the task since.
@@ -1633,7 +1858,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         }
         // C42: a RUNNING spec execution resumes in place, no transition.
         if (execution.state !== "RUNNING") {
-          await transition(tx, {
+          const moved = await transition(tx, {
             entity: "execution",
             id: executionId,
             // §5.2: COMPLETED -> RUNNING is the CI back edge for an
@@ -1643,8 +1868,26 @@ export function createRunner(deps: RunnerDeps): Runner {
                 ? "resume_with_ci_failure"
                 : "execution.resumed",
             actor: worker,
-            set: { endedAt: null },
+            set: {
+              endedAt: null,
+              ...(input.specRevisionId !== undefined
+                ? { specRevisionId: input.specRevisionId }
+                : {}),
+            },
           });
+          // §10.4: the old revision stays in the event payload.
+          const extra: Record<string, unknown> = {
+            ...resumedPayload,
+            ...(input.specRevisionId !== undefined
+              ? {
+                  previous_spec_revision_id: pinned?.specRevisionId ?? null,
+                  spec_revision_id: input.specRevisionId,
+                }
+              : {}),
+          };
+          if (Object.keys(extra).length > 0) {
+            await mergeExecutionEventPayload(tx, moved.eventId, extra);
+          }
         }
         // A paused execution's lease was not renewed. Renew it with the move
         // to RUNNING, so the sweeper never sees the resumed run stale.
@@ -1659,24 +1902,69 @@ export function createRunner(deps: RunnerDeps): Runner {
 
     const role = ctx.execution.role as ToolPolicy;
     const testCommand = testCommandFor(ctx);
+    const turnOptions: TurnOptions = { conversationTurn: input.conversationTurn };
+    if (fresh !== null) {
+      // C21, D5: a new session seeded with the full user prompt, the resume
+      // header as its pending prompt.
+      const spec = freshSpec!;
+      const cwd = worktreePath;
+      const buildPrompt = input.freshPrompt!;
+      log.info({ reason: fresh }, "resume starts a fresh session");
+      const done = track(state, log, () =>
+        withLease(state, ctx, log, false, async () => {
+          const noMistakes = await pathExists(path.join(cwd, NO_MISTAKES_MARKER));
+          const prompt = buildPrompt(
+            await implementationUserPrompt(ctx, spec, ctx.execution.branch, log),
+          );
+          await runSession(
+            state,
+            ctx,
+            input.usageKind ?? "resume",
+            log,
+            (token, signal) =>
+              adapter.start(
+                {
+                  cwd,
+                  systemPrompt: systemPromptFor("implementation", { noMistakes }),
+                  prompt,
+                  model: modelFor(ctx),
+                  allowedTools: "implementation",
+                  mcp: { url: deps.toolsUrl(), token },
+                  env: agentEnv(token),
+                  ...(testCommand ? { testCommand } : {}),
+                },
+                signal,
+              ),
+            { ...turnOptions, replaceSession: true },
+          );
+        }),
+      );
+      return { done };
+    }
     const done = track(state, log, () =>
       // The resume transaction already renewed the lease.
       withLease(state, ctx, log, false, () =>
-        runSession(state, ctx, input.usageKind ?? "resume", log, (token, signal) =>
-          adapter.resume(
-            {
-              cwd: worktreePath,
-              prompt: input.prompt,
-              model: modelFor(ctx),
-              allowedTools: role,
-              mcp: { url: deps.toolsUrl(), token },
-              env: agentEnv(token),
-              sessionId,
-              usageBaseline: baseline,
-              ...(testCommand ? { testCommand } : {}),
-            },
-            signal,
-          ),
+        runSession(
+          state,
+          ctx,
+          input.usageKind ?? "resume",
+          log,
+          (token, signal) =>
+            adapter.resume(
+              {
+                cwd: worktreePath,
+                prompt: input.prompt,
+                model: modelFor(ctx),
+                allowedTools: role,
+                mcp: { url: deps.toolsUrl(), token },
+                env: agentEnv(token),
+                sessionId,
+                usageBaseline: baseline,
+                ...(testCommand ? { testCommand } : {}),
+              },
+              signal,
+            ),
+          turnOptions,
         ),
       ),
     );

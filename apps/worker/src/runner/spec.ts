@@ -17,7 +17,7 @@ import {
 import { renderSpecMarkdown } from "@orchestra/prompts";
 import { z } from "zod";
 import type { Logger } from "../logger.js";
-import type { CommandHandlers, CommandOutcome } from "./commands.js";
+import type { CommandHandler, CommandHandlers, CommandOutcome } from "./commands.js";
 import { ResumeError, type Runner } from "./runner.js";
 
 /**
@@ -122,9 +122,26 @@ async function createSpecExecution(
   });
 }
 
+export interface SpecHandlerOptions {
+  /**
+   * GOT.47: handles a `send_message` on an issue (§9.3, §10.2): every one
+   * on an implementation execution, and one whose payload names an
+   * `issue_id` on a spec execution (C54), which a blocking `raise_issue` left
+   * in WAITING_FOR_USER. Without it such a command is skipped.
+   */
+  issueSendMessage?: CommandHandler;
+}
+
+/** An issue message (`/issues/:id/messages`) rather than a spec chat turn. */
+const isIssueMessage = (payload: unknown): boolean =>
+  typeof payload === "object" &&
+  payload !== null &&
+  typeof (payload as { issue_id?: unknown }).issue_id === "string";
+
 export function registerSpecHandlers(
   handlers: CommandHandlers,
   runner: Pick<Runner, "startSpec" | "resume" | "isLive">,
+  options: SpecHandlerOptions = {},
 ): void {
   handlers.registerCommandHandler("start_spec_session", async (command, ctx) => {
     const log = ctx.logger.child({ commandId: command.id, taskId: command.taskId });
@@ -155,7 +172,11 @@ export function registerSpecHandlers(
     }
     const loaded = await loadRunnerContext(ctx.db, executionId);
     if (!loaded) return { outcome: "skipped", reason: "execution not found" };
-    // Issue conversation on an implementation execution is GOT.47's.
+    // Issue conversation (GOT.47): any message on an implementation
+    // execution, an issue message on a spec execution (C54).
+    if (loaded.execution.role !== "spec" || isIssueMessage(command.payload)) {
+      if (options.issueSendMessage) return options.issueSendMessage(command, ctx);
+    }
     if (loaded.execution.role !== "spec") {
       return { outcome: "skipped", reason: "not a spec execution" };
     }
