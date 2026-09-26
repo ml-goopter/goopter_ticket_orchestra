@@ -944,6 +944,12 @@ export function createRunner(deps: RunnerDeps): Runner {
         if (row?.state !== execution.state) {
           refuse("NOT_RESUMABLE_STATE", `execution is ${row?.state ?? "gone"}`);
         }
+        // §6.1: the dead-host release may have cleared the pin since the
+        // context loaded. Re-read it under the execution lock.
+        const pinned = (await loadRunnerContext(tx, executionId))?.execution;
+        if (pinned?.host !== host || pinned.workerId !== execution.workerId) {
+          refuse("OTHER_HOST", "execution is no longer pinned to this host");
+        }
         await transition(tx, {
           entity: "execution",
           id: executionId,

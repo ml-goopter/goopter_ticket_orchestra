@@ -568,6 +568,60 @@ describe("dead-host command release (design.md §6.1)", () => {
     expect((await execution(id)).host).toBe(edge.host);
   });
 
+  it("leaves an execution whose host heartbeated between the dead-host select and the update", async () => {
+    const me = await sweeper();
+    const dead = await seedWorker({ heartbeatAt: at(-16 * MINUTE) });
+    const id = await seedExecution({
+      taskId: await seedTask(),
+      state: "WAITING_FOR_USER",
+      worker: dead,
+    });
+
+    const seen: string[] = [];
+    await createLeaseSweeperPhase({
+      // The dead host comes back: its heartbeat commits after the select.
+      beforeRelease: async (candidate) => {
+        seen.push(candidate.executionId);
+        await raw("update agent_workers set last_heartbeat_at = $1 where id = $2", [
+          NOW.toISOString(),
+          dead.id,
+        ]);
+      },
+    }).run(ctx(me.id));
+
+    expect(seen).toEqual([id]);
+    const row = await execution(id);
+    expect(row.host).toBe(dead.host);
+    expect(row.workerId).toBe(dead.id);
+    expect(records.filter((r) => r.fields.executionId === id)).toEqual([]);
+  });
+
+  it("leaves an execution that moved to RUNNING between the dead-host select and the update", async () => {
+    const me = await sweeper();
+    const dead = await seedWorker({ heartbeatAt: at(-16 * MINUTE) });
+    const id = await seedExecution({
+      taskId: await seedTask(),
+      state: "WAITING_FOR_USER",
+      worker: dead,
+    });
+
+    const seen: string[] = [];
+    await createLeaseSweeperPhase({
+      // A resume commits the move to RUNNING after the select.
+      beforeRelease: async (candidate) => {
+        seen.push(candidate.executionId);
+        await raw("update executions set state = 'RUNNING' where id = $1", [id]);
+      },
+    }).run(ctx(me.id));
+
+    expect(seen).toEqual([id]);
+    const row = await execution(id);
+    expect(row.state).toBe("RUNNING");
+    expect(row.host).toBe(dead.host);
+    expect(row.workerId).toBe(dead.id);
+    expect(records.filter((r) => r.fields.executionId === id)).toEqual([]);
+  });
+
   it("AC7 never releases this worker's own executions, even with a stale heartbeat row", async () => {
     const me = await seedWorker({ heartbeatAt: at(-60 * MINUTE) });
     const id = await seedExecution({

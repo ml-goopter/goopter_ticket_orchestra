@@ -7,6 +7,7 @@ import {
   transition,
   type Db,
   type ExpiredLease,
+  type ReleasedExecution,
 } from "@orchestra/db";
 import type { Logger } from "../logger.js";
 import type { Phase } from "../tick.js";
@@ -23,6 +24,12 @@ export interface LeaseSweeperOptions {
    * interleave a renewal or force an error; production passes nothing.
    */
   beforeLock?: (lease: ExpiredLease) => Promise<void>;
+  /**
+   * Called for each dead-host release candidate after the unlocked selects
+   * and before its transaction opens. Tests use it to interleave a
+   * heartbeat or a state move; production passes nothing.
+   */
+  beforeRelease?: (candidate: ReleasedExecution) => Promise<void>;
 }
 
 export interface SweepInput {
@@ -114,6 +121,7 @@ export async function sweepExpiredLeases(
  */
 export async function releaseDeadHostExecutions(
   input: SweepInput,
+  options: LeaseSweeperOptions = {},
 ): Promise<string[]> {
   const { db, workerId, now, logger } = input;
   const deadHost = { now, thresholdMs: DEAD_HOST_AFTER_MS, excludeWorkerId: workerId };
@@ -121,7 +129,11 @@ export async function releaseDeadHostExecutions(
   const hosts = await listDeadHosts(db, deadHost);
   if (hosts.length === 0) return [];
 
-  const released = await releaseExecutionsOnDeadHosts(db, { ...deadHost, hosts });
+  const released = await releaseExecutionsOnDeadHosts(db, {
+    ...deadHost,
+    hosts,
+    ...(options.beforeRelease ? { beforeRelease: options.beforeRelease } : {}),
+  });
   for (const row of released) {
     logger.info(
       { executionId: row.executionId, taskId: row.taskId, host: row.host },
@@ -150,7 +162,7 @@ export function createLeaseSweeperPhase(
       };
       await sweepExpiredLeases(input, options);
       try {
-        await releaseDeadHostExecutions(input);
+        await releaseDeadHostExecutions(input, options);
       } catch (err) {
         ctx.logger.error({ err: errMessage(err) }, "dead-host release failed");
       }

@@ -169,6 +169,12 @@ export interface ReleasedExecution {
 
 export interface ReleaseExecutionsInput extends DeadHostInput {
   hosts: readonly string[];
+  /**
+   * Called for each candidate after the unlocked select and before its
+   * transaction opens. Tests use it to interleave a heartbeat or a state
+   * move; production passes nothing.
+   */
+  beforeRelease?: (candidate: ReleasedExecution) => Promise<void>;
 }
 
 /**
@@ -208,6 +214,7 @@ export async function releaseExecutionsOnDeadHosts(
 
   const released: ReleasedExecution[] = [];
   for (const candidate of candidates) {
+    await input.beforeRelease?.(candidate);
     const done = await db.transaction(async (tx) => {
       const [task] = await tx
         .select({ id: tasks.id })
