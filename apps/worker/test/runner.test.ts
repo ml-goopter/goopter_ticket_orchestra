@@ -272,6 +272,8 @@ class FakeAdapter implements AgentAdapter {
   readonly resumes: ResumeRequest[] = [];
   readonly signals: AbortSignal[] = [];
   canResumeResult = true;
+  /** Runs inside `canResume`: after resume loads its context, before its transaction. */
+  onCanResume?: () => Promise<void>;
   script: Script = async function* () {};
 
   constructor(private readonly executionIdFor: (cwd: string) => string) {}
@@ -289,6 +291,7 @@ class FakeAdapter implements AgentAdapter {
   }
 
   async canResume(): Promise<boolean> {
+    await this.onCanResume?.();
     return this.canResumeResult;
   }
 }
@@ -1093,6 +1096,58 @@ describe("resume primitive (§9.3, §9.7)", () => {
 
     expect(err).toBeInstanceOf(ResumeError);
     expect((err as ResumeError).code).toBe("OTHER_HOST");
+    expect(await writeSnapshot(s.executionId)).toEqual(before);
+    expect(h.adapter.resumes).toHaveLength(0);
+    expect(h.runner.isLive(s.executionId)).toBe(false);
+  });
+
+  it("refuses a resume whose execution the dead-host release unpinned after the context loaded (§6.1)", async () => {
+    const { s, h } = await waitingExecution();
+    let before: Awaited<ReturnType<typeof writeSnapshot>> | undefined;
+    h.adapter.onCanResume = async () => {
+      // The sweeper's release commits between the context load and the lock.
+      await db.$client.unsafe(
+        "update executions set host = null, worker_id = null where id = $1",
+        [s.executionId],
+      );
+      before = await writeSnapshot(s.executionId);
+    };
+
+    const err = await h.runner
+      .resume({ executionId: s.executionId, prompt: "answer" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResumeError);
+    expect((err as ResumeError).code).toBe("OTHER_HOST");
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("WAITING_FOR_USER");
+    expect(row.host).toBeNull();
+    expect(row.toolsTokenHash).toBeNull();
+    expect(await eventTypes(s.executionId)).not.toContain("execution.resumed");
+    expect(await writeSnapshot(s.executionId)).toEqual(before);
+    expect(h.adapter.resumes).toHaveLength(0);
+    expect(h.runner.isLive(s.executionId)).toBe(false);
+  });
+
+  it("refuses a resume whose worker_id was cleared after the context loaded, host unchanged", async () => {
+    const { s, h } = await waitingExecution();
+    let before: Awaited<ReturnType<typeof writeSnapshot>> | undefined;
+    h.adapter.onCanResume = async () => {
+      await db.$client.unsafe("update executions set worker_id = null where id = $1", [s.executionId]);
+      before = await writeSnapshot(s.executionId);
+    };
+
+    const err = await h.runner
+      .resume({ executionId: s.executionId, prompt: "answer" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResumeError);
+    expect((err as ResumeError).code).toBe("OTHER_HOST");
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("WAITING_FOR_USER");
+    expect(row.workerId).toBeNull();
+    expect(row.toolsTokenHash).toBeNull();
+    expect(await eventTypes(s.executionId)).not.toContain("execution.resumed");
     expect(await writeSnapshot(s.executionId)).toEqual(before);
     expect(h.adapter.resumes).toHaveLength(0);
     expect(h.runner.isLive(s.executionId)).toBe(false);

@@ -4,6 +4,7 @@ import {
   createPromotePhase,
   type SchedulerDeps,
 } from "../scheduler/index.js";
+import { createLeaseSweeperPhase } from "../sweeper/index.js";
 import type { Phase, TickContext } from "../tick.js";
 
 /**
@@ -55,7 +56,8 @@ function stub(name: PhaseName): Phase {
 /**
  * The phases the worker registers at startup, in §6 order. Returns a fresh
  * array each call so a caller cannot mutate the registry. §6.1 commands, §6.2
- * promotion and §6.3 claim are real; the sweepers are still stubs.
+ * promotion, §6.3 claim and the §6.5 lease sweeper are real; the §6.6
+ * worktree sweeper is still a stub.
  */
 export function createDefaultPhases(deps: SchedulerDeps = {}): Phase[] {
   return PHASE_ORDER.map((name) => {
@@ -66,6 +68,8 @@ export function createDefaultPhases(deps: SchedulerDeps = {}): Phase[] {
         return createPromotePhase();
       case "claim":
         return createClaimPhase(deps);
+      case "lease_sweeper":
+        return createLeaseSweeperPhase();
       default:
         return stub(name);
     }

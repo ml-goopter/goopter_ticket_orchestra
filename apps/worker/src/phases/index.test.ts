@@ -65,7 +65,7 @@ describe("default phase registry (design.md §6.1-§6.6)", () => {
 
   it("stubs resolve without touching the database and log their name", async () => {
     records.length = 0;
-    const stubs = ["consume_commands", "lease_sweeper", "worktree_sweeper"];
+    const stubs = ["consume_commands", "worktree_sweeper"];
 
     for (const phase of createDefaultPhases()) {
       if (!stubs.includes(phase.name)) continue;
