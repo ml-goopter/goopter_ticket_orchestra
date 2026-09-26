@@ -17,7 +17,7 @@ import { useLatestRequest } from "../board/useLatestRequest.js";
 import { useEventStream, type EventSourceFactory } from "../sse/useEventStream.js";
 import { SpecDraftForm } from "../spec/SpecDraftForm.js";
 import { changedSpecFields, emptySpecContent, specContentEquals } from "../spec/specForm.js";
-import { isLiveExecutionState, SPEC_STREAM_EVENT_TYPES } from "../spec/specSession.js";
+import { isLiveExecutionState, isSpecChatBacklogEvent, SPEC_STREAM_EVENT_TYPES } from "../spec/specSession.js";
 import { buildTimelineItems, mergeTimelineEvents } from "../task/timelineItems.js";
 
 export interface SpecBuilderViewProps {
@@ -31,6 +31,9 @@ type LoadState = "loading" | "loaded" | "not_found" | "error";
 
 /** How long a changed field stays visually flagged after `spec.proposed`/`spec.revised` (design.md §14). */
 const HIGHLIGHT_DURATION_MS = 5000;
+
+/** Matches `TaskDetailView`'s backlog page size for `GET /tasks/:id/timeline`. */
+const TIMELINE_PAGE_LIMIT = 200;
 
 /** Every api error is shown with its code (contract AC5), never just the message alone. */
 function describeError(err: unknown): string {
@@ -180,6 +183,34 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
       } catch {
         // Best-effort: an empty list fails the repository-exists check safe
         // (Approve stays disabled) rather than silently passing it.
+      }
+      try {
+        const specExecutionIds = new Set(
+          loadedAggregate.executions
+            .filter((execution) => execution.role === "spec")
+            .map((execution) => execution.id),
+        );
+        let backlog: TimelineEvent[] = [];
+        let after: number | undefined;
+        for (;;) {
+          const page = await apiClient.getTimeline(id, { after, limit: TIMELINE_PAGE_LIMIT });
+          if (!isCurrent(generation)) return;
+          backlog = mergeTimelineEvents(
+            backlog,
+            page.events.filter((event) => isSpecChatBacklogEvent(event, specExecutionIds)),
+          );
+          if (page.events.length < TIMELINE_PAGE_LIMIT) break;
+          after = page.nextAfter;
+        }
+        // Merge with (rather than replace) whatever is already in `events`:
+        // the stream subscribes independently of this load, so a live event
+        // can already be in state here and must not be dropped (mirrors
+        // `TaskDetailView`'s backlog/live merge).
+        setEvents((prev) => mergeTimelineEvents(prev, backlog));
+      } catch {
+        // Best-effort: a reload's chat history failing to load must not
+        // block the rest of the page; the user can still see and use the
+        // live chat and draft form.
       }
     } catch (err) {
       if (!isCurrent(generation)) return;
@@ -381,8 +412,11 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const taskState = aggregate.task.state;
   const specExecution = aggregate.latestExecutions.spec;
   const hasLiveSpecExecution = isLiveExecutionState(specExecution?.state);
-  const showStartSessionButton =
-    taskState === "NEEDS_SPEC" || (taskState === "SPEC_IN_PROGRESS" && !hasLiveSpecExecution);
+  // `POST /tasks/:id/spec/session` is only legal from NEEDS_SPEC
+  // (apps/api/src/routes/spec.ts): resuming a SPEC_IN_PROGRESS task with no
+  // live execution (e.g. after a send-back) is the spec role worker's job
+  // (GOT.37), not a route this button can call.
+  const showStartSessionButton = taskState === "NEEDS_SPEC";
 
   const chatDisabledReason: string | null =
     taskState !== "SPEC_IN_PROGRESS"

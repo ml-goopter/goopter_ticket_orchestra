@@ -3,6 +3,8 @@ import type { SpecApiClient } from "../api/client.js";
 import type {
   Execution,
   Issue,
+  IssueDetail,
+  IssueMessage,
   PullRequest,
   ReviewResult,
   SpecificationApproval,
@@ -140,6 +142,54 @@ const issue: Issue = {
   resolvedAt: "2026-01-02T01:00:00.000Z",
 };
 
+/**
+ * A seeded blocking, OPEN issue with a question, two suggested options and
+ * a recommendation (AC2), distinct from the `RESOLVED` `issue` fixture
+ * embedded in `makeTaskAggregate()` above.
+ */
+const openIssue: Issue = {
+  id: "issue-2",
+  taskId: "task-1",
+  executionId: "exec-impl-1",
+  type: "DECISION_REQUIRED",
+  severity: "blocking",
+  blocking: true,
+  title: "Which pagination style?",
+  description: "The existing api supports both cursor and offset pagination.",
+  question: "Cursor or offset pagination?",
+  suggestedOptions: [
+    { id: "cursor", description: "Cursor-based pagination.", tradeoff: "Cannot jump to an arbitrary page." },
+    { id: "offset", description: "Offset-based pagination.", tradeoff: "Slower on large tables." },
+  ],
+  recommendedOption: "cursor",
+  status: "OPEN",
+  resolutionKind: null,
+  resolution: null,
+  resolvedBy: null,
+  createdAt: "2026-01-01T02:05:00.000Z",
+  resolvedAt: null,
+};
+
+const openIssueMessage: IssueMessage = {
+  id: "msg-1",
+  issueId: "issue-2",
+  authorKind: "user",
+  userId: "user-1",
+  body: "Any preference on pagination?",
+  createdAt: "2026-01-01T02:06:00.000Z",
+};
+
+export function makeIssueDetail(overrides: Partial<IssueDetail> = {}): IssueDetail {
+  return {
+    issue: openIssue,
+    messages: [openIssueMessage],
+    execution: { id: "exec-impl-1", role: "implementation", state: "WAITING_FOR_USER", runtime: "claude" },
+    task: { id: "task-1", jira_key: "TSK-70", state: "IMPLEMENTING" },
+    decision: null,
+    ...overrides,
+  };
+}
+
 const decision: TaskDecision = {
   id: "decision-1",
   taskId: "task-1",
@@ -262,10 +312,11 @@ export function makeTimelineEvent(overrides: Partial<TimelineEvent>): TimelineEv
 }
 
 /**
- * A fully-typed `SpecApiClient` double (a superset of `BoardApiClient`,
- * GOT.38) with every method a no-op `vi.fn()`, so a test only has to
- * override the handful of methods it exercises rather than restate the
- * whole interface (GOT.41-fix0).
+ * A fully-typed `SpecApiClient` double (a `BoardApiClient` plus the
+ * GOT.42 issue detail methods and the GOT.38 spec builder methods) with
+ * every method a no-op `vi.fn()`, so a test only has to override the
+ * handful of methods it exercises rather than restate the whole interface
+ * (GOT.41-fix0).
  */
 export function makeFakeClient(overrides: Partial<SpecApiClient> = {}): SpecApiClient {
   return {
@@ -282,6 +333,9 @@ export function makeFakeClient(overrides: Partial<SpecApiClient> = {}): SpecApiC
     getTimeline: vi.fn().mockResolvedValue({ events: [], nextAfter: 0 }),
     cancelTask: vi.fn(),
     retryTask: vi.fn(),
+    getIssue: vi.fn().mockResolvedValue(makeIssueDetail()),
+    postIssueMessage: vi.fn(),
+    resolveIssue: vi.fn(),
     listProjectRepositories: vi.fn().mockResolvedValue([]),
     startSpecSession: vi.fn(),
     postSpecMessage: vi.fn(),

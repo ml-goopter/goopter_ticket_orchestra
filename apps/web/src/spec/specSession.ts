@@ -1,4 +1,5 @@
 import type { ExecutionEventType, ExecutionState } from "@orchestra/core";
+import type { TimelineEvent } from "../api/types.js";
 
 /**
  * Event types the spec builder's chat subscribes to on `GET
@@ -35,4 +36,22 @@ const LIVE_EXECUTION_STATES: ReadonlySet<ExecutionState> = new Set([
 
 export function isLiveExecutionState(state: ExecutionState | null | undefined): boolean {
   return state !== null && state !== undefined && LIVE_EXECUTION_STATES.has(state);
+}
+
+/**
+ * Whether a `GET /tasks/:id/timeline` backlog row belongs in the spec
+ * chat pane on page load: chat text/tool calls from a spec-role execution
+ * (never an implementation execution's), plus the issue-independent
+ * `spec.*` transition events, which `apps/worker`'s `propose_spec` tool
+ * tags with the spec execution's id but the `spec.ts` route (revise,
+ * review, send back, approve) leaves execution-less (`null`).
+ */
+export function isSpecChatBacklogEvent(event: TimelineEvent, specExecutionIds: ReadonlySet<string>): boolean {
+  if (event.type === "agent.message" || event.type === "agent.tool_call") {
+    return event.executionId !== null && specExecutionIds.has(event.executionId);
+  }
+  if (event.type.startsWith("spec.")) {
+    return event.executionId === null || specExecutionIds.has(event.executionId);
+  }
+  return false;
 }

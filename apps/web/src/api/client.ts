@@ -1,9 +1,12 @@
-import type { Runtime, SpecContent } from "@orchestra/core";
+import type { ResolutionKind, Runtime, SpecContent } from "@orchestra/core";
 import { z } from "zod";
 import {
   AdminRepositorySchema,
+  IssueDetailSchema,
   IssueSchema,
   NotificationSchema,
+  PostIssueMessageResultSchema,
+  ResolveIssueResultSchema,
   SpecDraftResultSchema,
   SpecMessageResultSchema,
   SpecRevisionTransitionResultSchema,
@@ -13,7 +16,10 @@ import {
   TimelinePageSchema,
   type AdminRepository,
   type Issue,
+  type IssueDetail,
   type Notification,
+  type PostIssueMessageResult,
+  type ResolveIssueResult,
   type SpecDraftResult,
   type SpecMessageResult,
   type SpecRevisionTransitionResult,
@@ -66,6 +72,13 @@ export interface GetTimelineOptions {
   /** Exclusive lower bound: the last event id already loaded. */
   after?: number;
   limit?: number;
+}
+
+export interface ResolveIssueInput {
+  kind: ResolutionKind;
+  decision: string;
+  clarification?: string;
+  chosenOption?: string;
 }
 
 /**
@@ -140,15 +153,30 @@ export interface BoardApiClient extends ApiClient {
 }
 
 /**
- * The spec builder's view of the api (GOT.38, design.md §12.3), layered on
- * `BoardApiClient` the same way that interface is kept separate from the
- * plain `ApiClient`: it is its own interface so extending it does not force
- * an edit to `BoardApiClient` or the views typed against it. Named
- * `SpecApiClient` rather than `IssueApiClient` (as GOT.42's issue detail
- * view is not built in this worktree, so no such interface exists yet to
- * extend); `createApiClient()` implements both.
+ * The issue detail view's extension of `BoardApiClient` (GOT.42), kept as
+ * its own interface for the same reason `BoardApiClient` is kept separate
+ * from `ApiClient` above: `BoardApiClient` is the type
+ * `TaskDetailView.test.tsx`'s inline fake is annotated with, and that file
+ * is outside this task's `owned_paths`, so widening `BoardApiClient`
+ * itself would force an edit there. `createApiClient()` implements both.
  */
-export interface SpecApiClient extends BoardApiClient {
+export interface IssueApiClient extends BoardApiClient {
+  /** `GET /issues/:id` (design.md §12.4), the issue detail aggregate. */
+  getIssue(id: string): Promise<IssueDetail>;
+  /** `POST /issues/:id/messages` (design.md §10.2, §12.4). */
+  postIssueMessage(id: string, text: string): Promise<PostIssueMessageResult>;
+  /** `POST /issues/:id/resolve` (design.md §10.3, §10.4, §12.4). */
+  resolveIssue(id: string, input: ResolveIssueInput): Promise<ResolveIssueResult>;
+}
+
+/**
+ * The spec builder's view of the api (GOT.38, design.md §12.3), layered on
+ * `IssueApiClient` the same way that interface is kept separate from
+ * `BoardApiClient` above: its own interface so extending it does not force
+ * an edit to `IssueApiClient` or the views typed against it.
+ * `createApiClient()` implements all three.
+ */
+export interface SpecApiClient extends IssueApiClient {
   /**
    * `GET /repositories?project=` (design.md §12.5), scoped to one project.
    * The task aggregate carries only the task's own assigned repository
@@ -270,6 +298,23 @@ export function createApiClient(options: ApiClientOptions = {}): SpecApiClient {
     retryTask: (id) =>
       request<TaskTransitionResult>("POST", `/tasks/${id}/retry`, {
         schema: TaskTransitionResultSchema,
+      }),
+    getIssue: (id) =>
+      request<IssueDetail>("GET", `/issues/${id}`, { schema: IssueDetailSchema }),
+    postIssueMessage: (id, text) =>
+      request<PostIssueMessageResult>("POST", `/issues/${id}/messages`, {
+        body: { text },
+        schema: PostIssueMessageResultSchema,
+      }),
+    resolveIssue: (id, input) =>
+      request<ResolveIssueResult>("POST", `/issues/${id}/resolve`, {
+        body: {
+          kind: input.kind,
+          decision: input.decision,
+          clarification: input.clarification,
+          chosen_option: input.chosenOption,
+        },
+        schema: ResolveIssueResultSchema,
       }),
     listProjectRepositories: (projectId) =>
       request<AdminRepository[]>(

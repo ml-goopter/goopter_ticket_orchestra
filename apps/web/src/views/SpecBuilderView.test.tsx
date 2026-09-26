@@ -218,6 +218,54 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(screen.getByTestId("tool-chip").textContent).toBe("search_docs"));
   });
 
+  it("loads the chat backlog from GET /tasks/:id/timeline on mount, and a live event with an overlapping id is not duplicated", async () => {
+    const backlogEvent = makeTimelineEvent({
+      id: 7,
+      executionId: "exec-spec-1",
+      type: "agent.message",
+      payload: { text: "Backlog hello" },
+    });
+    const getTimeline = vi.fn().mockResolvedValue({ events: [backlogEvent], nextAfter: 7 });
+    const client = makeFakeClient({ getTask: vi.fn().mockResolvedValue(aggregateInProgress()), getTimeline });
+    renderSpecBuilder(client);
+
+    // The backlog renders before any live event is emitted.
+    await waitFor(() => expect(screen.getAllByTestId("chat-message")).toHaveLength(1));
+    expect(screen.getByTestId("chat-message").textContent).toBe("Backlog hello");
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({
+          id: 7,
+          executionId: "exec-spec-1",
+          type: "agent.message",
+          payload: { text: "Backlog hello" },
+        }),
+        "7",
+      );
+    });
+
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(1);
+  });
+
+  it("excludes an implementation execution's agent.message from the spec chat backlog", async () => {
+    const backlogEvent = makeTimelineEvent({
+      id: 8,
+      executionId: "exec-impl-1",
+      type: "agent.message",
+      payload: { text: "Implementation chatter" },
+    });
+    const getTimeline = vi.fn().mockResolvedValue({ events: [backlogEvent], nextAfter: 8 });
+    const client = makeFakeClient({ getTask: vi.fn().mockResolvedValue(aggregateInProgress()), getTimeline });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state")).toBeTruthy());
+    await waitFor(() => expect(getTimeline).toHaveBeenCalled());
+    expect(screen.queryByTestId("chat-message")).toBeNull();
+  });
+
   it("refetches and replaces the form with highlights on spec.proposed, preserving unsaved edits behind a confirm prompt", async () => {
     const initialRevision = makeRevision({ content: validSpecContent });
     const revisedContent: SpecContent = { ...validSpecContent, objective: "A different objective" };
@@ -384,6 +432,21 @@ describe("SpecBuilderView", () => {
 
     await waitFor(() => expect(startSpecSession).toHaveBeenCalledWith("task-1"));
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not show the Start spec session button in SPEC_IN_PROGRESS, even with no live spec execution (the route only allows NEEDS_SPEC)", async () => {
+    const base = makeTaskAggregate();
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          latestExecutions: { spec: { ...base.executions[0]!, state: "COMPLETED" }, implementation: null },
+        }),
+      ),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Start spec session" })).toBeNull();
   });
 
   it("shows the api's error code when a footer action fails with a 409", async () => {

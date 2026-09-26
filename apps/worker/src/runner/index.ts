@@ -6,7 +6,9 @@ export {
   type CommandContext,
   type CommandHandler,
   type CommandHandlers,
+  type CommandOutcome,
 } from "./commands.js";
+export { registerCiFailureHandler } from "./ci.js";
 export {
   DEFAULT_REVIEW_WRAPPER_BIN,
   DEFAULT_RUNNER_SHUTDOWN_TIMEOUT_MS,
