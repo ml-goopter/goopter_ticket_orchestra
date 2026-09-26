@@ -130,7 +130,7 @@ afterAll(async () => {
   await fs.rm(root, { recursive: true, force: true });
 });
 
-let runner: Runner | undefined;
+const runners: Runner[] = [];
 const clients: Client[] = [];
 let workspaceSeq = 0;
 
@@ -148,8 +148,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await runner?.shutdown(2000);
-  runner = undefined;
+  while (runners.length > 0) await runners.pop()!.shutdown(2000);
   while (clients.length > 0) await clients.pop()!.close().catch(() => {});
   await db.$client.unsafe("drop trigger if exists got37_fault on execution_commands");
   await db.$client.unsafe("drop function if exists got37_fault()");
@@ -328,8 +327,10 @@ class ScriptedAdapter implements AgentAdapter {
     return script(req, signal);
   }
 
+  resumable = true;
+
   async canResume(): Promise<boolean> {
-    return true;
+    return this.resumable;
   }
 }
 
@@ -339,16 +340,23 @@ interface Harness {
   prepared: Array<{ input: PrepareSpecInput; openTransactions: number }>;
 }
 
-function makeHarness(): Harness {
+interface HarnessOptions {
+  host?: string;
+  workerId?: string;
+  flushMs?: number;
+  beforeTokenIssue?: (executionId: string) => Promise<void>;
+}
+
+function makeHarness(options: HarnessOptions = {}): Harness {
   const adapter = new ScriptedAdapter();
   const manager = new WorktreeManager({ workspaceRoot });
   const prepared: Harness["prepared"] = [];
-  runner = createRunner({
+  const runner = createRunner({
     db,
     registry,
     logger,
-    workerId,
-    host: HOST,
+    workerId: options.workerId ?? workerId,
+    host: options.host ?? HOST,
     worktrees: {
       prepareImplementation: () => Promise.reject(new Error("not expected")),
       async prepareSpec(input) {
@@ -363,18 +371,24 @@ function makeHarness(): Harness {
     fetchTicket: async (key) => ({ ...TICKET, key }),
     quietTimeoutMs: 20_000,
     basePath: "/usr/bin:/bin",
-    timings: { leaseRenewMs: 60_000, blockingPollMs: 50 },
+    timings: {
+      leaseRenewMs: 60_000,
+      blockingPollMs: 50,
+      ...(options.flushMs !== undefined ? { flushMs: options.flushMs } : {}),
+    },
+    ...(options.beforeTokenIssue ? { hooks: { beforeTokenIssue: options.beforeTokenIssue } } : {}),
   });
+  runners.push(runner);
   return { runner, adapter, prepared };
 }
 
-function tickContext(): TickContext {
+function tickContext(host: string = HOST, worker: string = workerId): TickContext {
   return {
     db,
-    workerId,
+    workerId: worker,
     config: loadConfig({
       DATABASE_URL: "postgres://localhost/unused",
-      WORKER_HOST: HOST,
+      WORKER_HOST: host,
       WORKER_WORKSPACE_ROOT: workspaceRoot,
     }),
     now: new Date(),
@@ -383,10 +397,10 @@ function tickContext(): TickContext {
   };
 }
 
-async function consume(r: Runner): Promise<void> {
+async function consume(r: Runner, host: string = HOST, worker: string = workerId): Promise<void> {
   const handlers = createCommandHandlers();
   registerSpecHandlers(handlers, r);
-  await createConsumeCommandsPhase(handlers).run(tickContext());
+  await createConsumeCommandsPhase(handlers).run(tickContext(host, worker));
 }
 
 async function sweep(): Promise<void> {
@@ -828,5 +842,169 @@ describe("send_message guards (GOT.37 AC3)", () => {
     expect(h.adapter.resumes).toEqual([]);
     expect((await execution(spec!.id)).state).toBe("COMPLETED");
     expect(await auditOf(spec!.id)).toEqual([]);
+  });
+});
+
+// ------------------------------------------------- review round 1 (F1-F4)
+
+/** A spec execution pinned to HOST with a session and a recorded worktree. */
+async function seedSpecExecution(
+  taskId: string,
+  state: "RUNNING" | "COMPLETED",
+  options: { attempt?: number; worktreePath?: string | null; host?: string; worker?: string } = {},
+): Promise<string> {
+  const [row] = await db
+    .insert(executions)
+    .values({
+      taskId,
+      role: "spec",
+      attempt: options.attempt ?? 1,
+      state,
+      runtime: "claude",
+      model: "default",
+      host: options.host ?? HOST,
+      workerId: options.worker ?? workerId,
+      sessionId: "sess-spec",
+      worktreePath:
+        options.worktreePath === undefined
+          ? path.join(workspaceRoot, "work", `seeded-${++seq}`)
+          : options.worktreePath,
+      startedAt: NOW,
+      endedAt: state === "COMPLETED" ? NOW : null,
+    })
+    .returning({ id: executions.id });
+  return row!.id;
+}
+
+const skipReasons = () =>
+  records.filter((r) => r.msg === "command skipped").map((r) => r.fields.reason);
+
+describe("review round 1 (GOT.37 F1-F4)", () => {
+  it("F1: a start processed on another worker before the send-back resume is skipped; the sent-back session is the only live one", async () => {
+    const s = await seedSpecTask();
+    const id = await seedSpecExecution(s.taskId, "COMPLETED");
+    await db.$client.unsafe("update tasks set state = 'SPEC_REVIEW' where id = $1", [s.taskId]);
+    await sendBack(s.taskId);
+    // A restart enqueued after the send-back committed.
+    const startId = await enqueue(s.taskId, "start_spec_session", null);
+
+    const OTHER = "spec-role-other-host";
+    const [other] = await db
+      .insert(agentWorkers)
+      .values({ host: OTHER, capabilities: [], maxConcurrent: 4, workspaceRoot: root })
+      .returning({ id: agentWorkers.id });
+    const o = makeHarness({ host: OTHER, workerId: other!.id });
+    // The send_message is pinned to HOST, so OTHER claims only the start.
+    await consume(o.runner, OTHER, other!.id);
+    expect((await command(startId)).completedAt).not.toBeNull();
+    expect(skipReasons()).toContain("a sent-back spec session is about to resume");
+    expect(o.adapter.starts).toEqual([]);
+
+    const h = makeHarness();
+    h.adapter.resumeScripts.push(reply("What should change?"));
+    await consume(h.runner);
+    await idle(h.runner, id);
+
+    const rows = await executionsOf(s.taskId);
+    expect(rows.map((r) => [r.id, r.state])).toEqual([[id, "RUNNING"]]);
+    expect(h.adapter.resumes).toHaveLength(1);
+  });
+
+  it("F1: the send-back resume refuses when the task already has another live spec execution", async () => {
+    const s = await seedSpecTask();
+    const completed = await seedSpecExecution(s.taskId, "COMPLETED");
+    const running = await seedSpecExecution(s.taskId, "RUNNING", { attempt: 2 });
+    const cmd = await enqueue(s.taskId, "send_message", completed, {
+      text: SENT_BACK_TEXT,
+      system: "sent_back",
+    });
+    const h = makeHarness();
+    h.adapter.resumeScripts.push(reply("unexpected"));
+    await consume(h.runner);
+
+    expect((await command(cmd)).completedAt).not.toBeNull();
+    expect(skipReasons()).toContain("task already has another live spec execution");
+    expect(h.adapter.resumes).toEqual([]);
+    expect((await execution(completed)).state).toBe("COMPLETED");
+    expect((await execution(running)).state).toBe("RUNNING");
+    expect(await auditOf(completed)).toEqual([]);
+  });
+
+  it("F2: text buffered before a request-review abort is dropped; the COMPLETED execution gets no further events", async () => {
+    const s = await seedSpecTask();
+    const id = await seedSpecExecution(s.taskId, "RUNNING");
+    // A long flush window keeps the text buffered until the stop.
+    const h = makeHarness({ flushMs: 60_000 });
+    let textConsumed = false;
+    h.adapter.resumeScripts.push(async function* (_req, signal) {
+      yield { type: "text", delta: "partial answer" };
+      // Reached once the runner asks for the next event, after the text.
+      textConsumed = true;
+      await aborted(signal);
+    });
+    await enqueue(s.taskId, "send_message", id, { text: "one more thing" });
+    await consume(h.runner);
+    await waitFor(async () => (textConsumed ? true : undefined), { what: "the text event" });
+
+    await requestReview(s.taskId);
+    const before = await eventsOf(s.taskId);
+    await idle(h.runner, id);
+
+    expect(h.adapter.signals[0]!.aborted).toBe(true);
+    const after = await eventsOf(s.taskId);
+    expect(after).toHaveLength(before.length);
+    expect(JSON.stringify(after.map((e) => e.payload))).not.toContain("partial answer");
+    expect((await execution(id)).state).toBe("COMPLETED");
+  });
+
+  it.each([
+    ["NO_SESSION: C46 removed the worktree", { worktreePath: null, resumable: true }],
+    ["CANNOT_RESUME: the session store is gone", { worktreePath: undefined, resumable: false }],
+  ] as const)("F3: %s -> the send-back is skipped with an error log, not left claimed", async (_label, opts) => {
+    const s = await seedSpecTask();
+    const id = await seedSpecExecution(s.taskId, "COMPLETED", { worktreePath: opts.worktreePath });
+    const cmd = await enqueue(s.taskId, "send_message", id, {
+      text: SENT_BACK_TEXT,
+      system: "sent_back",
+    });
+    const h = makeHarness();
+    h.adapter.resumable = opts.resumable;
+    await consume(h.runner);
+
+    expect((await command(cmd)).completedAt).not.toBeNull();
+    expect(records).toContainEqual(
+      expect.objectContaining({ level: "error", msg: "send_message: spec session cannot be resumed" }),
+    );
+    expect(records.some((r) => r.msg === "command handler failed")).toBe(false);
+    expect(h.adapter.resumes).toEqual([]);
+    expect((await execution(id)).state).toBe("COMPLETED");
+  });
+
+  it("F4: request-review committing between the resume and the token issue leaves no token and opens no session", async () => {
+    const s = await seedSpecTask();
+    const id = await seedSpecExecution(s.taskId, "RUNNING");
+    let fired = false;
+    const h = makeHarness({
+      async beforeTokenIssue() {
+        if (fired) return;
+        fired = true;
+        await requestReview(s.taskId);
+      },
+    });
+    h.adapter.resumeScripts.push(reply("unexpected"));
+    const cmd = await enqueue(s.taskId, "send_message", id, { text: "hello" });
+    await consume(h.runner);
+    await idle(h.runner, id);
+
+    expect(fired).toBe(true);
+    expect((await command(cmd)).completedAt).not.toBeNull();
+    const row = await execution(id);
+    expect(row.state).toBe("COMPLETED");
+    expect(row.toolsTokenHash).toBeNull();
+    expect(h.adapter.resumes).toEqual([]);
+    expect(await auditOf(id)).toEqual(["RUNNING -(execution.completed)-> COMPLETED"]);
+    expect(records).toContainEqual(
+      expect.objectContaining({ msg: "execution is no longer live, not opening the session" }),
+    );
   });
 });

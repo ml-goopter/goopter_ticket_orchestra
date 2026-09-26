@@ -22,6 +22,7 @@ import {
   getExecutionState,
   getRevisionByStatus,
   getTaskState,
+  hasLiveSpecExecution,
   insertExecutionUsage,
   loadRunnerContext,
   lockExecutionForTool,
@@ -159,6 +160,14 @@ export interface RunnerDeps {
   testCommandFor?: (ctx: RunnerContext) => string | null;
   timings?: Partial<RunnerTimings>;
   now?: () => Date;
+  /** Test seams; production passes nothing. */
+  hooks?: {
+    /**
+     * Runs after a start or resume has committed and before the turn's
+     * token is issued. Tests use it to interleave a state move.
+     */
+    beforeTokenIssue?: (executionId: string) => Promise<void>;
+  };
 }
 
 export type ResumeErrorCode =
@@ -419,6 +428,22 @@ export function createRunner(deps: RunnerDeps): Runner {
     });
   }
 
+  /**
+   * §8 "issued at start or resume": issues the turn's token only while the
+   * execution is ASSIGNED or RUNNING, checked under the task, then
+   * execution, row locks. Request-review revokes a spec token in the same
+   * transaction that completes the execution, so a token is never stored
+   * on a COMPLETED row (GOT.37 F4). Null when the execution is not live.
+   */
+  async function issueRunToken(ctx: RunnerContext): Promise<string | null> {
+    return db.transaction(async (tx) => {
+      await lockTaskForTool(tx, ctx.task.id, "key share");
+      const row = await lockExecutionForTool(tx, ctx.execution.id);
+      if (row?.state !== "ASSIGNED" && row?.state !== "RUNNING") return null;
+      return issueToken(tx, ctx.execution.id);
+    });
+  }
+
   // --------------------------------------------------------- run lifecycle
 
   /**
@@ -550,7 +575,15 @@ export function createRunner(deps: RunnerDeps): Runner {
     };
 
     try {
-      const token = await issueToken(db, executionId);
+      await deps.hooks?.beforeTokenIssue?.(executionId);
+      const token = await issueRunToken(ctx);
+      if (token === null) {
+        // Request-review or a cancel moved it since the start or resume
+        // transaction committed. No token, no session, no further writes.
+        log.info({}, "execution is no longer live, not opening the session");
+        state.stop("gone");
+        return;
+      }
       const redact = <T>(value: T): T => redactToken(value, token);
 
       // Agent-tools calls renew through the default, state-gated helper.
@@ -694,18 +727,27 @@ export function createRunner(deps: RunnerDeps): Runner {
         }
       }
 
-      void flush();
-      const message =
-        turnText !== ""
-          ? turnText
-          : end.kind === "turn_done"
-            ? end.finalText
-            : "";
-      if (message !== "") {
-        const text = redact(message);
-        void writes.push("agent.message", () =>
-          appendRunEvent(ctx, "agent.message", { text }),
-        );
+      if (end.kind === "stopped" && end.reason === "gone") {
+        // The execution left the live states under us (C44 request-review,
+        // a cancel): its buffered text and the turn's message are dropped,
+        // so it gets no further runner writes.
+        cancel(flushTimer);
+        flushTimer = undefined;
+        buffer = "";
+      } else {
+        void flush();
+        const message =
+          turnText !== ""
+            ? turnText
+            : end.kind === "turn_done"
+              ? end.finalText
+              : "";
+        if (message !== "") {
+          const text = redact(message);
+          void writes.push("agent.message", () =>
+            appendRunEvent(ctx, "agent.message", { text }),
+          );
+        }
       }
       await writes.drain();
 
@@ -1557,6 +1599,11 @@ export function createRunner(deps: RunnerDeps): Runner {
           if (taskState !== "SPEC_IN_PROGRESS") {
             refuse("NOT_RESUMABLE_STATE", `task is ${taskState ?? "gone"}, not SPEC_IN_PROGRESS`);
           }
+        }
+        // F1: a send-back never resumes a second spec session. A restart
+        // (C49) may already have started a new one for the task.
+        if (spec && execution.state === "COMPLETED" && (await hasLiveSpecExecution(tx, ctx.task.id))) {
+          refuse("NOT_RESUMABLE_STATE", "task already has another live spec execution");
         }
         // C42: a RUNNING spec execution resumes in place, no transition.
         if (execution.state !== "RUNNING") {

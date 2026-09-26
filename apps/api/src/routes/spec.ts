@@ -13,6 +13,7 @@ import {
   approveRevision,
   findProjectRepositoryByName,
   getRevisionByStatus,
+  hasPendingSpecResume,
   hasPendingSpecSessionStart,
   insertDraftRevision,
   insertExecutionCommand,
@@ -146,7 +147,9 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
           // C49: restart a spec session that failed or was orphaned (for
           // example after a dead-host release), with no task transition.
           const live = await lockTaskExecutionIds(tx, id, "spec", LIVE_EXECUTION_STATES);
-          if (live.length > 0) {
+          // F1: a send-back not yet processed will resume the COMPLETED
+          // session; a restart now would leave two live spec sessions.
+          if (live.length > 0 || (await hasPendingSpecResume(tx, id))) {
             throw new AppError(
               409,
               "SPEC_SESSION_BUSY",

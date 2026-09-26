@@ -253,6 +253,23 @@ describe("POST /api/tasks/:id/spec/session (P1)", () => {
     expect((await executionRow(failed)).state).toBe("FAILED");
   });
 
+  it("returns 409 SPEC_SESSION_BUSY while a send-back resume of a COMPLETED spec execution is pending, then restarts once it completed (F1)", async () => {
+    const { id } = await newTask("SPEC_REVIEW");
+    await seedRevision(id, 1, "draft", content());
+    await seedExecution(h.db, id, { role: "spec", state: "COMPLETED" });
+    expect((await post(`/api/tasks/${id}/spec/send-back`)).statusCode).toBe(200);
+    const before = await snapshot(id);
+
+    const res = await post(`/api/tasks/${id}/spec/session`);
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe("SPEC_SESSION_BUSY");
+    expect(await snapshot(id)).toEqual(before);
+
+    // The worker skipped or handled it: no longer pending.
+    await h.sql`update execution_commands set completed_at = now() where task_id = ${id}`;
+    expect((await post(`/api/tasks/${id}/spec/session`)).statusCode).toBe(200);
+  });
+
   it.each(["QUEUED", "ASSIGNED", "RUNNING", "WAITING_FOR_USER"] as const)(
     "returns 409 SPEC_SESSION_BUSY from SPEC_IN_PROGRESS with a %s spec execution and writes nothing (C49)",
     async (execState) => {

@@ -4,6 +4,7 @@ import {
   completeExecutionCommand,
   getRevisionByStatus,
   hasLiveSpecExecution,
+  hasPendingSpecResume,
   insertQueuedExecution,
   loadRunnerContext,
   lockTaskForSpecStart,
@@ -91,6 +92,10 @@ async function createSpecExecution(
     }
     if (await hasLiveSpecExecution(tx, input.taskId)) {
       return { ok: false, reason: "task already has a live spec execution" };
+    }
+    // F1: a pending send-back resumes the COMPLETED session instead.
+    if (await hasPendingSpecResume(tx, input.taskId)) {
+      return { ok: false, reason: "a sent-back spec session is about to resume" };
     }
     const repository = await resolveSpecRepository(tx, input.taskId);
     if (!repository) {
@@ -194,6 +199,12 @@ export function registerSpecHandlers(
         }
         case "NOT_FOUND":
         case "NOT_RESUMABLE_STATE":
+          return { outcome: "skipped", reason: err.message };
+        // F3: the session or its worktree is gone for good (C46 removed an
+        // approved spec's worktree). Retrying would never succeed.
+        case "NO_SESSION":
+        case "CANNOT_RESUME":
+          log.error({ code: err.code, reason: err.message }, "send_message: spec session cannot be resumed");
           return { outcome: "skipped", reason: err.message };
         default:
           throw err;

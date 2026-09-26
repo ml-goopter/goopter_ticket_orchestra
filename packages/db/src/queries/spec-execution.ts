@@ -1,6 +1,6 @@
 import type { ExecutionState, TaskState } from "@orchestra/core";
 import { and, asc, eq, inArray, isNotNull, isNull, lt, ne, notInArray, sql } from "drizzle-orm";
-import { agentWorkers, executions } from "../schema/executions.js";
+import { agentWorkers, executionCommands, executions } from "../schema/executions.js";
 import { repositories } from "../schema/projects.js";
 import { tasks } from "../schema/tasks.js";
 import type { DbOrTx, Tx } from "../transition.js";
@@ -65,6 +65,30 @@ export async function hasLiveSpecExecution(tx: Tx, taskId: string): Promise<bool
         eq(executions.taskId, taskId),
         eq(executions.role, "spec"),
         inArray(executions.state, [...LIVE_SPEC_STATES]),
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
+}
+
+/**
+ * True when the task has an uncompleted `send_message` command on a
+ * `COMPLETED` spec execution: a send-back (C45) is about to resume that
+ * session, so a new one must not start (GOT.37 F1). Call with the task row
+ * locked.
+ */
+export async function hasPendingSpecResume(tx: Tx, taskId: string): Promise<boolean> {
+  const [row] = await tx
+    .select({ id: executionCommands.id })
+    .from(executionCommands)
+    .innerJoin(executions, eq(executions.id, executionCommands.executionId))
+    .where(
+      and(
+        eq(executionCommands.taskId, taskId),
+        eq(executionCommands.type, "send_message"),
+        isNull(executionCommands.completedAt),
+        eq(executions.role, "spec"),
+        eq(executions.state, "COMPLETED"),
       ),
     )
     .limit(1);
