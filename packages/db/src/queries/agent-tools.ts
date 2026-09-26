@@ -314,6 +314,57 @@ export async function insertPullRequest(
   return row;
 }
 
+export interface UpsertPullRequestInput {
+  taskId: string;
+  executionId: string;
+  number: number;
+  url: string;
+  headSha: string;
+  now: Date;
+}
+
+/**
+ * `report_pr_created` (design.md §8, GOT.39 C17). A task has at most one
+ * `pull_requests` row. The first call inserts it open with `ci_state =
+ * pending`. A later call, after a CI-failure resume, updates that row in
+ * place: `number`, `url`, `head_sha`, `execution_id`, `ci_state = pending`,
+ * `ci_detail = null`, `last_polled_at = now`. `state` and `created_at` are
+ * kept.
+ */
+export async function upsertPullRequest(
+  db: DbOrTx,
+  input: UpsertPullRequestInput,
+): Promise<{ id: string }> {
+  const [row] = await db
+    .insert(pullRequests)
+    .values({
+      taskId: input.taskId,
+      executionId: input.executionId,
+      number: input.number,
+      url: input.url,
+      headSha: input.headSha,
+      state: "open",
+      ciState: "pending",
+      lastPolledAt: input.now,
+      createdAt: input.now,
+    })
+    .onConflictDoUpdate({
+      target: pullRequests.taskId,
+      set: {
+        executionId: input.executionId,
+        number: input.number,
+        url: input.url,
+        headSha: input.headSha,
+        ciState: "pending",
+        ciDetail: null,
+        lastPolledAt: input.now,
+      },
+    })
+    .returning({ id: pullRequests.id });
+  if (!row) throw new Error("upsertPullRequest: upsert returned no row");
+  return row;
+}
+
 export interface UpsertDraftSpecificationRevisionInput {
   taskId: string;
   content: unknown;

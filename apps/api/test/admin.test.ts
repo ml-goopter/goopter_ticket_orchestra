@@ -273,6 +273,66 @@ describe("admin routes", () => {
       expect(patchRes.json().default_branch).toBe("develop");
     });
 
+    it("GOT.39 C15: stores test_command on create, returns it on read, and patches it", async () => {
+      const app = await withAuthedApp();
+      const project = await createProject(app, "REPOTC");
+
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/repositories",
+        headers: { cookie },
+        payload: {
+          project_id: project.id,
+          name: "tc-repo",
+          git_url: "git@example.com:goopter/tc-repo.git",
+          default_branch: "main",
+          default_runtime: "claude",
+          test_command: "pnpm test",
+        },
+      });
+      expect(createRes.statusCode).toBe(201);
+      const created = createRes.json();
+      expect(created.test_command).toBe("pnpm test");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/repositories/${created.id}`,
+        headers: { cookie },
+      });
+      expect(getRes.json().test_command).toBe("pnpm test");
+
+      const patchRes = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${created.id}`,
+        headers: { cookie },
+        payload: { test_command: "npm run test:unit" },
+      });
+      expect(patchRes.statusCode).toBe(200);
+      expect(patchRes.json().test_command).toBe("npm run test:unit");
+
+      const clearRes = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${created.id}`,
+        headers: { cookie },
+        payload: { test_command: null },
+      });
+      expect(clearRes.json().test_command).toBeNull();
+
+      const defaultRes = await app.inject({
+        method: "POST",
+        url: "/api/repositories",
+        headers: { cookie },
+        payload: {
+          project_id: project.id,
+          name: "tc-default-repo",
+          git_url: "git@example.com:goopter/tc-default-repo.git",
+          default_branch: "main",
+          default_runtime: "claude",
+        },
+      });
+      expect(defaultRes.json().test_command).toBeNull();
+    });
+
     it.each([
       ["plain word", "not-a-url"],
       ["ftp url", "ftp://example.com/org/repo.git"],

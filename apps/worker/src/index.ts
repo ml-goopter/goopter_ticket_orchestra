@@ -19,6 +19,7 @@ import {
   createCommandHandlers,
   createRunner,
   registerCancelHandler,
+  registerCiFailureHandler,
 } from "./runner/index.js";
 import { WorktreeManager } from "./worktrees/index.js";
 import { detectRuntimes } from "./scheduler/index.js";
@@ -138,6 +139,8 @@ async function main(): Promise<void> {
   });
   const commands = createCommandHandlers();
   registerCancelHandler(commands, runner);
+  // design.md §11.2: CI feedback resumes the same execution (GOT.39).
+  registerCiFailureHandler(commands, runner);
 
   const loop = createTickLoop({
     db,

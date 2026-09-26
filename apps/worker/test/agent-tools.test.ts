@@ -1519,6 +1519,81 @@ describe("report_pr_created", () => {
     );
     await expect(connect(s.token)).rejects.toThrow(/401|UNAUTHORIZED/);
   });
+
+  it("GOT.39 C17: a second call for the same task updates the PR row in place, leaving exactly one", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    expectOk(
+      await call(s.token, "report_pr_created", {
+        url: "https://github.com/goopter/orchestra/pull/42",
+        number: 42,
+        head_sha: "sha-one",
+      }),
+    );
+    const [first] = await db.query.pullRequests.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    // CI failed and the poller recorded it.
+    await db.$client.unsafe(
+      "update pull_requests set ci_state = 'failed', ci_detail = '{\"x\":1}'::jsonb, last_polled_at = '2026-01-01T00:00:00Z' where id = $1",
+      [first!.id],
+    );
+
+    // The CI-failure resume, then the agent's next review round.
+    const actor = { kind: "worker" as const };
+    await db.transaction(async (tx) => {
+      await transition(tx, { entity: "task", id: s.taskId, trigger: "ci.failed", actor });
+      await transition(tx, {
+        entity: "execution",
+        id: s.executionId,
+        trigger: "resume_with_ci_failure",
+        actor,
+      });
+      await transition(tx, { entity: "task", id: s.taskId, trigger: "review.started", actor });
+    });
+    const token = await db.transaction((tx) => issueToken(tx, s.executionId));
+    issuedTokens.push(token);
+
+    expectOk(
+      await call(token, "report_pr_created", {
+        url: "https://github.com/goopter/orchestra/pull/42",
+        number: 42,
+        head_sha: "sha-two",
+      }),
+    );
+
+    const prs = await db.query.pullRequests.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    expect(prs).toHaveLength(1);
+    expect(prs[0]).toMatchObject({
+      id: first!.id,
+      executionId: s.executionId,
+      number: 42,
+      url: "https://github.com/goopter/orchestra/pull/42",
+      headSha: "sha-two",
+      state: "open",
+      ciState: "pending",
+      ciDetail: null,
+    });
+    expect(prs[0]!.lastPolledAt.getTime()).toBeGreaterThan(
+      new Date("2026-01-01T00:00:00Z").getTime(),
+    );
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+    const execution = await getExecution(s.executionId);
+    expect(execution!.state).toBe("COMPLETED");
+    expect(execution!.toolsTokenHash).toBeNull();
+    const created = (await eventsFor(s.taskId)).filter(
+      (e) => e.type === "pull_request.created",
+    );
+    expect(created.map((e) => (e.payload as { head_sha: string }).head_sha)).toEqual([
+      "sha-one",
+      "sha-two",
+    ]);
+    expect(created.map((e) => (e.payload as { pull_request_id: string }).pull_request_id)).toEqual([
+      first!.id,
+      first!.id,
+    ]);
+  });
 });
 
 // ================================================================= AC3

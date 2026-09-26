@@ -52,6 +52,7 @@ const CreateRepositorySchema = z
     max_concurrent_worktrees: z.number().int().min(1).default(1),
     required_capability: z.string().nullable().optional().default(null),
     setup_command: z.string().nullable().optional().default(null),
+    test_command: z.string().nullable().optional().default(null),
   })
   .strict();
 
@@ -71,6 +72,7 @@ const PatchRepositorySchema = z
     max_concurrent_worktrees: z.number().int().min(1),
     required_capability: z.string().nullable(),
     setup_command: z.string().nullable(),
+    test_command: z.string().nullable(),
   })
   .strict()
   .partial();
@@ -87,6 +89,7 @@ function toResponse(row: RepositoryRow) {
     max_concurrent_worktrees: row.maxConcurrentWorktrees,
     required_capability: row.requiredCapability,
     setup_command: row.setupCommand,
+    test_command: row.testCommand,
     created_at: row.createdAt,
   };
 }
@@ -144,6 +147,7 @@ export default async function repositoriesRoutes(
         maxConcurrentWorktrees: parsed.data.max_concurrent_worktrees,
         requiredCapability: parsed.data.required_capability,
         setupCommand: parsed.data.setup_command,
+        testCommand: parsed.data.test_command,
       });
       reply.code(201);
       return toResponse(row);
@@ -194,6 +198,9 @@ export default async function repositoriesRoutes(
           : {}),
         ...(parsed.data.setup_command !== undefined
           ? { setupCommand: parsed.data.setup_command }
+          : {}),
+        ...(parsed.data.test_command !== undefined
+          ? { testCommand: parsed.data.test_command }
           : {}),
       });
       if (!row) throw notFound(request.params.id);

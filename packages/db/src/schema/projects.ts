@@ -33,6 +33,8 @@ export const repositories = pgTable(
       .default(1),
     requiredCapability: text("required_capability"),
     setupCommand: text("setup_command"),
+    /** One plain command the review role may run (design.md OI3, C15). */
+    testCommand: text("test_command"),
     createdAt: timestamptz("created_at").notNull().defaultNow(),
   },
   (table) => [unique().on(table.projectId, table.name)],
