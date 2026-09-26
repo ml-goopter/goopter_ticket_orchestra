@@ -1089,3 +1089,113 @@ describe("registration (§6.6)", () => {
     expect(records.map((r) => r.msg)).not.toContain("phase not implemented yet");
   });
 });
+
+describe("approved spec worktrees (GOT.37 C46)", () => {
+  /** A task in `taskState` with one spec execution whose read-only worktree was really prepared. */
+  async function seedSpecWorktree(options: {
+    taskState: TaskState;
+    state?: ExecutionState;
+    host?: string;
+    endedAt?: Date | null;
+    taskRepository?: boolean;
+  }): Promise<{ taskId: string; executionId: string; worktreePath: string }> {
+    const task = await seedTask(options.taskState);
+    if (options.taskRepository === false) {
+      await raw("update tasks set repository_id = null where id = $1", [task.id]);
+    }
+    const [row] = await db
+      .insert(executions)
+      .values({
+        taskId: task.id,
+        role: "spec",
+        attempt: 1,
+        state: options.state ?? "COMPLETED",
+        runtime: "claude",
+        model: "claude-opus",
+        host: options.host ?? HOST,
+        startedAt: at(-2 * HOUR),
+        endedAt: options.endedAt === undefined ? at(-60 * 1000) : options.endedAt,
+        createdAt: at(-2 * HOUR),
+      })
+      .returning({ id: executions.id });
+    const executionId = row!.id;
+    const prepared = await manager.prepareSpec({
+      executionId,
+      repository: { name: REPO_NAME, gitUrl: remote, defaultBranch: "main" },
+    });
+    expect(prepared.branch).toBeNull();
+    await raw("update executions set worktree_path = $1 where id = $2", [
+      prepared.worktreePath,
+      executionId,
+    ]);
+    return { taskId: task.id, executionId, worktreePath: prepared.worktreePath };
+  }
+
+  it.each(["SPEC_APPROVED", "READY", "IMPLEMENTING", "DONE", "CANCELLED"] as const)(
+    "removes a COMPLETED spec worktree once the task is %s, with no age threshold",
+    async (taskState) => {
+      const s = await seedSpecWorktree({ taskState });
+      const ops = recordingOps();
+      await sweep({ worktrees: ops });
+
+      expect(existsSync(s.worktreePath)).toBe(false);
+      expect(ops.removed).toEqual([s.executionId]);
+      const row = await execution(s.executionId);
+      expect(row.worktreePath).toBeNull();
+      expect(row.worktreeEvictedAt).toBeNull();
+      expect(row.state).toBe("COMPLETED");
+      expect(await evictedEvents(s.executionId)).toEqual([]);
+      expect(records).toContainEqual(
+        expect.objectContaining({ level: "info", msg: "spec worktree removed" }),
+      );
+    },
+  );
+
+  it.each(["NEEDS_SPEC", "SPEC_IN_PROGRESS", "SPEC_REVIEW"] as const)(
+    "leaves a COMPLETED spec worktree while the task is %s",
+    async (taskState) => {
+      const s = await seedSpecWorktree({ taskState, endedAt: at(-30 * DAY) });
+      const ops = recordingOps();
+      await sweep({ worktrees: ops });
+
+      expect(existsSync(s.worktreePath)).toBe(true);
+      expect(ops.removed).toEqual([]);
+      expect((await execution(s.executionId)).worktreePath).toBe(s.worktreePath);
+    },
+  );
+
+  it("leaves a spec worktree on another host", async () => {
+    const s = await seedSpecWorktree({ taskState: "SPEC_APPROVED", host: OTHER_HOST });
+    const ops = recordingOps();
+    await sweep({ worktrees: ops });
+    expect(existsSync(s.worktreePath)).toBe(true);
+    expect(ops.removed).toEqual([]);
+  });
+
+  it("removes one whose task has no repository, through the project's first repository by name (C41)", async () => {
+    const s = await seedSpecWorktree({ taskState: "CANCELLED", taskRepository: false });
+    const ops = recordingOps();
+    await sweep({ worktrees: ops });
+    expect(existsSync(s.worktreePath)).toBe(false);
+    expect(ops.removed).toEqual([s.executionId]);
+    expect((await execution(s.executionId)).worktreePath).toBeNull();
+    expect(records.filter((r) => r.level === "error")).toEqual([]);
+  });
+
+  it("keeps the worktree when the execution was resumed before the lock re-check", async () => {
+    const s = await seedSpecWorktree({ taskState: "SPEC_APPROVED" });
+    const ops = recordingOps();
+    const locking: WorktreeOps = {
+      ...ops,
+      async withRepositoryLock(repositoryName, fn) {
+        // A send-back resume lands between the list and the row locks.
+        await raw("update tasks set state = 'SPEC_IN_PROGRESS' where id = $1", [s.taskId]);
+        return ops.withRepositoryLock(repositoryName, fn);
+      },
+    };
+    await sweep({ worktrees: locking });
+    expect(existsSync(s.worktreePath)).toBe(true);
+    expect(ops.removed).toEqual([]);
+    expect((await execution(s.executionId)).worktreePath).toBe(s.worktreePath);
+  });
+});

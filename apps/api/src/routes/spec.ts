@@ -60,6 +60,9 @@ const LIVE_EXECUTION_STATES = [
 /** Live spec execution states that request-review cannot complete, so it refuses. */
 const BUSY_SPEC_EXECUTION_STATES = ["QUEUED", "ASSIGNED", "WAITING_FOR_USER"] as const;
 
+/** The `send_message` text the send-back route enqueues (GOT.37 C45). */
+const SENT_BACK_TEXT = "The specification was sent back for changes.";
+
 /** Dependency states that make an approved task `BLOCKED` (§6.2). */
 const FAILED_DEPENDENCY_STATES: ReadonlySet<TaskState> = new Set<TaskState>([
   "FAILED",
@@ -137,12 +140,28 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
     const actor = userActor(request);
     try {
       return await app.db.transaction(async (tx) => {
-        const result = await transition(tx, {
-          entity: "task",
-          id,
-          trigger: "spec.session_started",
-          actor,
-        });
+        const task = await lockTask(tx, id);
+        let result: { from: TaskState; to: TaskState };
+        if (task.state === "SPEC_IN_PROGRESS") {
+          // C49: restart a spec session that failed or was orphaned (for
+          // example after a dead-host release), with no task transition.
+          const live = await lockTaskExecutionIds(tx, id, "spec", LIVE_EXECUTION_STATES);
+          if (live.length > 0) {
+            throw new AppError(
+              409,
+              "SPEC_SESSION_BUSY",
+              "The task already has a live spec session.",
+            );
+          }
+          result = { from: task.state, to: task.state };
+        } else {
+          result = await transition(tx, {
+            entity: "task",
+            id,
+            trigger: "spec.session_started",
+            actor,
+          });
+        }
         await insertExecutionCommand(tx, {
           taskId: id,
           executionId: null,
@@ -303,12 +322,29 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
     const actor = userActor(request);
     try {
       return await app.db.transaction(async (tx) => {
+        // `transition()` locks the task row before the execution rows below.
         const result = await transition(tx, {
           entity: "task",
           id,
           trigger: "spec.sent_back",
           actor,
         });
+        // §5.2 "sending the spec back to draft resumes it" (C45): the worker
+        // moves the most recent COMPLETED spec execution back to RUNNING and
+        // resumes its session. With none (a hand-written draft), nothing is
+        // enqueued and the user edits the draft by hand.
+        const completed = await lockTaskExecutionIds(tx, id, "spec", ["COMPLETED"]);
+        const latest = completed[completed.length - 1];
+        if (latest) {
+          await insertExecutionCommand(tx, {
+            taskId: id,
+            executionId: latest,
+            type: "send_message",
+            payload: { text: SENT_BACK_TEXT, system: "sent_back" },
+            createdBy: actor.id!,
+            now: app.now(),
+          });
+        }
         return { from: result.from, to: result.to };
       });
     } catch (err) {

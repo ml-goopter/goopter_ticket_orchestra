@@ -20,6 +20,7 @@ import {
   createRunner,
   registerCancelHandler,
   registerCiFailureHandler,
+  registerSpecHandlers,
   startRetryStarter,
 } from "./runner/index.js";
 import { WorktreeManager } from "./worktrees/index.js";
@@ -150,6 +151,8 @@ async function main(): Promise<void> {
   registerCancelHandler(commands, runner);
   // design.md §11.2: CI feedback resumes the same execution (GOT.39).
   registerCiFailureHandler(commands, runner);
+  // design.md §12.3, D8: spec sessions start and chat by command (GOT.37).
+  registerSpecHandlers(commands, runner);
 
   const loop = createTickLoop({
     db,

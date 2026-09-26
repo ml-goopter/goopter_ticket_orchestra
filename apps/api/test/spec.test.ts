@@ -223,7 +223,7 @@ describe("POST /api/tasks/:id/spec/session (P1)", () => {
     expect(await auditTriggers(id)).toEqual(["spec.session_started"]);
   });
 
-  it.each(["SPEC_IN_PROGRESS", "SPEC_REVIEW", "READY", "IMPLEMENTING", "DONE"] as const)(
+  it.each(["SPEC_REVIEW", "READY", "IMPLEMENTING", "DONE"] as const)(
     "returns 409 from %s and writes nothing",
     async (state) => {
       const { id } = await newTask(state);
@@ -231,6 +231,37 @@ describe("POST /api/tasks/:id/spec/session (P1)", () => {
       const res = await post(`/api/tasks/${id}/spec/session`);
       expect(res.statusCode).toBe(409);
       expect(res.json().error.code).toBe("ILLEGAL_TRANSITION");
+      expect(await snapshot(id)).toEqual(before);
+    },
+  );
+
+  it("restarts from SPEC_IN_PROGRESS with no live spec execution: enqueues start_spec_session, no task transition (C49)", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const failed = await seedExecution(h.db, id, { role: "spec", state: "FAILED" });
+    await seedExecution(h.db, id, { role: "spec", state: "COMPLETED", attempt: 2 });
+    // A live implementation execution is not a spec session.
+    await seedExecution(h.db, id, { role: "implementation", state: "WAITING_FOR_USER" });
+
+    const res = await post(`/api/tasks/${id}/spec/session`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ from: "SPEC_IN_PROGRESS", to: "SPEC_IN_PROGRESS" });
+    expect((await taskRow(id)).state).toBe("SPEC_IN_PROGRESS");
+    expect(await commands(id)).toEqual([
+      { type: "start_spec_session", execution_id: null, created_by: fx.userId, payload: {} },
+    ]);
+    expect(await auditTriggers(id)).toEqual([]);
+    expect((await executionRow(failed)).state).toBe("FAILED");
+  });
+
+  it.each(["QUEUED", "ASSIGNED", "RUNNING", "WAITING_FOR_USER"] as const)(
+    "returns 409 SPEC_SESSION_BUSY from SPEC_IN_PROGRESS with a %s spec execution and writes nothing (C49)",
+    async (execState) => {
+      const { id } = await newTask("SPEC_IN_PROGRESS");
+      await seedExecution(h.db, id, { role: "spec", state: execState });
+      const before = await snapshot(id);
+      const res = await post(`/api/tasks/${id}/spec/session`);
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error.code).toBe("SPEC_SESSION_BUSY");
       expect(await snapshot(id)).toEqual(before);
     },
   );
@@ -480,23 +511,63 @@ describe("POST /api/tasks/:id/spec/request-review and send-back (P4)", () => {
     expect(res.json().error.code).toBe("ILLEGAL_TRANSITION");
   });
 
-  it("send-back returns SPEC_REVIEW to SPEC_IN_PROGRESS and writes only the transition", async () => {
+  it("send-back returns SPEC_REVIEW to SPEC_IN_PROGRESS and enqueues send_message on the latest COMPLETED spec execution (C45)", async () => {
     const { id } = await newTask("SPEC_REVIEW");
     await seedRevision(id, 1, "draft", content());
-    const specExec = await seedExecution(h.db, id, { role: "spec", state: "COMPLETED" });
+    const older = await seedExecution(h.db, id, {
+      role: "spec",
+      state: "COMPLETED",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    const specExec = await seedExecution(h.db, id, {
+      role: "spec",
+      state: "COMPLETED",
+      attempt: 2,
+      createdAt: new Date("2026-01-01T01:00:00Z"),
+    });
+    await seedExecution(h.db, id, {
+      role: "spec",
+      state: "FAILED",
+      attempt: 3,
+      createdAt: new Date("2026-01-01T02:00:00Z"),
+    });
+    await seedExecution(h.db, id, { role: "implementation", state: "COMPLETED" });
+    const res = await post(`/api/tasks/${id}/spec/send-back`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ from: "SPEC_REVIEW", to: "SPEC_IN_PROGRESS" });
+    expect(await auditTriggers(id)).toEqual(["spec.sent_back"]);
+    expect(await commands(id)).toEqual([
+      {
+        type: "send_message",
+        execution_id: specExec,
+        created_by: fx.userId,
+        payload: { text: "The specification was sent back for changes.", system: "sent_back" },
+      },
+    ]);
+    // The route only enqueues; the worker moves the execution (C45).
+    expect((await executionRow(specExec)).state).toBe("COMPLETED");
+    expect((await executionRow(older)).state).toBe("COMPLETED");
+    expect(await auditTriggers(specExec)).toEqual([]);
+  });
+
+  it("send-back with no COMPLETED spec execution (a hand-written draft) enqueues nothing", async () => {
+    const { id } = await newTask("SPEC_REVIEW");
+    await seedRevision(id, 1, "draft", content());
+    await seedExecution(h.db, id, { role: "spec", state: "FAILED" });
     const res = await post(`/api/tasks/${id}/spec/send-back`);
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ from: "SPEC_REVIEW", to: "SPEC_IN_PROGRESS" });
     expect(await auditTriggers(id)).toEqual(["spec.sent_back"]);
     expect(await commands(id)).toHaveLength(0);
-    expect((await executionRow(specExec)).state).toBe("COMPLETED");
   });
 
   it("send-back returns 409 outside SPEC_REVIEW", async () => {
     const { id } = await newTask("SPEC_IN_PROGRESS");
+    await seedExecution(h.db, id, { role: "spec", state: "COMPLETED" });
     const res = await post(`/api/tasks/${id}/spec/send-back`);
     expect(res.statusCode).toBe(409);
     expect(res.json().error.code).toBe("ILLEGAL_TRANSITION");
+    expect(await commands(id)).toHaveLength(0);
   });
 });
 

@@ -11,6 +11,7 @@ import {
   SpecContentSchema,
   type EndReason,
   type ExecutionEventType,
+  type ExecutionState,
   type Runtime,
   type UsageKind,
 } from "@orchestra/core";
@@ -18,11 +19,15 @@ import {
   DEFAULT_EXECUTION_MODEL,
   addExecutionUsageTotals,
   appendEvent,
+  getExecutionState,
+  getRevisionByStatus,
+  getTaskState,
   insertExecutionUsage,
   loadRunnerContext,
   lockExecutionForTool,
   lockTaskForTool,
   markExecutionEnded,
+  resolveSpecRepository,
   restoreEvictedWorktree as restoreEvictedWorktreeRow,
   setExecutionPlacement,
   setExecutionWorktree,
@@ -187,6 +192,12 @@ export interface ResumeInput {
   executionId: string;
   prompt: string;
   usageKind?: Extract<UsageKind, "resume">;
+  /**
+   * Spec role only (GOT.37): the state the command handler saw. The resume
+   * refuses `NOT_RESUMABLE_STATE` when the row is in another state by the
+   * time it is locked.
+   */
+  expectedState?: ExecutionState;
 }
 
 /**
@@ -250,8 +261,17 @@ export interface Runner {
    */
   start(claim: ClaimedExecution, options?: StartOptions): Promise<void>;
   /**
-   * Resumes a WAITING_FOR_USER or COMPLETED execution on this host. Resolves
-   * once it is RUNNING; `done` resolves when the turn has been handled.
+   * Runs the first turn of an ASSIGNED spec execution that the
+   * `start_spec_session` handler created and pinned here (§9.1, §9.3, D8).
+   * Resolves when the turn has been handled; never rejects.
+   */
+  startSpec(claim: ClaimedExecution): Promise<void>;
+  /**
+   * Resumes a WAITING_FOR_USER or COMPLETED execution on this host. A spec
+   * execution may also be RUNNING between turns: it resumes in place with
+   * no transition (GOT.37 C42), and a COMPLETED spec execution moves back
+   * on `execution.resumed` (C45); both need the task in SPEC_IN_PROGRESS.
+   * Resolves once it is RUNNING; `done` resolves when the turn has been handled.
    * An evicted worktree is first recreated from the remote branch (§6.6).
    * Rejects with `ResumeError` without writing anything otherwise, except
    * that a recreated worktree stays recorded.
@@ -549,6 +569,32 @@ export function createRunner(deps: RunnerDeps): Runner {
         }
       };
       intervals.add(setInterval(checkBlocking, timings.blockingPollMs));
+
+      // GOT.37 C44: request-review (and cancel) move a spec execution out of
+      // RUNNING in the database only, while a turn may be in flight. On the
+      // same poll, a spec run reads its state and aborts the session once
+      // it is no longer ASSIGNED or RUNNING; the after-turn then writes
+      // nothing (a `gone` stop).
+      if (ctx.execution.role === "spec") {
+        let reading = false;
+        const checkSpecState = (): void => {
+          if (reading || state.stopReason !== null) return;
+          reading = true;
+          void getExecutionState(db, executionId)
+            .then((current) => {
+              if (current === "ASSIGNED" || current === "RUNNING") return;
+              log.info({ state: current }, "spec execution left RUNNING, aborting the session");
+              state.stop("gone");
+            })
+            .catch((err: unknown) => {
+              log.warn({ err: errMessage(err) }, "spec execution state check failed");
+            })
+            .finally(() => {
+              reading = false;
+            });
+        };
+        intervals.add(setInterval(checkSpecState, timings.blockingPollMs));
+      }
 
       const resetQuiet = (): void => {
         cancel(quietTimer);
@@ -1175,6 +1221,137 @@ export function createRunner(deps: RunnerDeps): Runner {
     return track(state, log, () => startBody(state, claim, options, log));
   }
 
+  // ------------------------------------------------------------ spec start
+
+  /**
+   * GOT.37: the first turn of a spec execution (§9.1, §9.2, §9.3, D8). A
+   * read-only worktree detached at the default branch under
+   * `work/<execution id>`, the spec system prompt, a user prompt with the
+   * ticket and the current draft, and the `spec` tool policy. Spec sessions
+   * hold no lease. After the turn the execution stays RUNNING (the
+   * after-turn `spec` rule) and `finalize` revokes the token.
+   */
+  async function startSpecBody(
+    state: RunState,
+    claim: ClaimedExecution,
+    log: Logger,
+  ): Promise<void> {
+    const loaded = await loadRunnerContext(db, claim.executionId);
+    if (!loaded) {
+      log.warn({}, "spec execution not found");
+      return;
+    }
+    if (loaded.execution.role !== "spec" || loaded.execution.state !== "ASSIGNED") {
+      log.warn(
+        { role: loaded.execution.role, state: loaded.execution.state },
+        "execution is not an ASSIGNED spec execution, not starting",
+      );
+      return;
+    }
+    // C41: before approval the task may have no repository.
+    const repository =
+      loaded.repository ?? (await resolveSpecRepository(db, loaded.task.id));
+    const ctx: RunnerContext = { ...loaded, repository };
+
+    const adapter = deps.adapters[ctx.execution.runtime];
+    if (!adapter) {
+      await endFailed(ctx, "adapter_error", `${ctx.execution.runtime} adapter not available`);
+      return;
+    }
+
+    let prepared: PreparedWorktree;
+    try {
+      if (!repository) throw new Error("project has no repository");
+      // No row lock is held here (carry-forward, PR #34).
+      prepared = await deps.worktrees.prepareSpec({
+        executionId: ctx.execution.id,
+        repository: {
+          name: repository.name,
+          gitUrl: repository.gitUrl,
+          defaultBranch: repository.defaultBranch,
+          setupCommand: repository.setupCommand,
+        },
+      });
+    } catch (err) {
+      log.warn({ err: errMessage(err) }, "spec worktree preparation failed");
+      await endFailed(ctx, "setup_failed", setupDetail(err));
+      return;
+    }
+    if (state.stopReason !== null) return;
+
+    await db.transaction(async (tx) => {
+      await lockTaskForTool(tx, ctx.task.id, "key share");
+      await setExecutionWorktree(tx, ctx.execution.id, prepared);
+      await appendEvent(tx, {
+        taskId: ctx.task.id,
+        executionId: ctx.execution.id,
+        type: "worktree.prepared",
+        payload: { worktree_path: prepared.worktreePath, branch: prepared.branch },
+      });
+    });
+
+    const draftRow = await getRevisionByStatus(db, ctx.task.id, "draft");
+    const draftContent = draftRow ? SpecContentSchema.safeParse(draftRow.content) : null;
+    if (draftContent && !draftContent.success) {
+      log.warn({ revisionId: draftRow!.id }, "draft revision is not valid spec content, prompting without it");
+    }
+    const prompt = buildUserPrompt({
+      role: "spec",
+      ticket: await loadTicket(ctx, log),
+      draftSpec:
+        draftRow && draftContent?.success
+          ? { version: draftRow.version, content: draftContent.data }
+          : null,
+      approvedSpec: null,
+      decisions: ctx.decisions.map((d) => ({
+        issueId: d.issueId,
+        decision: d.decision,
+        clarification: d.clarification,
+        chosenOption: d.chosenOption,
+        author: d.decidedBy,
+        decidedAt: d.decidedAt.toISOString().slice(0, 10),
+      })),
+      repository: {
+        name: repository!.name,
+        defaultBranch: repository!.defaultBranch,
+        workingBranch: null,
+        setupCommand: repository!.setupCommand,
+        testCommand: testCommandFor(ctx),
+      },
+    });
+
+    if (state.stopReason !== null) return;
+    await runSession(state, ctx, "main", log, (token, signal) =>
+      adapter.start(
+        {
+          cwd: prepared.worktreePath,
+          systemPrompt: systemPromptFor("spec"),
+          prompt,
+          model: modelFor(ctx),
+          allowedTools: "spec",
+          mcp: { url: deps.toolsUrl(), token },
+          env: agentEnv(token),
+        },
+        signal,
+      ),
+    );
+  }
+
+  function startSpec(claim: ClaimedExecution): Promise<void> {
+    const log = logger.child({ executionId: claim.executionId, taskId: claim.taskId });
+    if (closed) {
+      log.warn({}, "runner is shutting down, not starting spec execution");
+      return Promise.resolve();
+    }
+    if (live.has(claim.executionId)) {
+      log.warn({}, "execution already running here");
+      return Promise.resolve();
+    }
+    const state = new RunState(claim.executionId);
+    live.set(claim.executionId, state);
+    return track(state, log, () => startSpecBody(state, claim, log));
+  }
+
   // ---------------------------------------------------------------- resume
 
   /**
@@ -1312,8 +1489,24 @@ export function createRunner(deps: RunnerDeps): Runner {
       if (!loaded) return refuse("NOT_FOUND", "execution not found");
       ctx = loaded;
       const { execution } = ctx;
-      if (execution.state !== "WAITING_FOR_USER" && execution.state !== "COMPLETED") {
+      const spec = execution.role === "spec";
+      // GOT.37 C42: a spec execution is RUNNING between turns.
+      const resumable =
+        execution.state === "WAITING_FOR_USER" ||
+        execution.state === "COMPLETED" ||
+        (spec && execution.state === "RUNNING");
+      if (!resumable) {
         refuse("NOT_RESUMABLE_STATE", `execution is ${execution.state}`);
+      }
+      if (input.expectedState !== undefined && execution.state !== input.expectedState) {
+        refuse(
+          "NOT_RESUMABLE_STATE",
+          `execution is ${execution.state}, expected ${input.expectedState}`,
+        );
+      }
+      // C41: before approval a spec task may have no repository.
+      if (spec && ctx.repository === null) {
+        ctx = { ...ctx, repository: await resolveSpecRepository(db, ctx.task.id) };
       }
       if (execution.host !== host) refuse("OTHER_HOST", "execution is pinned to another host");
       if (!execution.sessionId || !execution.worktreePath) {
@@ -1357,17 +1550,29 @@ export function createRunner(deps: RunnerDeps): Runner {
         if (pinned?.worktreeEvictedAt != null) {
           refuse("WORKTREE_UNAVAILABLE", "worktree was evicted after the context loaded");
         }
-        await transition(tx, {
-          entity: "execution",
-          id: executionId,
-          // §5.2: COMPLETED -> RUNNING is the CI back edge.
-          trigger:
-            execution.state === "COMPLETED"
-              ? "resume_with_ci_failure"
-              : "execution.resumed",
-          actor: worker,
-          set: { endedAt: null },
-        });
+        // GOT.37: a spec chat turn or a send-back only while the user is
+        // drafting. Request-review or cancel may have moved the task since.
+        if (spec && execution.state !== "WAITING_FOR_USER") {
+          const taskState = await getTaskState(tx, ctx.task.id);
+          if (taskState !== "SPEC_IN_PROGRESS") {
+            refuse("NOT_RESUMABLE_STATE", `task is ${taskState ?? "gone"}, not SPEC_IN_PROGRESS`);
+          }
+        }
+        // C42: a RUNNING spec execution resumes in place, no transition.
+        if (execution.state !== "RUNNING") {
+          await transition(tx, {
+            entity: "execution",
+            id: executionId,
+            // §5.2: COMPLETED -> RUNNING is the CI back edge for an
+            // implementation, and the send-back edge for a spec (C45).
+            trigger:
+              execution.state === "COMPLETED" && !spec
+                ? "resume_with_ci_failure"
+                : "execution.resumed",
+            actor: worker,
+            set: { endedAt: null },
+          });
+        }
         // A paused execution's lease was not renewed. Renew it with the move
         // to RUNNING, so the sweeper never sees the resumed run stale.
         if (execution.role === "implementation") {
@@ -1412,6 +1617,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       void start(claim);
     },
     start,
+    startSpec,
     resume,
     abort(executionId) {
       const state = live.get(executionId);

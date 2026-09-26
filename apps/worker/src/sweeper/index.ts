@@ -2,7 +2,9 @@ import {
   deleteLease,
   listDeadHosts,
   listExpiredLiveLeases,
+  listOrphanedSpecExecutions,
   lockExpiredLease,
+  lockOrphanedSpecExecution,
   releaseExecutionsOnDeadHosts,
   transition,
   type Db,
@@ -128,11 +130,86 @@ export async function sweepExpiredLeases(
 }
 
 /**
- * design.md §6.1 dead-host release. Clears `host` and `worker_id` on
+ * GOT.37 C48: fails every ASSIGNED spec execution pinned to a dead host
+ * with `process_crash`. Spec sessions hold no lease, so the lease pass
+ * never sees one whose host died between the `start_spec_session` commit
+ * and the session start. Same transaction shape as the lease pass, one per
+ * execution: task row then execution row locked, `execution.failed` with
+ * the token revoked, then the §9.5 retry policy, which for a spec
+ * execution only notifies. A failure is logged and the next one still
+ * runs. Returns the execution ids failed.
+ */
+export async function failOrphanedSpecExecutions(input: SweepInput): Promise<string[]> {
+  const { db, workerId, now, logger } = input;
+  const deadHost = { now, thresholdMs: DEAD_HOST_AFTER_MS, excludeWorkerId: workerId };
+  const failed: string[] = [];
+
+  for (const candidate of await listOrphanedSpecExecutions(db, deadHost)) {
+    try {
+      const swept = await db.transaction(async (tx) => {
+        const row = await lockOrphanedSpecExecution(tx, {
+          ...deadHost,
+          executionId: candidate.executionId,
+          taskId: candidate.taskId,
+        });
+        if (!row) return null;
+
+        const actor = { kind: "worker" as const, id: workerId };
+        const endDetail = `host ${row.host} stopped heartbeating before the spec session started`;
+        await transition(tx, {
+          entity: "execution",
+          id: row.executionId,
+          trigger: "execution.failed",
+          actor,
+          set: {
+            endReason: "process_crash",
+            endDetail,
+            endedAt: now,
+            // §8: the agent-tools token is revoked when the execution
+            // leaves RUNNING.
+            toolsTokenHash: null,
+          },
+        });
+        // Task, then execution, are locked by `lockOrphanedSpecExecution`.
+        const outcome = await runFailurePolicy(tx, {
+          executionId: row.executionId,
+          endReason: "process_crash",
+          endDetail,
+          actor,
+          now,
+          logger,
+        });
+        return { row, outcome: outcome.kind };
+      });
+      if (!swept) continue;
+
+      failed.push(swept.row.executionId);
+      logger.warn(
+        {
+          taskId: swept.row.taskId,
+          executionId: swept.row.executionId,
+          host: swept.row.host,
+          retryPolicy: swept.outcome,
+        },
+        "spec execution orphaned on a dead host, failed; retry policy applied",
+      );
+    } catch (err) {
+      logger.error(
+        { taskId: candidate.taskId, executionId: candidate.executionId, err: errMessage(err) },
+        "orphaned spec execution sweep failed",
+      );
+    }
+  }
+  return failed;
+}
+
+/**
+ * design.md §6.1 dead-host release. First fails orphaned ASSIGNED spec
+ * executions on dead hosts (C48). Then clears `host` and `worker_id` on
  * `WAITING_FOR_USER` and `COMPLETED` executions pinned to a host whose
  * heartbeat is older than `DEAD_HOST_AFTER_MS`, so any worker may take
- * their commands. This worker's host is never dead. Writes no event.
- * Returns the execution ids released.
+ * their commands. This worker's host is never dead. The release writes no
+ * event. Returns the execution ids released.
  */
 export async function releaseDeadHostExecutions(
   input: SweepInput,
@@ -143,6 +220,8 @@ export async function releaseDeadHostExecutions(
 
   const hosts = await listDeadHosts(db, deadHost);
   if (hosts.length === 0) return [];
+
+  await failOrphanedSpecExecutions(input);
 
   const released = await releaseExecutionsOnDeadHosts(db, {
     ...deadHost,
@@ -160,7 +239,8 @@ export async function releaseDeadHostExecutions(
 
 /**
  * The `lease_sweeper` tick phase, every tick: the §6.5 lease pass, then the
- * §6.1 dead-host release. A failure of the release is logged and does not
+ * §6.1 dead-host pass (orphaned ASSIGNED spec executions failed, C48, then
+ * the release). A failure of the release is logged and does not
  * undo the lease pass, which committed per lease.
  */
 export function createLeaseSweeperPhase(
