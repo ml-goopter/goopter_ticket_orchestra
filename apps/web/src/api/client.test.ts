@@ -249,4 +249,124 @@ describe("createApiClient", () => {
     expect(url).toBe("/api/tasks/task-1/retry");
     expect(init.method).toBe("POST");
   });
+
+  const issueDetail = {
+    issue,
+    messages: [
+      {
+        id: "m1",
+        issueId: "i1",
+        authorKind: "user",
+        userId: "u1",
+        body: "please clarify",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
+    execution: { id: "e1", role: "implementation", state: "WAITING_FOR_USER", runtime: "claude" },
+    task: { id: "t1", jira_key: "ABC-1", state: "IMPLEMENTING" },
+    decision: null,
+  };
+
+  it("getIssue(id) hits GET /issues/:id and validates the response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, issueDetail));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.getIssue("i1");
+
+    expect(result).toEqual(issueDetail);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe("/api/issues/i1");
+  });
+
+  it("throws when the issue detail fails schema validation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, { nope: true }));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    await expect(client.getIssue("i1")).rejects.toThrow();
+  });
+
+  it("postIssueMessage(id, text) posts { text } to /issues/:id/messages and validates the response", async () => {
+    const body = { messageId: "m1", commandId: "c1", executionId: "e1" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.postIssueMessage("i1", "please clarify");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/issues/i1/messages");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe(JSON.stringify({ text: "please clarify" }));
+  });
+
+  it("postIssueMessage(id, text) turns a 409 EXECUTION_NOT_WAITING into an ApiError carrying the code", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      fakeResponse(409, {
+        error: { code: "EXECUTION_NOT_WAITING", message: "The issue's execution is RUNNING, not WAITING_FOR_USER." },
+      }),
+    );
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    let caught: unknown;
+    try {
+      await client.postIssueMessage("i1", "hi");
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).code).toBe("EXECUTION_NOT_WAITING");
+  });
+
+  it("resolveIssue(id, input) posts kind/decision/clarification/chosen_option to /issues/:id/resolve", async () => {
+    const body = {
+      issueId: "i1",
+      decisionId: "d1",
+      kind: "clarification",
+      commandId: "c1",
+      task: null,
+      revisionId: null,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.resolveIssue("i1", {
+      kind: "clarification",
+      decision: "Use approach A",
+      clarification: "because it's simpler",
+      chosenOption: "A",
+    });
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/issues/i1/resolve");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe(
+      JSON.stringify({
+        kind: "clarification",
+        decision: "Use approach A",
+        clarification: "because it's simpler",
+        chosen_option: "A",
+      }),
+    );
+  });
+
+  it("resolveIssue(id, input) with no clarification/chosenOption omits those keys", async () => {
+    const body = {
+      issueId: "i1",
+      decisionId: "d1",
+      kind: "spec_revision",
+      commandId: null,
+      task: { from: "IMPLEMENTING", to: "SPEC_IN_PROGRESS" },
+      revisionId: "rev-3",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.resolveIssue("i1", { kind: "spec_revision", decision: "Change it" });
+
+    expect(result).toEqual(body);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.body).toBe(JSON.stringify({ kind: "spec_revision", decision: "Change it" }));
+  });
 });

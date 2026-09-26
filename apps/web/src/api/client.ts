@@ -1,13 +1,20 @@
+import type { ResolutionKind } from "@orchestra/core";
 import { z } from "zod";
 import {
+  IssueDetailSchema,
   IssueSchema,
   NotificationSchema,
+  PostIssueMessageResultSchema,
+  ResolveIssueResultSchema,
   TaskAggregateSchema,
   TaskCardSchema,
   TaskTransitionResultSchema,
   TimelinePageSchema,
   type Issue,
+  type IssueDetail,
   type Notification,
+  type PostIssueMessageResult,
+  type ResolveIssueResult,
   type TaskAggregate,
   type TaskCard,
   type TaskTransitionResult,
@@ -57,6 +64,13 @@ export interface GetTimelineOptions {
   /** Exclusive lower bound: the last event id already loaded. */
   after?: number;
   limit?: number;
+}
+
+export interface ResolveIssueInput {
+  kind: ResolutionKind;
+  decision: string;
+  clarification?: string;
+  chosenOption?: string;
 }
 
 /**
@@ -131,11 +145,28 @@ export interface BoardApiClient extends ApiClient {
 }
 
 /**
+ * The issue detail view's extension of `BoardApiClient` (GOT.42), kept as
+ * its own interface for the same reason `BoardApiClient` is kept separate
+ * from `ApiClient` above: `BoardApiClient` is the type
+ * `TaskDetailView.test.tsx`'s inline fake is annotated with, and that file
+ * is outside this task's `owned_paths`, so widening `BoardApiClient`
+ * itself would force an edit there. `createApiClient()` implements both.
+ */
+export interface IssueApiClient extends BoardApiClient {
+  /** `GET /issues/:id` (design.md §12.4), the issue detail aggregate. */
+  getIssue(id: string): Promise<IssueDetail>;
+  /** `POST /issues/:id/messages` (design.md §10.2, §12.4). */
+  postIssueMessage(id: string, text: string): Promise<PostIssueMessageResult>;
+  /** `POST /issues/:id/resolve` (design.md §10.3, §10.4, §12.4). */
+  resolveIssue(id: string, input: ResolveIssueInput): Promise<ResolveIssueResult>;
+}
+
+/**
  * Typed wrapper around the api (design.md §12.1). Cookies are httpOnly, so
  * every request is sent with `credentials: "include"` and the caller never
  * touches the session cookie directly (design.md §13).
  */
-export function createApiClient(options: ApiClientOptions = {}): BoardApiClient {
+export function createApiClient(options: ApiClientOptions = {}): IssueApiClient {
   const baseUrl = options.baseUrl ?? "/api";
   const fetchImpl = options.fetch ?? fetch;
 
@@ -223,6 +254,23 @@ export function createApiClient(options: ApiClientOptions = {}): BoardApiClient 
     retryTask: (id) =>
       request<TaskTransitionResult>("POST", `/tasks/${id}/retry`, {
         schema: TaskTransitionResultSchema,
+      }),
+    getIssue: (id) =>
+      request<IssueDetail>("GET", `/issues/${id}`, { schema: IssueDetailSchema }),
+    postIssueMessage: (id, text) =>
+      request<PostIssueMessageResult>("POST", `/issues/${id}/messages`, {
+        body: { text },
+        schema: PostIssueMessageResultSchema,
+      }),
+    resolveIssue: (id, input) =>
+      request<ResolveIssueResult>("POST", `/issues/${id}/resolve`, {
+        body: {
+          kind: input.kind,
+          decision: input.decision,
+          clarification: input.clarification,
+          chosen_option: input.chosenOption,
+        },
+        schema: ResolveIssueResultSchema,
       }),
   };
 }
