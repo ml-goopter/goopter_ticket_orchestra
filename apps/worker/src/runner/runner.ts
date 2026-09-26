@@ -23,6 +23,7 @@ import {
   lockExecutionForTool,
   lockTaskForTool,
   markExecutionEnded,
+  restoreEvictedWorktree as restoreEvictedWorktreeRow,
   setExecutionPlacement,
   setExecutionWorktree,
   sumSessionUsageByModel,
@@ -48,7 +49,10 @@ import type { ClaimedExecution, OnClaimed } from "../scheduler/claim.js";
 import {
   SetupFailedError,
   type PrepareImplementationInput,
+  type PrepareSpecInput,
   type PreparedWorktree,
+  type RemoveOptions,
+  type RemoveResult,
 } from "../worktrees/index.js";
 
 /**
@@ -111,6 +115,10 @@ export interface RunnerDeps {
     prepareImplementation(
       input: PrepareImplementationInput,
     ): Promise<PreparedWorktree>;
+    /** Resume of an evicted spec execution recreates its worktree (§6.6). */
+    prepareSpec(input: PrepareSpecInput): Promise<PreparedWorktree>;
+    /** Resume removes a worktree whose recreation failed part way (§6.6). */
+    remove(executionId: string, options: RemoveOptions): Promise<RemoveResult>;
   };
   /** One adapter per runtime (§7.3). A missing runtime fails the execution. */
   adapters: Partial<Record<Runtime, AgentAdapter>>;
@@ -141,9 +149,13 @@ export type ResumeErrorCode =
   | "NO_SESSION"
   | "NO_ADAPTER"
   | "CANNOT_RESUME"
+  | "WORKTREE_UNAVAILABLE"
   | "SHUT_DOWN";
 
-/** `runner.resume` refused. Nothing was written. */
+/**
+ * `runner.resume` refused. Nothing was written, except that a worktree
+ * recreated after eviction is recorded before any later refusal.
+ */
 export class ResumeError extends Error {
   readonly code: ResumeErrorCode;
   readonly executionId: string;
@@ -170,7 +182,9 @@ export interface Runner {
   /**
    * Resumes a WAITING_FOR_USER or COMPLETED execution on this host. Resolves
    * once it is RUNNING; `done` resolves when the turn has been handled.
-   * Rejects with `ResumeError` without writing anything otherwise.
+   * An evicted worktree is first recreated from the remote branch (§6.6).
+   * Rejects with `ResumeError` without writing anything otherwise, except
+   * that a recreated worktree stays recorded.
    */
   resume(input: ResumeInput): Promise<{ done: Promise<void> }>;
   /** Aborts the live run of `executionId`. False when none runs here. */
@@ -890,6 +904,113 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   // ---------------------------------------------------------------- resume
 
+  /**
+   * §6.6: the sweeper evicted this execution's worktree. Recreates it at the
+   * same `work/<executionId>` path: a spec worktree detached at
+   * `origin/<default_branch>` (§9.1); an implementation worktree from
+   * `origin/<branch>`, or from `origin/<default_branch>` on the same branch
+   * name when the remote lacks it (the sweeper pushes a branch that is
+   * ahead, so nothing was left to push); that fallback is logged as a
+   * warning. Then records the path, clears `worktree_evicted_at` and appends
+   * `worktree.prepared` with `start_point` for an implementation worktree.
+   * Returns the worktree path. Any failure before the write removes what the
+   * recreation left at `work/<executionId>`, so the next resume starts
+   * clean, then refuses with `WORKTREE_UNAVAILABLE` and writes nothing.
+   */
+  async function restoreEvictedWorktree(
+    ctx: RunnerContext,
+    refuse: (code: ResumeErrorCode, message: string) => never,
+    log: Logger,
+  ): Promise<string> {
+    let prepared: PreparedWorktree;
+    try {
+      if (!ctx.repository) throw new Error("task has no repository");
+      const repository = {
+        name: ctx.repository.name,
+        gitUrl: ctx.repository.gitUrl,
+        defaultBranch: ctx.repository.defaultBranch,
+        setupCommand: ctx.repository.setupCommand,
+      };
+      if (ctx.execution.role === "spec") {
+        prepared = await deps.worktrees.prepareSpec({
+          executionId: ctx.execution.id,
+          repository,
+        });
+      } else {
+        if (ctx.execution.role !== "implementation" || !ctx.execution.branch) {
+          throw new Error(`a ${ctx.execution.role} worktree cannot be recreated`);
+        }
+        if (!ctx.revision) throw new Error("no approved specification revision");
+        prepared = await deps.worktrees.prepareImplementation({
+          executionId: ctx.execution.id,
+          repository,
+          task: {
+            id: ctx.task.id,
+            jiraKey: ctx.task.jiraKey,
+            jiraSummary: ctx.task.jiraSummary,
+          },
+          spec: {
+            version: ctx.revision.version,
+            content: SpecContentSchema.parse(ctx.revision.content),
+          },
+          decisions: ctx.decisions.map((d) => ({
+            issue_id: d.issueId,
+            decision: d.decision,
+            clarification: d.clarification,
+            chosen_option: d.chosenOption,
+            decided_by: d.decidedBy,
+            decided_at: d.decidedAt.toISOString(),
+          })),
+          reviewCommand: testCommandFor(ctx),
+          runtime: ctx.execution.runtime,
+          resumeFromRemote: true,
+          fallbackToDefaultBranch: true,
+        });
+      }
+    } catch (err) {
+      if (ctx.repository) {
+        // The row keeps `worktree_evicted_at`; the local branch goes too,
+        // as eviction left it.
+        try {
+          await deps.worktrees.remove(ctx.execution.id, {
+            repositoryName: ctx.repository.name,
+            branch: ctx.execution.role === "implementation" ? ctx.execution.branch : null,
+          });
+        } catch (removeErr) {
+          log.warn(
+            { err: errMessage(removeErr) },
+            "could not remove the worktree of a failed recreation",
+          );
+        }
+      }
+      return refuse(
+        "WORKTREE_UNAVAILABLE",
+        `evicted worktree could not be recreated: ${setupDetail(err)}`,
+      );
+    }
+    if (prepared.startPoint === "default_branch") {
+      log.warn(
+        { branch: prepared.branch, startPoint: prepared.startPoint },
+        "remote branch missing, evicted worktree recreated from the default branch",
+      );
+    }
+    await db.transaction(async (tx) => {
+      await lockTaskForTool(tx, ctx.task.id, "key share");
+      await restoreEvictedWorktreeRow(tx, ctx.execution.id, prepared);
+      await appendEvent(tx, {
+        taskId: ctx.task.id,
+        executionId: ctx.execution.id,
+        type: "worktree.prepared",
+        payload: {
+          worktree_path: prepared.worktreePath,
+          branch: prepared.branch,
+          ...(prepared.startPoint ? { start_point: prepared.startPoint } : {}),
+        },
+      });
+    });
+    return prepared.worktreePath;
+  }
+
   async function resume(input: ResumeInput): Promise<{ done: Promise<void> }> {
     const { executionId } = input;
     const refuse = (code: ResumeErrorCode, message: string): never => {
@@ -924,6 +1045,9 @@ export function createRunner(deps: RunnerDeps): Runner {
       const found = deps.adapters[execution.runtime];
       if (!found) return refuse("NO_ADAPTER", `${execution.runtime} adapter not available`);
       adapter = found;
+      if (execution.worktreeEvictedAt !== null) {
+        worktreePath = await restoreEvictedWorktree(ctx, refuse, log);
+      }
       if (!(await adapter.canResume(sessionId, worktreePath))) {
         refuse("CANNOT_RESUME", "session cannot be resumed");
       }
@@ -949,6 +1073,10 @@ export function createRunner(deps: RunnerDeps): Runner {
         const pinned = (await loadRunnerContext(tx, executionId))?.execution;
         if (pinned?.host !== host || pinned.workerId !== execution.workerId) {
           refuse("OTHER_HOST", "execution is no longer pinned to this host");
+        }
+        // §6.6: the worktree sweeper may have evicted it since then.
+        if (pinned?.worktreeEvictedAt != null) {
+          refuse("WORKTREE_UNAVAILABLE", "worktree was evicted after the context loaded");
         }
         await transition(tx, {
           entity: "execution",
