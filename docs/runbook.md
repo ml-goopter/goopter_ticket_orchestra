@@ -170,7 +170,7 @@ From `apps/worker/src/config.ts` (the source of truth; `.env.example` and
 | `WORKER_TOOLS_PORT` | `4317` | agent-tools MCP server, loopback only |
 | `WORKER_DISK_HIGH_WATER_PCT` | `85` | integer 1-100, worktree sweeper rule 4 |
 | `AGENT_QUIET_TIMEOUT_MS` | `1200000` (20 min) | integer 1000 - 86400000 |
-| `PRICING_FILE` | `config/pricing.json` | resolved against `WorkingDirectory` |
+| `PRICING_FILE` | `config/pricing.json` | a relative path is resolved against the repository root, not `WorkingDirectory`; a missing or invalid file stops the worker at startup |
 | `PUBLIC_URL` | none (optional) | used in Jira comment links |
 | `JIRA_BASE_URL` | none (optional) | with `JIRA_EMAIL`/`JIRA_API_TOKEN`, enables the Jira poller and write-back loop |
 | `JIRA_EMAIL` | none (optional) | see above |

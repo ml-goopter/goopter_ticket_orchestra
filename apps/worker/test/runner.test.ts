@@ -48,6 +48,7 @@ import {
 import { loadConfig } from "../src/config.js";
 import type { LogFields, Logger } from "../src/logger.js";
 import { createDefaultPhases } from "../src/phases/index.js";
+import type { PricingTable } from "../src/pricing/index.js";
 import {
   DEFAULT_REVIEW_WRAPPER_BIN,
   PROTOCOL_VIOLATION_DETAIL,
@@ -86,6 +87,9 @@ const HOST = "runner-host";
 const NOW = new Date("2026-09-25T10:00:00.000Z");
 const TOOLS_URL = "http://127.0.0.1:4999/mcp";
 const BASE_PATH = "/usr/bin:/bin";
+// §9.7: not exercised by these tests (all fake-adapter usage events carry
+// their own `costUsd`, as Claude's do); the runner still requires a table.
+const PRICING: PricingTable = {};
 
 const SPEC = {
   repository: "repo",
@@ -398,6 +402,7 @@ function makeRunner(
       },
     },
     adapters: options.adapters ?? { claude: adapter },
+    pricing: PRICING,
     toolsUrl: () => TOOLS_URL,
     githubToken: "gh-token",
     quietTimeoutMs: options.quietTimeoutMs ?? 10_000,

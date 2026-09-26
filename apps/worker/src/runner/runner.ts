@@ -20,6 +20,7 @@ import {
   DEFAULT_EXECUTION_MODEL,
   addExecutionUsageTotals,
   appendEvent,
+  getExecutionCostUsd,
   getExecutionState,
   getRevisionByStatus,
   getSpecRevisionById,
@@ -59,6 +60,7 @@ import {
 } from "../agent-tools/registry.js";
 import { issueToken, revokeToken } from "../agent-tools/tokens.js";
 import type { Logger } from "../logger.js";
+import { priceUsage, type PricingTable } from "../pricing/index.js";
 import type { ClaimedExecution, OnClaimed } from "../scheduler/claim.js";
 import {
   SetupFailedError,
@@ -125,6 +127,25 @@ export const DEFAULT_REVIEW_WRAPPER_BIN = fileURLToPath(
 export const PROTOCOL_VIOLATION_DETAIL =
   "turn ended without a terminal call: expected report_pr_created, report_failed, or a blocking raise_issue";
 
+/**
+ * §9.5 adapter_error classification decides retriable vs terminal, but a
+ * budget failure is neither: it is `budget_exceeded` (§9.5 business,
+ * NEEDS_HUMAN), decided before that classification ever runs. Same pattern
+ * as `packages/adapters/src/retriable.ts`'s budget line; not imported
+ * because the adapters package exposes no budget-specific classifier and
+ * this task may not add one there.
+ */
+export const BUDGET_ERROR_PATTERN =
+  /\berror_max_budget_usd\b|\bmax[_ ]budget\b|\bbudget\s+(?:exceeded|exhausted)\b/i;
+
+/**
+ * §9.7 item 4: runtimes whose adapter cannot enforce `maxBudgetUsd` itself,
+ * so the runner must abort the session when the cumulative cost crosses it.
+ * Claude relies on its own enforcement (the `error` path above); Codex has
+ * no such option, so its usage is priced and checked here.
+ */
+const RUNTIMES_WITHOUT_BUDGET_ENFORCEMENT = new Set<Runtime>(["codex"]);
+
 export interface RunnerDeps {
   db: Db;
   registry: ExecutionRegistry;
@@ -156,6 +177,12 @@ export interface RunnerDeps {
   };
   /** One adapter per runtime (§7.3). A missing runtime fails the execution. */
   adapters: Partial<Record<Runtime, AgentAdapter>>;
+  /**
+   * `config/pricing.json` (§9.7), loaded once at startup. Prices a usage
+   * event that carries no `costUsd` of its own (Codex); an unpriced model
+   * records `cost_usd = NULL` rather than failing the execution.
+   */
+  pricing: PricingTable;
   /** Agent-tools MCP url; read at session start, after the server listens. */
   toolsUrl: () => string;
   /** Jira `getIssue`, when JIRA_* is configured (Q11). */
@@ -360,11 +387,20 @@ export interface Runner {
   shutdown(timeoutMs?: number): Promise<void>;
 }
 
-type StopReason = "cancelled" | "gone" | "hung" | "blocking_timeout" | "shutdown";
+type StopReason =
+  | "cancelled"
+  | "gone"
+  | "hung"
+  | "blocking_timeout"
+  | "shutdown"
+  /** §9.7 item 4: a runtime that cannot enforce its own budget cap crossed it. */
+  | "budget_exceeded";
 
 class RunState {
   readonly controller = new AbortController();
   stopReason: StopReason | null = null;
+  /** Set with a `budget_exceeded` stop: the end_detail `afterTurn` records. */
+  stopDetail: string | undefined;
   readonly stopped: Promise<void>;
   done: Promise<void> = Promise.resolve();
   private resolveStopped!: () => void;
@@ -375,9 +411,10 @@ class RunState {
     });
   }
 
-  stop(reason: StopReason): void {
+  stop(reason: StopReason, detail?: string): void {
     if (this.stopReason !== null) return;
     this.stopReason = reason;
+    this.stopDetail = detail;
     this.controller.abort();
     this.resolveStopped();
   }
@@ -388,7 +425,7 @@ type TurnEnd =
   | { kind: "exhausted" }
   | { kind: "error"; message: string; retriable: boolean }
   | { kind: "thrown"; message: string }
-  | { kind: "stopped"; reason: StopReason };
+  | { kind: "stopped"; reason: StopReason; detail?: string };
 
 const ENDED_STATES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 
@@ -431,7 +468,7 @@ function createWriteQueue(log: Logger) {
 }
 
 export function createRunner(deps: RunnerDeps): Runner {
-  const { db, registry, logger, workerId, host } = deps;
+  const { db, registry, logger, workerId, host, pricing } = deps;
   const now = deps.now ?? (() => new Date());
   const timings: RunnerTimings = { ...DEFAULT_RUNNER_TIMINGS, ...deps.timings };
   const reviewWrapperBin = deps.reviewWrapperBin ?? DEFAULT_REVIEW_WRAPPER_BIN;
@@ -584,6 +621,14 @@ export function createRunner(deps: RunnerDeps): Runner {
     ctx.execution.model === DEFAULT_EXECUTION_MODEL
       ? undefined
       : ctx.execution.model;
+
+  /**
+   * §7 StartRequest/ResumeRequest `maxBudgetUsd`: the task's project cap
+   * (C55, a per-execution cap, not a cumulative project total), omitted
+   * when the project has none.
+   */
+  const budgetFor = (ctx: RunnerContext): number | undefined =>
+    ctx.project.maxBudgetUsd === null ? undefined : Number(ctx.project.maxBudgetUsd);
 
   /**
    * §6.4: renews the lease every `leaseRenewMs` while `body` runs. Spec
@@ -758,14 +803,14 @@ export function createRunner(deps: RunnerDeps): Runner {
             state.stopped.then(() => null),
           ]);
           if (next === null) {
-            end = { kind: "stopped", reason: state.stopReason! };
+            end = { kind: "stopped", reason: state.stopReason!, detail: state.stopDetail };
             break;
           }
           if ("error" in next) {
             finished = true;
             end =
               state.stopReason !== null
-                ? { kind: "stopped", reason: state.stopReason }
+                ? { kind: "stopped", reason: state.stopReason, detail: state.stopDetail }
                 : { kind: "thrown", message: redact(errMessage(next.error)) };
             break;
           }
@@ -800,7 +845,7 @@ export function createRunner(deps: RunnerDeps): Runner {
               );
             }
           } else if (event.type === "usage") {
-            await writes.push("usage", () => recordUsage(ctx, usageKind, event));
+            await writes.push("usage", () => recordUsage(state, ctx, usageKind, event));
           } else if (event.type === "error") {
             end = {
               kind: "error",
@@ -896,13 +941,46 @@ export function createRunner(deps: RunnerDeps): Runner {
     }
   }
 
-  /** `usage` event: one `execution_usage` row, totals, `usage.recorded`. */
+  /**
+   * `usage` event. Only runtimes with no budget enforcement of their own
+   * (`RUNTIMES_WITHOUT_BUDGET_ENFORCEMENT`, currently just Codex, §9.7) are
+   * priced against the loaded pricing table: those adapters never report a
+   * `costUsd`, so an absent one always means "price it". Every other
+   * runtime (Claude) stores `event.costUsd` as reported, defaulting to `0`
+   * — an absent `costUsd` there is a later per-model usage row the adapter
+   * has nothing new to add for, not an unpriced one, and must not be run
+   * through the pricing table or warn as an unknown model. An unpriced
+   * Codex model stores `cost_usd = NULL` and adds nothing to the totals.
+   *
+   * §9.7 item 4: once a priced event lands, the same runtimes are checked
+   * against the project's `max_budget_usd`; crossing it aborts the session
+   * the same way the quiet timer and a cancel do. Claude relies on the
+   * adapter's own enforcement (the `error` path in `afterTurn`) and is
+   * never aborted here.
+   */
   async function recordUsage(
+    state: RunState,
     ctx: RunnerContext,
     kind: "main" | "resume",
     event: Extract<AgentEvent, { type: "usage" }>,
   ): Promise<void> {
-    const costUsd = String(event.costUsd ?? 0);
+    const runtimeIsPriced = RUNTIMES_WITHOUT_BUDGET_ENFORCEMENT.has(
+      ctx.execution.runtime,
+    );
+    const priced = runtimeIsPriced
+      ? (event.costUsd ??
+        priceUsage(pricing, {
+          model: event.model,
+          input: event.input,
+          cached: event.cached,
+          output: event.output,
+        }))
+      : null;
+    const costUsd = runtimeIsPriced
+      ? priced === null
+        ? null
+        : String(priced)
+      : String(event.costUsd ?? 0);
     await db.transaction(async (tx) => {
       await lockTaskForTool(tx, ctx.task.id, "key share");
       const usage = await insertExecutionUsage(tx, {
@@ -938,6 +1016,22 @@ export function createRunner(deps: RunnerDeps): Runner {
         },
       });
     });
+
+    if (
+      priced !== null &&
+      ctx.project.maxBudgetUsd !== null &&
+      RUNTIMES_WITHOUT_BUDGET_ENFORCEMENT.has(ctx.execution.runtime)
+    ) {
+      const total = await getExecutionCostUsd(db, ctx.execution.id);
+      const maxBudget = Number(ctx.project.maxBudgetUsd);
+      const totalCost = total === null ? 0 : Number(total);
+      if (totalCost > maxBudget) {
+        state.stop(
+          "budget_exceeded",
+          `cost ${totalCost.toFixed(4)} USD exceeded budget ${maxBudget.toFixed(4)} USD`,
+        );
+      }
+    }
   }
 
   /**
@@ -964,9 +1058,17 @@ export function createRunner(deps: RunnerDeps): Runner {
           );
           return;
         }
+        if (end.reason === "budget_exceeded") {
+          await endFailed(ctx, "budget_exceeded", end.detail ?? "budget exceeded");
+          return;
+        }
         if (end.reason !== "blocking_timeout") return;
         break;
       case "error":
+        if (BUDGET_ERROR_PATTERN.test(end.message)) {
+          await endFailed(ctx, "budget_exceeded", end.message);
+          return;
+        }
         await endFailed(
           ctx,
           "adapter_error",
@@ -1215,6 +1317,7 @@ export function createRunner(deps: RunnerDeps): Runner {
           sessionId: session.sessionId,
           usageBaseline: baseline,
           ...(testCommand ? { testCommand } : {}),
+          ...(budgetFor(ctx) !== undefined ? { maxBudgetUsd: budgetFor(ctx) } : {}),
         },
         signal,
       ),
@@ -1357,9 +1460,6 @@ export function createRunner(deps: RunnerDeps): Runner {
       : startPrompt;
 
     if (state.stopReason !== null) return;
-    // TODO(GOT.44/GOT.45): pass `maxBudgetUsd` once `projects.max_budget_usd`
-    // exists (GOT.44) and the adapters honour it (GOT.45). Until then
-    // `budget_exceeded` is classified in retry.ts but never produced (C29).
     await runSession(state, ctx, "main", log, (token, signal) =>
       adapter.start(
         {
@@ -1371,6 +1471,7 @@ export function createRunner(deps: RunnerDeps): Runner {
           mcp: { url: deps.toolsUrl(), token },
           env: agentEnv(token),
           ...(testCommand ? { testCommand } : {}),
+          ...(budgetFor(ctx) !== undefined ? { maxBudgetUsd: budgetFor(ctx) } : {}),
         },
         signal,
       ),
@@ -1502,6 +1603,7 @@ export function createRunner(deps: RunnerDeps): Runner {
           allowedTools: "spec",
           mcp: { url: deps.toolsUrl(), token },
           env: agentEnv(token),
+          ...(budgetFor(ctx) !== undefined ? { maxBudgetUsd: budgetFor(ctx) } : {}),
         },
         signal,
       ),
@@ -1932,6 +2034,7 @@ export function createRunner(deps: RunnerDeps): Runner {
                   mcp: { url: deps.toolsUrl(), token },
                   env: agentEnv(token),
                   ...(testCommand ? { testCommand } : {}),
+                  ...(budgetFor(ctx) !== undefined ? { maxBudgetUsd: budgetFor(ctx) } : {}),
                 },
                 signal,
               ),
@@ -1961,6 +2064,7 @@ export function createRunner(deps: RunnerDeps): Runner {
                 sessionId,
                 usageBaseline: baseline,
                 ...(testCommand ? { testCommand } : {}),
+                ...(budgetFor(ctx) !== undefined ? { maxBudgetUsd: budgetFor(ctx) } : {}),
               },
               signal,
             ),
