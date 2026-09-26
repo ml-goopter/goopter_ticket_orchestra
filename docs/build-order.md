@@ -2,7 +2,7 @@
 
 Execution order for the tracker tasks (GOT.10 to GOT.49). It refines docs/design.md §16 into waves: tasks in one wave have their dependencies met and own disjoint paths, so up to two run in parallel. Each task's plan and spec is approved by the user before dispatch (CLAUDE.md, workflow step 2).
 
-Status as of 2026-09-25, main at `66dc1e7` plus this change.
+Status as of 2026-09-25, main at `b71d7fa` plus this change.
 
 ## Completed
 
@@ -37,6 +37,7 @@ Status as of 2026-09-25, main at `66dc1e7` plus this change.
 | W6 | GOT.30 | worker: Jira comment write-back | #35 |
 | W7 | GOT.42 | web: issue detail view | #36 |
 | W7 | GOT.39 | worker: implementation role with review phase | #37 |
+| W7 | GOT.44 | cost: pricing table, /costs route, costs view | #38 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
@@ -49,7 +50,6 @@ Order within a wave is priority order. Critical path: GOT.31 → GOT.39 → GOT.
 | W7 | GOT.37 | worker: spec role execution | GOT.31 | M5 |
 | W7 | GOT.38 | web: spec builder split pane | GOT.22, 28, 32 | M5 |
 | W7 | GOT.43 | worker: failure classification and retry policy | GOT.26, 31 | M8 |
-| W7 | GOT.44 | cost: pricing table, /costs route, costs view | GOT.22, 31 | M8 |
 | W8 | GOT.46 | worker: GitHub poller | GOT.39 | M6 |
 | W8 | GOT.47 | worker: issue conversation and resume commands | GOT.33, 39 | M7 |
 | W9 | GOT.48 | E2E: sandbox ticket to merged PR through Claude | GOT.38 to 42, 46, 47 | M6 |
@@ -67,7 +67,9 @@ GOT.45 is ready now but stays in W9 per design §16 step 9, because it needs `co
 - GOT.46: call `applyCiFailure` from `packages/db/src/queries/ci.ts` inside a transaction that locks task then execution; it returns `{ applied: false, reason }` for a stale pull request id or head sha and the poller must treat that as "already superseded", not an error. `resume_with_ci_failure` carries `{ pull_request_id, head_sha, round, checks: [{ name, url, log_excerpt }] }` (PR #37).
 - GOT.46: `report_pr_created` now updates the task's single `pull_requests` row and resets it to open; the poller should key its state on `head_sha`, not on row identity (C17, C22, PR #37).
 - GOT.43/47: command handlers return `handled`, `unclaimed` or `skipped` (C20). Only an execution pinned to another host unclaims. A CI resume for an unpinned execution (host null after a dead-host release) is skipped and completed, leaving the task IMPLEMENTING with a COMPLETED execution; the retry policy's fresh-session fallback must pick these up (C21, PR #37).
-- GOT.43: `repositories.test_command` exists (C15, migration 0003); the runner passes it as the review test command. `projects.max_budget_usd` still does not exist (Q9).
+- GOT.43: `repositories.test_command` exists (C15, migration 0003); the runner passes it as the review test command.
+- GOT.45: `projects.max_budget_usd` exists (migration 0004, C29) but nothing reads it: the runner does not pass `maxBudgetUsd` to the adapter and no path produces `budget_exceeded`. Wire both with the Codex adapter, together with `apps/worker/src/pricing` for Codex usage; `execution_usage.cost_usd` is nullable for an unknown model (PR #38, C30).
+- GOT.48: the UI labels every Claude cost "estimated" (C28, design OI2) because the api cannot tell an API-key login from a subscription login. Revisit if the host reports it.
 - GOT.43/47: a `WorktreeManager.prepareImplementation` call must follow the end of any earlier session for the same task, because a stale worktree holding the task branch is detached (PR #22).
 - All tasks: run `pnpm typecheck` (or build) before `pnpm test` in a fresh checkout. Worker tests load workspace packages from `dist`, and a stale `dist` fails tests unrelated to the change.
 - GOT.43: the claim inserts the execution QUEUED and moves it to ASSIGNED but never writes the §9.6 `execution.queued` event.
