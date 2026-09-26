@@ -17,3 +17,15 @@ export {
   type StartJiraPollerOptions,
   type StopJiraPoller,
 } from "./poller.js";
+export {
+  DEFAULT_JIRA_WRITEBACK_INTERVAL_MS,
+  DEFAULT_JIRA_WRITEBACK_JITTER_RATIO,
+  JIRA_WRITEBACK_BATCH_LIMIT,
+  runJiraWriteback,
+  startJiraWriteback,
+  writebackMarker,
+  type RunJiraWritebackOptions,
+  type StartJiraWritebackOptions,
+  type StopJiraWriteback,
+  type WritebackKind,
+} from "./writeback.js";

@@ -1,8 +1,11 @@
 import { TaskState } from "@orchestra/core";
-import { and, eq, notInArray } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, max, notInArray, or, sql } from "drizzle-orm";
 import { appendEvent } from "../events.js";
+import { executionEvents } from "../schema/events.js";
 import { projects } from "../schema/projects.js";
-import { tasks } from "../schema/tasks.js";
+import { pullRequests } from "../schema/pull_requests.js";
+import { specificationApprovals, tasks } from "../schema/tasks.js";
+import { users } from "../schema/users.js";
 import { transition, type Actor, type DbOrTx, type Tx } from "../transition.js";
 import { listActiveExecutionIds } from "./task-cost.js";
 
@@ -174,4 +177,106 @@ export async function failJiraTaskNotFound(
       reason: `Jira ticket ${input.jiraKey} returned 404 and no longer exists`,
     },
   });
+}
+
+/**
+ * Current highest `execution_events.id`, or `0n` when the table is empty
+ * (design.md §11.1 write-back). The Jira write-back loop starts its cursor
+ * here (C11): no historical replay on a fresh worker, only events appended
+ * from this moment on.
+ */
+export async function maxExecutionEventId(db: DbOrTx): Promise<bigint> {
+  const [row] = await db.select({ id: max(executionEvents.id) }).from(executionEvents);
+  return row?.id ?? 0n;
+}
+
+/** One `execution_events` row the Jira write-back loop can act on (design.md §11.1). */
+export interface JiraWritebackEventRow {
+  id: bigint;
+  type: "spec.approved" | "pull_request.created" | "task.state_changed";
+  payload: unknown;
+  taskId: string;
+  jiraKey: string;
+  jiraProjectId: string;
+  /** `tasks.needs_human_reason`, current as of the read (may postdate the event). */
+  needsHumanReason: string | null;
+  /** `pull_requests.url` for the task, or null when it has no PR yet. */
+  pullRequestUrl: string | null;
+}
+
+const WRITEBACK_SIMPLE_TYPES = ["spec.approved", "pull_request.created"] as const;
+
+/**
+ * Loads write-back trigger events with id > `after` (design.md §11.1 C11):
+ * `spec.approved`, `pull_request.created`, and `task.state_changed` whose
+ * payload's `to` is `READY_FOR_MERGE` or `NEEDS_HUMAN`, ascending, capped at
+ * `limit`. Joined with the task's `jira_key`/`project_id`/`needs_human_reason`
+ * and the task's `pull_requests.url` (at most one row per task), so the
+ * worker never needs a second round trip, or `drizzle-orm`, to build a
+ * comment.
+ */
+export async function listJiraWritebackEvents(
+  db: DbOrTx,
+  after: bigint,
+  limit = 200,
+): Promise<JiraWritebackEventRow[]> {
+  const rows = await db
+    .select({
+      id: executionEvents.id,
+      type: executionEvents.type,
+      payload: executionEvents.payload,
+      taskId: tasks.id,
+      jiraKey: tasks.jiraKey,
+      jiraProjectId: tasks.projectId,
+      needsHumanReason: tasks.needsHumanReason,
+      pullRequestUrl: pullRequests.url,
+    })
+    .from(executionEvents)
+    .innerJoin(tasks, eq(tasks.id, executionEvents.taskId))
+    .leftJoin(pullRequests, eq(pullRequests.taskId, tasks.id))
+    .where(
+      and(
+        gt(executionEvents.id, after),
+        or(
+          inArray(executionEvents.type, WRITEBACK_SIMPLE_TYPES),
+          and(
+            eq(executionEvents.type, "task.state_changed"),
+            sql`(${executionEvents.payload} ->> 'to') in ('READY_FOR_MERGE', 'NEEDS_HUMAN')`,
+          ),
+        ),
+      ),
+    )
+    .orderBy(asc(executionEvents.id))
+    .limit(limit);
+
+  return rows.map((row) => ({
+    ...row,
+    type: row.type as JiraWritebackEventRow["type"],
+  }));
+}
+
+/**
+ * The display name of the user who approved `revisionId` (design.md §11.1
+ * "spec approved"): the `specification_approvals` row for that revision,
+ * falling back to `actorId` — the `spec.approved` event's actor — when the
+ * approval row is missing. Null when neither resolves to a user.
+ */
+export async function getSpecApprovalDisplayName(
+  db: DbOrTx,
+  revisionId: string,
+  actorId: string | null,
+): Promise<string | null> {
+  const [approval] = await db
+    .select({ displayName: users.displayName })
+    .from(specificationApprovals)
+    .innerJoin(users, eq(users.id, specificationApprovals.approvedBy))
+    .where(eq(specificationApprovals.revisionId, revisionId));
+  if (approval) return approval.displayName;
+
+  if (!actorId) return null;
+  const [actor] = await db
+    .select({ displayName: users.displayName })
+    .from(users)
+    .where(eq(users.id, actorId));
+  return actor?.displayName ?? null;
 }
