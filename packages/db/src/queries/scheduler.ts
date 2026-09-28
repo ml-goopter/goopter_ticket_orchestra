@@ -148,9 +148,21 @@ export async function getClaimWorker(
 }
 
 /**
- * Executions on `host` holding a slot: `ASSIGNED` and `RUNNING` (§6.3, the
- * same rule as `listWorkersWithSlots`). `WAITING_FOR_USER` frees its slot
- * (D5).
+ * Executions on `host` holding a worker slot (§6.3): `ASSIGNED` and
+ * `RUNNING`, except a spec execution `RUNNING` between turns. `WAITING_FOR_USER`
+ * frees its slot (D5).
+ *
+ * GOT.56 (O1): a spec execution stays `RUNNING` between chat turns (C42) but
+ * has no agent process then. Its agent-tools token is issued before each
+ * turn's adapter call and revoked when the turn ends (§8, §9.3), so a
+ * `RUNNING` spec execution holds a slot only while `tools_token_hash` is set.
+ * An `ASSIGNED` spec execution (first turn starting) always holds one.
+ *
+ * Race bound: spec turns start without a capacity check (they never did), and
+ * a turn whose token commits after this count read is not seen by that claim.
+ * Live agent processes can therefore exceed `max_concurrent` by at most the spec
+ * turns in flight, each only until its turn ends. No claim lands while this
+ * count is at `max_concurrent`.
  */
 export async function countSlotHoldingExecutions(
   db: DbOrTx,
@@ -163,6 +175,13 @@ export async function countSlotHoldingExecutions(
       and(
         eq(executions.host, host),
         inArray(executions.state, [...SLOT_HOLDING_STATES]),
+        not(
+          and(
+            eq(executions.role, "spec"),
+            eq(executions.state, "RUNNING"),
+            isNull(executions.toolsTokenHash),
+          )!,
+        ),
       ),
     );
   return row?.n ?? 0;
