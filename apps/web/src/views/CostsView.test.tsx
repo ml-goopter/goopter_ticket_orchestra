@@ -23,6 +23,31 @@ function projectRows() {
   ];
 }
 
+const ZERO_KIND = { cost_usd: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, unpriced_rows: 0 };
+
+function twoProjectRows() {
+  return [
+    {
+      key: { id: "p1", label: "Project A" },
+      cost_usd: 1,
+      input_tokens: 100,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      unpriced_rows: 0,
+      by_kind: { main: ZERO_KIND, review: ZERO_KIND, resume: ZERO_KIND },
+    },
+    {
+      key: { id: "p2", label: "Project B" },
+      cost_usd: 2,
+      input_tokens: 200,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      unpriced_rows: 0,
+      by_kind: { main: ZERO_KIND, review: ZERO_KIND, resume: ZERO_KIND },
+    },
+  ];
+}
+
 describe("CostsView", () => {
   it("shows a loading state before the first fetch resolves", () => {
     const request = vi.fn(() => new Promise<never>(() => {}));
@@ -41,6 +66,43 @@ describe("CostsView", () => {
     const row = screen.getByText("CST1 project").closest("tr")!;
     expect(within(row).getByText("$1.75")).toBeTruthy();
     expect(within(row).getByText("190")).toBeTruthy();
+  });
+
+  it("formats a large token count with thousands separators", async () => {
+    const request = vi.fn().mockResolvedValue([
+      {
+        key: { id: "p1", label: "Big project" },
+        cost_usd: 12.5,
+        input_tokens: 788403,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+        unpriced_rows: 0,
+        by_kind: { main: ZERO_KIND, review: ZERO_KIND, resume: ZERO_KIND },
+      },
+    ]);
+    render(<CostsView request={request} />);
+
+    await waitFor(() => expect(screen.getByText("Big project")).toBeTruthy());
+    expect(screen.getByText("788,403")).toBeTruthy();
+    expect(screen.getByText("$12.50")).toBeTruthy();
+  });
+
+  it("shows no totals row for a single row", async () => {
+    const request = vi.fn().mockResolvedValue(projectRows());
+    render(<CostsView request={request} />);
+
+    await waitFor(() => expect(screen.getByText("CST1 project")).toBeTruthy());
+    expect(screen.queryByText("Total")).toBeNull();
+  });
+
+  it("shows a totals row summing cost and token columns when there is more than one row", async () => {
+    const request = vi.fn().mockResolvedValue(twoProjectRows());
+    render(<CostsView request={request} />);
+
+    await waitFor(() => expect(screen.getByText("Project A")).toBeTruthy());
+    const totalsRow = screen.getByText("Total").closest("tr")!;
+    expect(within(totalsRow).getByText("$3.00")).toBeTruthy();
+    expect(within(totalsRow).getByText("300")).toBeTruthy();
   });
 
   it("shows an empty state when there are no rows", async () => {
