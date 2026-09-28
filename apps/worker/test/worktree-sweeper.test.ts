@@ -24,6 +24,11 @@ import {
   vi,
 } from "vitest";
 import { loadConfig } from "../src/config.js";
+import {
+  DockerError,
+  type ExecutionContainerOps,
+  type LabelledContainer,
+} from "../src/containers/index.js";
 import type { LogFields, Logger } from "../src/logger.js";
 import {
   WORKTREE_SWEEPER_EVERY_TICKS,
@@ -125,6 +130,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   records.length = 0;
+  containers = fakeContainers();
   await raw(
     "truncate table projects, agent_workers, audit_events restart identity cascade",
   );
@@ -133,6 +139,51 @@ beforeEach(async () => {
 });
 
 // ---------------------------------------------------------------- helpers
+
+/**
+ * Stands in for Docker in every test, so no test lists or removes a real
+ * container on this host. Records removals by execution id and by
+ * container id.
+ */
+function fakeContainers(
+  options: {
+    listed?: LabelledContainer[];
+    failList?: boolean;
+    failRemove?: (ref: string) => boolean;
+  } = {},
+): { ops: ExecutionContainerOps; removed: string[]; removedForExecution: string[] } {
+  const removed: string[] = [];
+  const removedForExecution: string[] = [];
+  const failure = (args: string[]) =>
+    new DockerError({ reason: "failed", args, exitCode: 1, stderr: "docker exploded" });
+  return {
+    removed,
+    removedForExecution,
+    ops: {
+      async list() {
+        if (options.failList) {
+          throw new DockerError({
+            reason: "unavailable",
+            args: ["ps"],
+            exitCode: 1,
+            stderr: "Cannot connect to the Docker daemon",
+          });
+        }
+        return options.listed ?? [];
+      },
+      async removeForExecution(executionId) {
+        if (options.failRemove?.(executionId)) throw failure(["rm"]);
+        removedForExecution.push(executionId);
+      },
+      async remove(ref) {
+        if (options.failRemove?.(ref)) throw failure(["rm"]);
+        removed.push(ref);
+      },
+    },
+  };
+}
+
+let containers = fakeContainers();
 
 function raw(text: string, params: unknown[] = []): Promise<unknown[]> {
   return db.$client.unsafe(text, params as never[]) as unknown as Promise<
@@ -400,6 +451,7 @@ function ctx(highWaterPct = 85): TickContext {
 async function sweep(options: WorktreeSweeperOptions = {}): Promise<void> {
   await createWorktreeSweeperPhase({
     diskUsage: async () => 10,
+    containers: containers.ops,
     ...options,
   }).run(ctx());
 }
@@ -764,6 +816,7 @@ describe("rule four: disk usage above the high-water mark (§6.6)", () => {
     const ops = recordingOps({ onRemove: () => void (usage -= 4) });
 
     await createWorktreeSweeperPhase({
+      containers: containers.ops,
       worktrees: ops,
       diskUsage: async () => usage,
     }).run(ctx(85));
@@ -787,6 +840,7 @@ describe("rule four: disk usage above the high-water mark (§6.6)", () => {
     const ops = recordingOps();
 
     await createWorktreeSweeperPhase({
+      containers: containers.ops,
       worktrees: ops,
       diskUsage: async () => 99,
     }).run(ctx(85));
@@ -806,6 +860,7 @@ describe("rule four: disk usage above the high-water mark (§6.6)", () => {
     const ops = recordingOps();
 
     await createWorktreeSweeperPhase({
+      containers: containers.ops,
       worktrees: ops,
       diskUsage: async () => 50,
     }).run(ctx(85));
@@ -886,6 +941,7 @@ describe("failure isolation (§6.6)", () => {
     const ops = recordingOps();
 
     await createWorktreeSweeperPhase({
+      containers: containers.ops,
       worktrees: ops,
       diskUsage: async () => {
         throw new Error("statfs exploded");
@@ -1079,7 +1135,7 @@ describe("registration (§6.6)", () => {
     });
     const phase = createDefaultPhases(
       {},
-      { worktrees: recordingOps(), diskUsage: async () => 10 },
+      { worktrees: recordingOps(), diskUsage: async () => 10, containers: containers.ops },
     ).find((p) => p.name === "worktree_sweeper")!;
 
     expect(phase.every).toBe(720);
@@ -1087,6 +1143,229 @@ describe("registration (§6.6)", () => {
 
     await expectRemoved(done);
     expect(records.map((r) => r.msg)).not.toContain("phase not implemented yet");
+  });
+});
+
+describe("agent containers follow their worktree (§9.9 Removal, §6.6)", () => {
+  it("rule one removes the execution's container with its worktree", async () => {
+    const done = await seedWithWorktree({
+      taskState: "DONE",
+      state: "COMPLETED",
+      endedAt: at(-25 * HOUR),
+    });
+
+    await sweep();
+
+    await expectRemoved(done);
+    expect(containers.removedForExecution).toEqual([done.executionId]);
+  });
+
+  it("rule three removes the execution's container when it evicts the worktree", async () => {
+    const waiting = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "WAITING_FOR_USER",
+      lastEventAt: at(-15 * DAY),
+    });
+
+    await sweep();
+
+    await expectEvicted(waiting, false);
+    expect(containers.removedForExecution).toEqual([waiting.executionId]);
+  });
+
+  it("removes the container of the execution that holds a taken-over worktree (C33)", async () => {
+    const s = await seedReusedWorktree({
+      taskState: "DONE",
+      state: "COMPLETED",
+      endedAt: at(-25 * HOUR),
+    });
+
+    await sweep();
+
+    await expectRemoved(s);
+    expect(containers.removedForExecution).toEqual([s.executionId]);
+  });
+
+  it("leaves the container when the worktree is kept", async () => {
+    const young = await seedWithWorktree({
+      taskState: "DONE",
+      state: "COMPLETED",
+      endedAt: at(-23 * HOUR),
+    });
+    const running = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "RUNNING",
+      startedAt: at(-40 * DAY),
+    });
+
+    await sweep();
+
+    await expectUntouched(young);
+    await expectUntouched(running);
+    expect(containers.removedForExecution).toEqual([]);
+  });
+
+  it("touches no container when no container ops are passed (worker without the docker capability)", async () => {
+    const done = await seedWithWorktree({
+      taskState: "DONE",
+      state: "COMPLETED",
+      endedAt: at(-25 * HOUR),
+    });
+    containers = fakeContainers({ listed: [{ id: "c-x", name: "x", executionId: "gone", taskId: null }] });
+
+    await createWorktreeSweeperPhase({ diskUsage: async () => 10 }).run(ctx());
+
+    await expectRemoved(done);
+    expect(containers.removed).toEqual([]);
+    expect(containers.removedForExecution).toEqual([]);
+    expect(records.filter((r) => /container/.test(r.msg))).toEqual([]);
+  });
+
+  it("a container removal failure is logged and never blocks the worktree cleanup", async () => {
+    const done = await seedWithWorktree({
+      taskState: "DONE",
+      state: "COMPLETED",
+      endedAt: at(-25 * HOUR),
+    });
+    const waiting = await seedWithWorktree({
+      taskState: "IMPLEMENTING",
+      state: "WAITING_FOR_USER",
+      lastEventAt: at(-15 * DAY),
+    });
+    containers = fakeContainers({ failRemove: () => true });
+
+    await sweep();
+
+    await expectRemoved(done);
+    await expectEvicted(waiting, false);
+    for (const executionId of [done.executionId, waiting.executionId]) {
+      expect(records).toContainEqual(
+        expect.objectContaining({
+          level: "warn",
+          msg: "agent container removal failed",
+          fields: expect.objectContaining({ executionId, err: expect.stringMatching(/docker exploded/) }),
+        }),
+      );
+    }
+    expect(records.filter((r) => r.level === "error")).toEqual([]);
+  });
+});
+
+describe("orphan agent containers (§9.9 Orphans)", () => {
+  const labelled = (id: string, executionId: string, taskId: string | null = null): LabelledContainer => ({
+    id,
+    name: `orchestra-exec-${executionId}`,
+    executionId,
+    taskId,
+  });
+
+  async function seedExecution(state: ExecutionState, host: string | null = HOST) {
+    const task = await seedTask("IMPLEMENTING");
+    const executionId = await insertExecution({ taskId: task.id, state, host });
+    return { taskId: task.id, executionId };
+  }
+
+  it("removes containers whose execution is terminal on this host or unknown, and keeps every other", async () => {
+    const failed = await seedExecution("FAILED");
+    const cancelled = await seedExecution("CANCELLED");
+    const completed = await seedExecution("COMPLETED");
+    const running = await seedExecution("RUNNING");
+    const assigned = await seedExecution("ASSIGNED");
+    const waiting = await seedExecution("WAITING_FOR_USER");
+    const queued = await seedExecution("QUEUED", null);
+    const otherHost = await seedExecution("FAILED", OTHER_HOST);
+    const noHost = await seedExecution("CANCELLED", null);
+    const unknown = "0b1e9c8e-1d6f-4c55-9d7e-2a1f3c4b5d6e";
+    containers = fakeContainers({
+      listed: [
+        labelled("c-failed", failed.executionId, failed.taskId),
+        labelled("c-cancelled", cancelled.executionId, cancelled.taskId),
+        labelled("c-completed", completed.executionId),
+        labelled("c-running", running.executionId, running.taskId),
+        labelled("c-assigned", assigned.executionId),
+        labelled("c-waiting", waiting.executionId),
+        labelled("c-queued", queued.executionId),
+        labelled("c-other-host", otherHost.executionId),
+        labelled("c-no-host", noHost.executionId),
+        labelled("c-unknown", unknown),
+        labelled("c-bogus", "not-an-execution-id"),
+      ],
+    });
+
+    await sweep();
+
+    expect(containers.removed.sort()).toEqual(
+      ["c-bogus", "c-cancelled", "c-completed", "c-failed", "c-unknown"].sort(),
+    );
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "info",
+        msg: "orphan agent container removed",
+        fields: expect.objectContaining({ container: "c-unknown", executionId: unknown }),
+      }),
+    );
+  });
+
+  it("skips a container whose task row another transaction holds, until the next sweep", async () => {
+    const failed = await seedExecution("FAILED");
+    containers = fakeContainers({ listed: [labelled("c-failed", failed.executionId)] });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((resolve) => (locked = resolve));
+    const holder = db.transaction(async (tx) => {
+      await lockTaskForTool(tx, failed.taskId);
+      locked();
+      await held;
+    });
+    await isLocked;
+
+    try {
+      await sweep();
+      expect(containers.removed).toEqual([]);
+    } finally {
+      release();
+      await holder;
+    }
+
+    await sweep();
+    expect(containers.removed).toEqual(["c-failed"]);
+  });
+
+  it("a failed container list is logged and the worktree rules still run", async () => {
+    const done = await seedWithWorktree({
+      taskState: "DONE",
+      state: "COMPLETED",
+      endedAt: at(-25 * HOUR),
+    });
+    containers = fakeContainers({ failList: true });
+
+    await sweep();
+
+    await expectRemoved(done);
+    expect(records).toContainEqual(
+      expect.objectContaining({ level: "warn", msg: "agent container list failed" }),
+    );
+  });
+
+  it("a failed orphan removal is logged and the next container is still removed", async () => {
+    const a = await seedExecution("FAILED");
+    const b = await seedExecution("FAILED");
+    containers = fakeContainers({
+      listed: [labelled("c-a", a.executionId), labelled("c-b", b.executionId)],
+      failRemove: (ref) => ref === "c-a",
+    });
+
+    await sweep();
+
+    expect(containers.removed).toEqual(["c-b"]);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        msg: "agent container removal failed",
+        fields: expect.objectContaining({ container: "c-a", executionId: a.executionId }),
+      }),
+    );
   });
 });
 
@@ -1163,6 +1442,28 @@ describe("approved spec worktrees (GOT.37 C46)", () => {
       expect((await execution(s.executionId)).worktreePath).toBe(s.worktreePath);
     },
   );
+
+  it("removes the spec execution's container with its worktree (§9.9 Removal)", async () => {
+    const s = await seedSpecWorktree({ taskState: "SPEC_APPROVED" });
+    await sweep({ worktrees: recordingOps() });
+    expect(existsSync(s.worktreePath)).toBe(false);
+    expect(containers.removedForExecution).toEqual([s.executionId]);
+  });
+
+  it("a spec container removal failure is logged and never blocks the worktree cleanup", async () => {
+    const s = await seedSpecWorktree({ taskState: "READY" });
+    containers = fakeContainers({ failRemove: () => true });
+    await sweep({ worktrees: recordingOps() });
+    expect(existsSync(s.worktreePath)).toBe(false);
+    expect((await execution(s.executionId)).worktreePath).toBeNull();
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        msg: "agent container removal failed",
+        fields: expect.objectContaining({ executionId: s.executionId }),
+      }),
+    );
+  });
 
   it("leaves a spec worktree on another host", async () => {
     const s = await seedSpecWorktree({ taskState: "SPEC_APPROVED", host: OTHER_HOST });

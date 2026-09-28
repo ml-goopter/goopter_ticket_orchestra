@@ -508,3 +508,72 @@ export async function restoreEvictedWorktree(
     })
     .where(eq(executions.id, executionId));
 }
+
+/**
+ * One execution named by an agent container's `orchestra.execution` label
+ * (design.md §9.9 "Orphans").
+ */
+export interface ContainerExecution {
+  executionId: string;
+  taskId: string;
+  state: (typeof executions.$inferSelect)["state"];
+  host: string | null;
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function containerExecutionQuery(db: DbOrTx) {
+  return db
+    .select({
+      executionId: executions.id,
+      taskId: executions.taskId,
+      state: executions.state,
+      host: executions.host,
+    })
+    .from(executions);
+}
+
+/**
+ * The executions among `executionIds` that exist, read without locks. Ids
+ * missing from the result are unknown. Label values that are not uuids
+ * cannot name an execution, so they are dropped before the query instead of
+ * failing the `uuid` cast.
+ */
+export async function listContainerExecutions(
+  db: DbOrTx,
+  executionIds: readonly string[],
+): Promise<ContainerExecution[]> {
+  const ids = [...new Set(executionIds.filter((id) => UUID_PATTERN.test(id)))];
+  if (ids.length === 0) return [];
+  return containerExecutionQuery(db).where(inArray(executions.id, ids));
+}
+
+/**
+ * Locks the task row, then the execution row, both `FOR UPDATE SKIP
+ * LOCKED`, and returns the execution's current state and host. Null when a
+ * row is gone, the execution is not the task's, or another transaction
+ * holds a row (retried on the next sweep). Holding the task lock keeps a
+ * resume from moving the execution while its container is removed.
+ */
+export async function lockContainerExecution(
+  tx: Tx,
+  input: { executionId: string; taskId: string },
+): Promise<ContainerExecution | null> {
+  const [task] = await tx
+    .select({ id: tasks.id })
+    .from(tasks)
+    .where(eq(tasks.id, input.taskId))
+    .for("update", { skipLocked: true });
+  if (!task) return null;
+
+  const [row] = await containerExecutionQuery(tx)
+    .where(
+      and(
+        eq(executions.id, input.executionId),
+        eq(executions.taskId, input.taskId),
+      ),
+    )
+    .for("update", { skipLocked: true });
+  return row ?? null;
+}

@@ -3,15 +3,22 @@ import {
   appendEvent,
   clearExecutionWorktree,
   listApprovedSpecWorktrees,
+  listContainerExecutions,
   listWorktreeCandidates,
   lockApprovedSpecWorktree,
+  lockContainerExecution,
   lockWorktreeCandidate,
   markWorktreeEvicted,
   type ApprovedSpecWorktree,
+  type ContainerExecution,
   type Db,
   type WorktreeCandidate,
   type WorktreeSweepClass,
 } from "@orchestra/db";
+import type {
+  ExecutionContainerOps,
+  LabelledContainer,
+} from "../containers/index.js";
 import type { Logger } from "../logger.js";
 import type { Phase } from "../tick.js";
 import { WorktreeManager } from "../worktrees/manager.js";
@@ -46,6 +53,12 @@ export interface WorktreeSweeperOptions {
   worktrees?: WorktreeOps;
   /** Defaults to `statfsUsagePct`. Tests inject a fake. */
   diskUsage?: DiskUsage;
+  /**
+   * Agent containers (§9.9), normally `dockerExecutionContainers()`. Only a
+   * worker with the `docker` capability passes it; omitted, the sweeper
+   * touches no container.
+   */
+  containers?: ExecutionContainerOps;
 }
 
 export interface WorktreeSweepInput {
@@ -58,6 +71,17 @@ export interface WorktreeSweepInput {
   now: Date;
   logger: Logger;
 }
+
+/**
+ * Execution states whose agent container the orphan pass removes: the
+ * execution has ended (§9.9 "removed when the execution ends"). A
+ * `COMPLETED` execution that is resumed later recreates its container.
+ */
+const CONTAINER_ENDED_STATES: ReadonlySet<ContainerExecution["state"]> = new Set([
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+]);
 
 /** What a candidate's rule does to it. */
 type Action = "remove" | "evict";
@@ -87,12 +111,21 @@ const errMessage = (err: unknown): string =>
  * appends `worktree.evicted`; the path and branch stay on the row for the
  * resume path. A candidate that fails is logged and the next one runs.
  *
+ * With `options.containers`, whenever a rule removes or evicts a worktree,
+ * the execution's agent container is removed too (§9.9 Removal). After rule three, the orphan
+ * pass removes every container labelled `orchestra.execution` whose
+ * execution has ended on this host or does not exist (§9.9 Orphans). A
+ * container failure is logged and never blocks worktree cleanup.
+ *
  * Lock order for one candidate: the per-repository lock of the worktree
  * manager, then the task row, then the execution row. The repository lock
  * is in-process, so Postgres cannot see a wait on it; taking it before the
  * row locks means the sweeper never holds a row while it waits behind a
  * fetch or push on the same repository. The runner never calls the manager
- * while holding a row lock, so the order is not inverted anywhere.
+ * while holding a row lock, so the order is not inverted anywhere. The
+ * container removal runs last, still holding the row locks, so a resume
+ * cannot reuse the container while it is being removed. The orphan pass
+ * takes the task row, then the execution row, and no repository lock.
  */
 export async function sweepWorktrees(
   input: WorktreeSweepInput,
@@ -102,6 +135,20 @@ export async function sweepWorktrees(
   const worktrees =
     options.worktrees ?? new WorktreeManager({ workspaceRoot });
   const diskUsage = options.diskUsage ?? statfsUsagePct;
+  const containers = options.containers;
+
+  /** Removes the execution's container. Logs a failure; never throws. */
+  const removeContainer = async (
+    executionId: string,
+    fields: Record<string, unknown>,
+  ): Promise<void> => {
+    if (!containers) return;
+    try {
+      await containers.removeForExecution(executionId);
+    } catch (err) {
+      logger.warn({ ...fields, err: errMessage(err) }, "agent container removal failed");
+    }
+  };
 
   /** Lists one class; a failed list is logged and yields nothing. */
   const list = async (
@@ -201,6 +248,7 @@ export async function sweepWorktrees(
               },
             });
           }
+          await removeContainer(row.executionId, fields);
           return "done" as const;
         }),
       );
@@ -250,6 +298,7 @@ export async function sweepWorktrees(
           if (!row || row.repositoryName !== repositoryName) return "gone" as const;
           await repo.remove(row.worktreePath, { branch: null });
           await clearExecutionWorktree(tx, row.executionId);
+          await removeContainer(row.executionId, fields);
           return "done" as const;
         }),
       );
@@ -280,6 +329,8 @@ export async function sweepWorktrees(
     }
   }
 
+  if (containers) await sweepOrphanContainers({ db, host, logger }, containers);
+
   // Rule four.
   const threshold = input.diskHighWaterPct;
   try {
@@ -301,6 +352,66 @@ export async function sweepWorktrees(
     logger.warn({ usage, threshold }, "workspace disk still above high water");
   } catch (err) {
     logger.error({ err: errMessage(err) }, "disk high-water check failed");
+  }
+}
+
+/**
+ * §9.9 Orphans, one pass. Lists containers labelled `orchestra.execution`
+ * (never any other) and removes each whose label names no execution, or an
+ * execution on `host` that has ended. An execution on another host, or on
+ * none, is left alone: its container's owner cannot be told apart here. A
+ * known execution is re-checked with its task and execution rows locked,
+ * and the container is removed under those locks. Never throws.
+ */
+async function sweepOrphanContainers(
+  input: Pick<WorktreeSweepInput, "db" | "host" | "logger">,
+  containers: ExecutionContainerOps,
+): Promise<void> {
+  const { db, host, logger } = input;
+  let listed: LabelledContainer[];
+  try {
+    listed = await containers.list();
+  } catch (err) {
+    logger.warn({ err: errMessage(err) }, "agent container list failed");
+    return;
+  }
+  if (listed.length === 0) return;
+
+  let known: Map<string, ContainerExecution>;
+  try {
+    const rows = await listContainerExecutions(
+      db,
+      listed.map((c) => c.executionId),
+    );
+    known = new Map(rows.map((row) => [row.executionId.toLowerCase(), row]));
+  } catch (err) {
+    logger.error({ err: errMessage(err) }, "agent container execution lookup failed");
+    return;
+  }
+
+  const ownedAndEnded = (row: ContainerExecution): boolean =>
+    row.host === host && CONTAINER_ENDED_STATES.has(row.state);
+
+  for (const container of listed) {
+    const fields = { container: container.id, executionId: container.executionId };
+    try {
+      const row = known.get(container.executionId.toLowerCase());
+      if (!row) {
+        await containers.remove(container.id);
+        logger.info({ ...fields, reason: "unknown" }, "orphan agent container removed");
+        continue;
+      }
+      if (!ownedAndEnded(row)) continue;
+      const removed = await db.transaction(async (tx) => {
+        const locked = await lockContainerExecution(tx, row);
+        if (!locked || !ownedAndEnded(locked)) return false;
+        await containers.remove(container.id);
+        return true;
+      });
+      if (removed) logger.info({ ...fields, reason: row.state }, "orphan agent container removed");
+    } catch (err) {
+      logger.warn({ ...fields, err: errMessage(err) }, "agent container removal failed");
+    }
   }
 }
 
