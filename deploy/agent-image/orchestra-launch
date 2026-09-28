@@ -1,0 +1,70 @@
+#!/bin/sh
+# In-container launcher (docs/design.md §9.9).
+#
+#   orchestra-launch <turn> -- <cmd> [args...]
+#
+# Starts <cmd> as the leader of a new process group, records that process
+# group id at /run/orchestra/<turn>.pid, passes stdin/stdout/stderr through
+# unchanged, and exits with <cmd>'s exit code.
+#
+# A separate `docker exec <container> kill -KILL -<pgid from the pid file>`
+# stops <cmd> and every process it spawned; this launcher's own `docker
+# exec` client then ends because `wait` below returns.
+#
+# `<turn>` is restricted to [A-Za-z0-9._-] so it can only ever name a single
+# file directly inside /run/orchestra: it never contains "/", so it cannot
+# address a path outside that directory.
+set -eu
+
+usage() {
+  echo "usage: orchestra-launch <turn> -- <cmd> [args...]" >&2
+  exit 2
+}
+
+pid_dir=/run/orchestra
+
+[ $# -ge 1 ] || usage
+turn=$1
+shift
+
+case "$turn" in
+  '')
+    echo "orchestra-launch: invalid turn '$turn'" >&2
+    exit 2
+    ;;
+  *[!A-Za-z0-9._-]*)
+    echo "orchestra-launch: invalid turn '$turn'" >&2
+    exit 2
+    ;;
+esac
+
+[ "${1:-}" = "--" ] || usage
+shift
+[ $# -ge 1 ] || usage
+
+mkdir -p "$pid_dir"
+pid_file="$pid_dir/$turn.pid"
+
+# `setsid <cmd>` does not fork: it calls setsid(2) on itself, which makes
+# its own pid both the leader of a new session and the leader of a new
+# process group, then execve()s <cmd> in place, inheriting stdin/stdout/
+# stderr unchanged. So $! below is <cmd>'s pid *and* its process group id.
+#
+# POSIX shells give an asynchronous ("&") command /dev/null on stdin unless
+# its stdin is explicitly redirected from an already-open descriptor,
+# rather than inherited implicitly. Duplicating our real stdin onto fd 3
+# first and redirecting the child's fd 0 from that counts as explicit, so
+# the real stdin (this launcher's own stdin, e.g. from `docker exec -i`)
+# still reaches <cmd>.
+exec 3<&0
+setsid "$@" 0<&3 3<&- &
+child=$!
+echo "$child" > "$pid_file"
+
+set +e
+wait "$child"
+status=$?
+set -e
+
+rm -f "$pid_file"
+exit "$status"
