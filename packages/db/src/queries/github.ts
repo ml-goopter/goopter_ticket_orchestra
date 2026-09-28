@@ -8,6 +8,7 @@ import { tasks } from "../schema/tasks.js";
 import { type Actor, transition, type Tx } from "../transition.js";
 import { insertNotification, lockExecutionForTool, lockTaskForTool } from "./agent-tools.js";
 import { applyCiFailure, type CiFailedCheck } from "./ci.js";
+import { clearReadyForMergeNotifications } from "./notifications.js";
 
 /**
  * Queries behind the GitHub poller (design.md §11.2, GOT.46). The poller
@@ -200,6 +201,11 @@ export async function markPullRequestMerged(
     .update(pullRequests)
     .set({ state: "merged", mergedAt: input.mergedAt, lastPolledAt: input.now })
     .where(eq(pullRequests.id, input.pullRequestId));
+
+  // U6: the task's own "ready for merge" notifications stop being
+  // actionable the moment its PR merges, in the same transaction as the
+  // DONE transition above.
+  await clearReadyForMergeNotifications(tx, input.taskId, input.now);
 }
 
 export interface MarkPullRequestClosedInput {
