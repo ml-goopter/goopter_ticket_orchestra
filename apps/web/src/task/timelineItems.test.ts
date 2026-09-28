@@ -99,6 +99,45 @@ describe("buildTimelineItems", () => {
     expect(items[0]!.toolInput).toEqual({ title: "x" });
   });
 
+  it("reads the tool name from payload.tool when payload.name is absent (AC2, the agent-tools server's actual shape)", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        executionId: "exec-1",
+        type: "agent.tool_call",
+        payload: { tool: "propose_spec", input: { version: 1 }, ok: true },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.toolName).toBe("propose_spec");
+    expect(items[0]!.toolOk).toBe(true);
+  });
+
+  it("falls back to the literal 'tool' label when payload has neither name nor tool", () => {
+    const events = [makeTimelineEvent({ id: 1, type: "agent.tool_call", payload: {} })];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.toolName).toBe("tool");
+  });
+
+  it("carries the error line for a failed agent.tool_call", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        type: "agent.tool_call",
+        payload: { tool: "raise_issue", input: {}, ok: false, error: "VALIDATION_FAILED" },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.toolOk).toBe(false);
+    expect(items[0]!.toolError).toBe("VALIDATION_FAILED");
+  });
+
   it("renders task.state_changed with from and to", () => {
     const events = [
       makeTimelineEvent({
@@ -113,6 +152,188 @@ describe("buildTimelineItems", () => {
     expect(items[0]!.kind).toBe("state_changed");
     expect(items[0]!.from).toBe("READY");
     expect(items[0]!.to).toBe("IMPLEMENTING");
+  });
+
+  it("renders an execution.* transition event the same way as task.state_changed", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        executionId: "exec-1",
+        type: "execution.started",
+        payload: { from: "ASSIGNED", to: "RUNNING", trigger: "execution.started" },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("state_changed");
+    expect(items[0]!.from).toBe("ASSIGNED");
+    expect(items[0]!.to).toBe("RUNNING");
+  });
+
+  it("renders a null from as null, not '?', for a transition event with no prior state (AC1)", () => {
+    const events = [
+      makeTimelineEvent({ id: 1, type: "task.state_changed", payload: { to: "NEEDS_SPEC" } }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.from).toBeNull();
+    expect(items[0]!.to).toBe("NEEDS_SPEC");
+  });
+
+  it("does not treat execution.queued (no to) as a state_changed row", () => {
+    const events = [
+      makeTimelineEvent({ id: 1, type: "execution.queued", payload: { attempt: 2, retry_of: "exec-1" } }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("generic");
+  });
+
+  it("renders worktree.prepared with branch and path", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        type: "worktree.prepared",
+        payload: { worktree_path: "/work/task-1", branch: "tsk-70" },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("worktree");
+    expect(items[0]!.worktreeBranch).toBe("tsk-70");
+    expect(items[0]!.worktreePath).toBe("/work/task-1");
+  });
+
+  it("renders a null branch for worktree.prepared when the payload omits it", () => {
+    const events = [
+      makeTimelineEvent({ id: 1, type: "worktree.prepared", payload: { worktree_path: "/work/task-1" } }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.worktreeBranch).toBeNull();
+  });
+
+  it("renders usage.recorded with model, tokens, cost and round", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        type: "usage.recorded",
+        payload: {
+          usage_id: "u1",
+          kind: "review",
+          round: 2,
+          model: "claude-sonnet-5",
+          input_tokens: 1000,
+          cached_input_tokens: 100,
+          output_tokens: 200,
+          cost_usd: 0.5,
+        },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("usage");
+    expect(items[0]!.usageModel).toBe("claude-sonnet-5");
+    expect(items[0]!.usageInputTokens).toBe(1000);
+    expect(items[0]!.usageCachedTokens).toBe(100);
+    expect(items[0]!.usageOutputTokens).toBe(200);
+    expect(items[0]!.usageCostUsd).toBe(0.5);
+    expect(items[0]!.usageRound).toBe(2);
+  });
+
+  it("renders review.started and review.result as review rounds", () => {
+    const events = [
+      makeTimelineEvent({ id: 1, type: "review.started", payload: { round: 1 } }),
+      makeTimelineEvent({
+        id: 2,
+        type: "review.result",
+        payload: { review_result_id: "rr1", round: 1, verdict: "findings", findings_count: 3 },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("review");
+    expect(items[0]!.reviewRound).toBe(1);
+    expect(items[1]!.reviewVerdict).toBe("findings");
+    expect(items[1]!.reviewFindingsCount).toBe(3);
+  });
+
+  it("renders pull_request.created with number and url", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        type: "pull_request.created",
+        payload: { pull_request_id: "pr-1", number: 42, url: "https://example.com/pr/42" },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("pull_request");
+    expect(items[0]!.prNumber).toBe(42);
+    expect(items[0]!.prUrl).toBe("https://example.com/pr/42");
+  });
+
+  it("renders ci.failed and pull_request.merged as readable outcomes", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        type: "ci.failed",
+        payload: { round: 2, checks: [{ name: "test", url: "https://x" }] },
+      }),
+      makeTimelineEvent({ id: 2, type: "pull_request.merged", payload: { pull_request_id: "pr-1" } }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("outcome");
+    expect(items[0]!.outcomeText).toContain("round 2");
+    expect(items[0]!.outcomeText).toContain("1 check failed");
+    expect(items[1]!.outcomeText).toBe("Pull request merged");
+  });
+
+  it("renders issue.created with title and blocking flag, and issue.resolved with a kind", () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        type: "issue.created",
+        payload: { issue_id: "issue-1", type: "QUESTION", severity: "blocking", blocking: true, title: "Pagination?" },
+      }),
+      makeTimelineEvent({
+        id: 2,
+        type: "issue.resolved",
+        payload: { issue_id: "issue-1", decision_id: "d1", kind: "clarification", blocking: true },
+      }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("issue");
+    expect(items[0]!.issueId).toBe("issue-1");
+    expect(items[0]!.issueTitle).toBe("Pagination?");
+    expect(items[0]!.issueBlocking).toBe(true);
+    expect(items[1]!.issueKindLabel).toBe("clarification");
+  });
+
+  it("renders spec.proposed/revised/approved with a version and revision id", () => {
+    const events = [
+      makeTimelineEvent({ id: 1, type: "spec.proposed", payload: { revision_id: "rev-1", version: 1 } }),
+      makeTimelineEvent({ id: 2, type: "spec.approved", payload: { revision_id: "rev-1", version: 1, runtime: "claude" } }),
+    ];
+
+    const items = buildTimelineItems(events);
+
+    expect(items[0]!.kind).toBe("spec_revision");
+    expect(items[0]!.specVersion).toBe(1);
+    expect(items[0]!.specRevisionId).toBe("rev-1");
+    expect(items[1]!.kind).toBe("spec_revision");
   });
 
   it("renders an agent.message with no prior deltas for that execution as a complete message item (F2)", () => {
@@ -165,14 +386,15 @@ describe("buildTimelineItems", () => {
     expect(b.text).toBe("B1B2!");
   });
 
-  it("renders any other event type with a compact payload summary", () => {
+  it("renders any other event type generic, with the raw payload retained (not stringified) for a collapsed details block (AC1)", () => {
     const events = [
-      makeTimelineEvent({ id: 1, type: "issue.created", payload: { issueId: "i1" } }),
+      makeTimelineEvent({ id: 1, type: "worktree.evicted", payload: { execution_id: "exec-1", branch: "tsk-70" } }),
     ];
 
     const items = buildTimelineItems(events);
 
     expect(items[0]!.kind).toBe("generic");
-    expect(items[0]!.summary).toContain("i1");
+    expect(items[0]!.payload).toEqual({ execution_id: "exec-1", branch: "tsk-70" });
+    expect(typeof items[0]!.payload).not.toBe("string");
   });
 });
