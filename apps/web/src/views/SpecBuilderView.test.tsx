@@ -648,6 +648,34 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
   });
 
+  it("GOT.54: the repository chosen in the dropdown reaches the saved draft", async () => {
+    const saveDraft = vi.fn().mockResolvedValue(makeRevision());
+    const getTask = vi
+      .fn()
+      .mockResolvedValue(aggregateInProgress({ revisions: [makeRevision({ content: { ...validSpecContent, repository: "" } })] }));
+    const client = makeFakeClient({
+      getTask,
+      saveDraft,
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ name: "repo-a" }), makeAdminRepository({ name: "repo-b" })]),
+    });
+    renderSpecBuilder(client);
+
+    const select = await screen.findByLabelText("Repository");
+    await waitFor(() => expect((select as HTMLSelectElement).options.length).toBeGreaterThan(1));
+    fireEvent.change(select, { target: { value: "repo-b" } });
+
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Save Draft" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save Draft" }));
+    });
+
+    await waitFor(() =>
+      expect(saveDraft).toHaveBeenCalledWith("task-1", expect.objectContaining({ repository: "repo-b" })),
+    );
+  });
+
   it("calls requestReview and refetches", async () => {
     const requestReview = vi.fn().mockResolvedValue({ from: "SPEC_IN_PROGRESS", to: "SPEC_REVIEW" });
     const getTask = vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision()] }));
