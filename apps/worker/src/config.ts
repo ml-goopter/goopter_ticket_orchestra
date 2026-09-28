@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -39,6 +40,12 @@ export interface WorkerConfig {
   anthropicApiKey?: string;
   openaiApiKey?: string;
   logLevel: LogLevel;
+  /** `AGENT_CONTAINER_IMAGE`: default image for container mode (§9.9). */
+  agentContainerImage: string;
+  /** `AGENT_CONTAINER_CPUS`: `docker --cpus` for each agent container. */
+  agentContainerCpus: number;
+  /** `AGENT_CONTAINER_MEMORY`: `docker --memory` for each agent container. */
+  agentContainerMemory: string;
 }
 
 /** Thrown when the environment is missing or malformed. Names every variable. */
@@ -95,6 +102,19 @@ export function expandHome(input: string, home: string = os.homedir()): string {
   return input;
 }
 
+/**
+ * `orchestra/agent:<root package.json version>`, the tag
+ * `deploy/agent-image/build.sh` builds by default. The root `package.json`
+ * is three levels above both `src/config.ts` and `dist/config.js`.
+ */
+export const DEFAULT_AGENT_IMAGE = `orchestra/agent:${
+  (
+    JSON.parse(
+      readFileSync(new URL("../../../package.json", import.meta.url), "utf8"),
+    ) as { version: string }
+  ).version
+}`;
+
 const schema = z.object({
   DATABASE_URL: required("DATABASE_URL"),
   WORKER_HOST: z
@@ -141,6 +161,30 @@ const schema = z.object({
     .refine((v): v is LogLevel => (LOG_LEVELS as readonly string[]).includes(v), {
       message: `LOG_LEVEL must be one of ${LOG_LEVELS.join(", ")}`,
     }),
+  AGENT_CONTAINER_IMAGE: z
+    .string()
+    .optional()
+    .transform((v) => present(v)?.trim() ?? DEFAULT_AGENT_IMAGE)
+    .refine((v) => !/\s/.test(v), {
+      message: "AGENT_CONTAINER_IMAGE must be an image reference without whitespace",
+    }),
+  // `docker --cpus` takes a decimal; the value is never echoed.
+  AGENT_CONTAINER_CPUS: z
+    .string()
+    .optional()
+    .transform((v) => present(v)?.trim())
+    .transform((v) => (v === undefined ? 2 : /^\d+(\.\d+)?$/.test(v) ? Number(v) : NaN))
+    .refine((n) => n > 0 && n <= 1024, {
+      message: "AGENT_CONTAINER_CPUS must be a number greater than 0 and at most 1024",
+    }),
+  // `docker --memory`: a positive amount with an optional b, k, m or g unit.
+  AGENT_CONTAINER_MEMORY: z
+    .string()
+    .optional()
+    .transform((v) => present(v)?.trim() ?? "4g")
+    .refine((v) => /^\d+(\.\d+)?[bkmg]?$/i.test(v) && parseFloat(v) > 0, {
+      message: "AGENT_CONTAINER_MEMORY must be a positive amount like 4g, 512m or a byte count",
+    }),
 });
 
 /**
@@ -182,6 +226,9 @@ export function loadConfig(
     anthropicApiKey: e.ANTHROPIC_API_KEY,
     openaiApiKey: e.OPENAI_API_KEY,
     logLevel: e.LOG_LEVEL,
+    agentContainerImage: e.AGENT_CONTAINER_IMAGE,
+    agentContainerCpus: e.AGENT_CONTAINER_CPUS,
+    agentContainerMemory: e.AGENT_CONTAINER_MEMORY,
   };
 }
 
