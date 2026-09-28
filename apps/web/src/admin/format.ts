@@ -22,6 +22,11 @@ export function isStaleHeartbeat(seconds: number): boolean {
   return seconds > DEAD_HOST_THRESHOLD_SECONDS;
 }
 
+/** Slots capacity as "used/max" (task contract point 3): used is max minus free. */
+export function formatSlots(maxConcurrent: number, freeSlots: number): string {
+  return `${maxConcurrent - freeSlots}/${maxConcurrent}`;
+}
+
 /**
  * Renders `${code}: ${message}` for an api error so a 400/409's exact
  * reason is always visible inline next to the form that triggered it

@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "../api/client.js";
-import { DEAD_HOST_THRESHOLD_SECONDS, describeApiError, formatHeartbeatAge, isStaleHeartbeat } from "./format.js";
+import {
+  DEAD_HOST_THRESHOLD_SECONDS,
+  describeApiError,
+  formatHeartbeatAge,
+  formatSlots,
+  isStaleHeartbeat,
+} from "./format.js";
 
 describe("formatHeartbeatAge", () => {
   it("formats under a minute as seconds", () => {
@@ -24,6 +30,16 @@ describe("isStaleHeartbeat", () => {
   it("is true once the age exceeds 15 minutes", () => {
     expect(isStaleHeartbeat(DEAD_HOST_THRESHOLD_SECONDS + 1)).toBe(true);
     expect(isStaleHeartbeat(20 * 60)).toBe(true);
+  });
+});
+
+describe("formatSlots", () => {
+  it("renders used/max, where used is max minus free", () => {
+    expect(formatSlots(3, 2)).toBe("1/3");
+  });
+
+  it("renders 0 used when every slot is free", () => {
+    expect(formatSlots(3, 3)).toBe("0/3");
   });
 });
 

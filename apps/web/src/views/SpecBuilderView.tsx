@@ -15,6 +15,7 @@ import {
 import { useRefetchOnReconnect } from "../board/useEventReconnect.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
 import { useEventStream, type EventSourceFactory } from "../sse/useEventStream.js";
+import "../spec/spec.css";
 import { SpecDraftForm } from "../spec/SpecDraftForm.js";
 import { changedSpecFields, emptySpecContent, specContentEquals } from "../spec/specForm.js";
 import {
@@ -25,6 +26,10 @@ import {
   SPEC_STREAM_EVENT_TYPES,
 } from "../spec/specSession.js";
 import { buildTimelineItems, mergeTimelineEvents } from "../task/timelineItems.js";
+import { Markdown } from "../ui/Markdown.js";
+import { StateBadge } from "../ui/StateBadge.js";
+import { Time } from "../ui/Time.js";
+import { humanizeEnum } from "../ui/humanizeEnum.js";
 
 export interface SpecBuilderViewProps {
   /** Injectable for tests; defaults to a real createApiClient(). */
@@ -569,103 +574,207 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const canApprove = taskState === "SPEC_REVIEW" && validation.ok;
   const canRevise = taskState === "SPEC_APPROVED" || taskState === "READY";
 
+  // Q4: no draft, but the task has an approved revision -- show it
+  // read-only rather than "No draft revision." (design.md §14 Spec
+  // builder row, docs/design.md Appendix A).
+  const approvedRevision = aggregate.approvedRevision;
+  const showApprovedReadOnly = formContent === null && approvedRevision !== null;
+  const approvedApproval = approvedRevision
+    ? (aggregate.approvals.find((approval) => approval.revisionId === approvedRevision.id) ?? null)
+    : null;
+
+  // S2 (coordinator visual check, SCRUM-93): the right pane's heading
+  // reflects what it is actually showing, not always "Draft" -- the same
+  // three-way split the pane body already uses below.
+  const draftPaneHeading = formContent ? "Draft" : showApprovedReadOnly ? "Specification" : "Draft";
+
+  // S3 (coordinator visual check, SCRUM-93): every disabled footer/composer
+  // action gets a `title` explaining why, derived from task state, so a
+  // disabled button is never silent.
+  const chatSendTitle = chatDisabledReason ?? undefined;
+  const saveDraftTitle = canSaveDraft
+    ? undefined
+    : taskState !== "SPEC_IN_PROGRESS"
+      ? `Task is ${humanizeEnum(taskState)}; drafts can only be saved while in progress.`
+      : "No draft to save.";
+  const requestReviewTitle = canRequestReview
+    ? undefined
+    : taskState !== "SPEC_IN_PROGRESS"
+      ? `Task is ${humanizeEnum(taskState)}; review can only be requested while in progress.`
+      : "Save a draft before requesting review.";
+  const sendBackTitle = canSendBack ? undefined : `Task is ${humanizeEnum(taskState)}; can only send back from review.`;
+  const approveTitle = canApprove
+    ? undefined
+    : taskState !== "SPEC_REVIEW"
+      ? `Task is ${humanizeEnum(taskState)}; can only approve from review.`
+      : !validation.ok
+        ? (validation.errors[0] ?? "Spec is not ready to approve.")
+        : "Spec is not ready to approve.";
+  const reviseTitle = canRevise
+    ? undefined
+    : `Task is ${humanizeEnum(taskState)}; can only revise an approved or ready spec.`;
+
   return (
-    <main>
-      <h1>
-        {aggregate.task.jiraKey}: {aggregate.task.jiraSummary}
-      </h1>
-      <p data-testid="task-state">{taskState}</p>
-      {actionError && <p role="alert">{actionError}</p>}
+    <>
+      <div className="page-header">
+        <h1 className="page-header__title">
+          {aggregate.task.jiraKey}: {aggregate.task.jiraSummary}
+        </h1>
+        <div className="page-header__actions">
+          <StateBadge state={taskState} />
+        </div>
+      </div>
+      {/* Kept for tests that assert the raw state string; StateBadge above is the human-readable one. */}
+      <p data-testid="task-state" className="spec-builder__sr-only">
+        {taskState}
+      </p>
+      {actionError && (
+        <p className="alert alert--error" role="alert">
+          {actionError}
+        </p>
+      )}
 
-      <section aria-label="Spec chat">
-        <h2>Chat</h2>
-        {showStartSessionButton && (
-          <button type="button" onClick={() => void handleStartSession()}>
-            Start spec session
-          </button>
-        )}
-        <ul data-testid="spec-chat">
-          {chatItems.map((item) =>
-            item.kind === "tool_call" ? (
-              <li key={item.key}>
-                <span data-testid="tool-chip">{item.toolName}</span>
-              </li>
-            ) : (
-              <li key={item.key} data-testid="chat-message">
-                {item.text}
-                {!item.final && " ..."}
-              </li>
-            ),
+      <div className="split spec-builder__split">
+        <section aria-label="Spec chat" className="split__pane spec-builder__chat-pane">
+          <div className="spec-builder__chat-header">
+            <h2>Chat</h2>
+            {showStartSessionButton && (
+              <button type="button" onClick={() => void handleStartSession()}>
+                Start spec session
+              </button>
+            )}
+          </div>
+          <ul className="spec-builder__chat-list" data-testid="spec-chat">
+            {chatItems.map((item) =>
+              item.kind === "tool_call" ? (
+                <li key={item.key} className="spec-builder__tool-line">
+                  <span data-testid="tool-chip">{item.toolName}</span>
+                </li>
+              ) : (
+                <li key={item.key} className="spec-builder__bubble spec-builder__bubble--agent">
+                  <div className="spec-builder__bubble-meta">
+                    <Time value={item.createdAt} />
+                  </div>
+                  <div data-testid="chat-message" className="spec-builder__bubble-text">
+                    <Markdown>{item.text ?? ""}</Markdown>
+                    {!item.final && " ..."}
+                  </div>
+                </li>
+              ),
+            )}
+          </ul>
+          <div className="spec-builder__composer">
+            {chatDisabledReason && (
+              <p className="spec-builder__disabled-reason" data-testid="chat-disabled-reason">
+                {chatDisabledReason}
+              </p>
+            )}
+            <form className="spec-builder__composer-form" onSubmit={(event) => void handleSendMessage(event)}>
+              <label className="field">
+                Message
+                <textarea
+                  value={messageText}
+                  disabled={chatDisabledReason !== null}
+                  onChange={(event) => setMessageText(event.target.value)}
+                />
+              </label>
+              <button type="submit" disabled={chatDisabledReason !== null || messageText.trim() === ""} title={chatSendTitle}>
+                Send
+              </button>
+            </form>
+          </div>
+        </section>
+
+        <section aria-label="Spec draft" className="split__pane spec-builder__draft-pane">
+          <h2>{draftPaneHeading}</h2>
+          {isDirty && (
+            <p data-testid="unsaved-changes" className="spec-builder__unsaved">
+              Unsaved changes
+            </p>
           )}
-        </ul>
-        <form onSubmit={(event) => void handleSendMessage(event)}>
-          <label>
-            Message
-            <input
-              value={messageText}
-              disabled={chatDisabledReason !== null}
-              onChange={(event) => setMessageText(event.target.value)}
+          {formContent ? (
+            <SpecDraftForm
+              content={formContent}
+              highlightedFields={highlightedFields}
+              disabled={taskState !== "SPEC_IN_PROGRESS"}
+              onChange={setFormContent}
             />
-          </label>
-          <button type="submit" disabled={chatDisabledReason !== null || messageText.trim() === ""}>
-            Send
-          </button>
-        </form>
-        {chatDisabledReason && <p data-testid="chat-disabled-reason">{chatDisabledReason}</p>}
-      </section>
+          ) : showApprovedReadOnly && approvedRevision ? (
+            <div className="spec-builder__approved" data-testid="approved-spec">
+              <h3>Approved specification, version {approvedRevision.version}</h3>
+              {approvedApproval && (
+                <p className="spec-builder__approved-meta">
+                  Approved <Time value={approvedApproval.approvedAt} />
+                </p>
+              )}
+              <Markdown>{renderSpecMarkdown(approvedRevision.content)}</Markdown>
+            </div>
+          ) : (
+            <div className="empty-state">
+              <p>{taskState === "NEEDS_SPEC" ? "Start a spec session to begin." : "No draft revision."}</p>
+            </div>
+          )}
 
-      <section aria-label="Spec draft">
-        <h2>Draft</h2>
-        {isDirty && <p data-testid="unsaved-changes">Unsaved changes</p>}
-        {formContent ? (
-          <SpecDraftForm
-            content={formContent}
-            highlightedFields={highlightedFields}
-            disabled={taskState !== "SPEC_IN_PROGRESS"}
-            onChange={setFormContent}
-          />
-        ) : (
-          <p>{taskState === "NEEDS_SPEC" ? "Start a spec session to begin." : "No draft revision."}</p>
-        )}
-      </section>
+          <div className="spec-builder__draft-actions" aria-label="Actions">
+            {formContent ? (
+              <>
+                <div className="toolbar">
+                  <button type="button" disabled={!canSaveDraft} title={saveDraftTitle} onClick={() => void handleSaveDraft()}>
+                    Save Draft
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!canRequestReview}
+                    title={requestReviewTitle}
+                    onClick={() => void handleRequestReview()}
+                  >
+                    Request Review
+                  </button>
+                  <button type="button" disabled={!canSendBack} title={sendBackTitle} onClick={() => void handleSendBack()}>
+                    Send Back
+                  </button>
+                  <label>
+                    Runtime
+                    <select value={runtimeValue} onChange={(event) => setRuntimeOverride(event.target.value as Runtime)}>
+                      <option value="claude">claude</option>
+                      <option value="codex">codex</option>
+                    </select>
+                  </label>
+                  <button type="button" disabled={!canApprove} title={approveTitle} onClick={() => void handleApprove()}>
+                    Approve
+                  </button>
+                </div>
+                {!validation.ok && (
+                  <p className="alert alert--error" data-testid="approve-blocker">
+                    {validation.errors[0]}
+                  </p>
+                )}
+              </>
+            ) : (
+              <div className="toolbar">
+                <button type="button" disabled={!canRevise} title={reviseTitle} onClick={() => void handleRevise()}>
+                  Revise
+                </button>
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
 
-      <section aria-label="Actions">
-        <button type="button" disabled={!canSaveDraft} onClick={() => void handleSaveDraft()}>
-          Save Draft
-        </button>
-        <button type="button" disabled={!canRequestReview} onClick={() => void handleRequestReview()}>
-          Request Review
-        </button>
-        <button type="button" disabled={!canSendBack} onClick={() => void handleSendBack()}>
-          Send Back
-        </button>
-        <label>
-          Runtime
-          <select value={runtimeValue} onChange={(event) => setRuntimeOverride(event.target.value as Runtime)}>
-            <option value="claude">claude</option>
-            <option value="codex">codex</option>
-          </select>
-        </label>
-        <button type="button" disabled={!canApprove} onClick={() => void handleApprove()}>
-          Approve
-        </button>
-        {!validation.ok && <p data-testid="approve-blocker">{validation.errors[0]}</p>}
-        <button type="button" disabled={!canRevise} onClick={() => void handleRevise()}>
-          Revise
-        </button>
-      </section>
-
-      <section aria-label="Specification revisions">
+      <section aria-label="Specification revisions" className="card spec-builder__revisions">
         <h2>Specification revisions</h2>
-        <ul>
+        <ul className="spec-builder__revision-list" data-testid="revision-list">
           {revisions.map((revision) => (
-            <li key={revision.id}>
-              v{revision.version} - {revision.status} - {revision.createdAt}
+            <li key={revision.id} className="spec-builder__revision-row">
+              <span className="spec-builder__revision-version">v{revision.version}</span>
+              <StateBadge state={revision.status} />
+              <Time value={revision.createdAt} />
             </li>
           ))}
         </ul>
         {revisions.length > 0 && (
-          <div>
+          <details className="spec-builder__revision-details">
+            <summary>Compare revisions</summary>
             <label>
               Compare from
               <select value={fromRevisionId ?? ""} onChange={(event) => setFromRevisionId(event.target.value)}>
@@ -699,9 +808,9 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
               </select>
             </label>
             {readMarkdown && <pre data-testid="spec-read-view">{readMarkdown}</pre>}
-          </div>
+          </details>
         )}
       </section>
-    </main>
+    </>
   );
 }

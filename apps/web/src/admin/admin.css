@@ -1,0 +1,62 @@
+/**
+ * Admin-view styles (U5, docs/design.md §14 Admin row). Panel-local classes
+ * only -- shared layout, table, form, and badge classes live in
+ * ../styles/components.css and ../styles/base.css; nothing here duplicates
+ * those.
+ */
+
+/* Long values (Jira JQL, git URLs, shell commands) truncated with an
+ * ellipsis; the full value is always carried on the element's `title` so
+ * it is never lost, only visually clipped. */
+.admin-table__mono {
+  display: inline-block;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+/* Small row-action button inside a table cell (e.g. "Edit"). */
+.admin-table__action {
+  height: 26px;
+  padding: 0 var(--space-3);
+  font-size: var(--font-size-xs);
+}
+
+/* Wrapping list of badges inside a table cell, e.g. a worker's capabilities. */
+.admin-badge-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* Primary/secondary button row at the end of a create/edit form. */
+.admin-form__actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+/* Space between a panel's table (or its loading/empty/error state) and its
+ * create/edit card below it. */
+.admin-panel__table {
+  margin-bottom: var(--space-5);
+}
+
+/* Muted placeholder text, e.g. a worker with no capabilities. */
+.admin-table__muted {
+  color: var(--color-text-muted);
+}
+
+/* A cell's primary value plus a trailing badge (e.g. heartbeat age plus a
+ * stale badge). Uses `gap` for the space between them because `.badge` is
+ * `display: inline-flex`, which collapses a leading/trailing whitespace
+ * text node placed inside it. */
+.admin-table__with-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}

@@ -5,10 +5,15 @@ import { ApiError, createApiClient, type IssueApiClient } from "../api/client.js
 import { TimelineEventSchema, type IssueDetail } from "../api/types.js";
 import { useRefetchOnReconnect } from "../board/useEventReconnect.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
+import "../issue/issue.css";
 import { AgentMessagePayloadSchema, reduceAgentReply, type LiveReply } from "../issue/liveReply.js";
 import { parseSuggestedOptions } from "../issue/issueOptions.js";
 import { createDeltaAccumulator } from "../sse/deltas.js";
 import { useEventStream, type EventSourceFactory } from "../sse/useEventStream.js";
+import { Markdown } from "../ui/Markdown.js";
+import { StateBadge } from "../ui/StateBadge.js";
+import { Time } from "../ui/Time.js";
+import { humanizeEnum } from "../ui/humanizeEnum.js";
 
 export interface IssueDetailViewProps {
   /** Injectable for tests; defaults to a real createApiClient(). */
@@ -243,31 +248,44 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
 
   return (
     <main>
-      <h1>{issue.title}</h1>
-      <p data-testid="issue-status">{issue.status}</p>
-      <section aria-label="Header">
-        <p>
-          {issue.type} - {issue.severity} {issue.blocking ? <strong>Blocking</strong> : "Non-blocking"}
-        </p>
-        <p>
-          <Link to={`/tasks/${task.id}`}>{task.jira_key}</Link> ({task.state})
-        </p>
-        <p>
-          Execution: {execution.role} - {execution.state} ({execution.runtime})
-        </p>
-        <p>
+      <div className="page-header">
+        <h1 className="page-header__title">{issue.title}</h1>
+        <div className="page-header__actions">
+          <StateBadge state={issue.status} />
+        </div>
+      </div>
+      {/* Kept for tests that assert the raw state string; StateBadge above is the human-readable one. */}
+      <p data-testid="issue-status" className="issue-detail__sr-only">
+        {issue.status}
+      </p>
+
+      <div className="issue-detail__meta">
+        <span className="issue-detail__meta-item">{humanizeEnum(issue.type)}</span>
+        {issue.blocking && <span className="badge badge--attention">Blocking</span>}
+        <span className="issue-detail__meta-item">
+          <Link to={`/tasks/${task.id}`}>{task.jira_key}</Link> <StateBadge state={task.state} />
+        </span>
+        <span className="issue-detail__meta-item" data-testid="issue-execution">
+          Execution: {execution.role} <StateBadge state={execution.state} /> ({execution.runtime})
+        </span>
+        <span className="issue-detail__meta-item">
           <Link to={`/tasks/${task.id}/spec`}>Spec revision</Link>
-        </p>
-      </section>
+        </span>
+      </div>
 
       <section aria-label="Details">
-        <p>{issue.description}</p>
-        {issue.question && <p data-testid="issue-question">{issue.question}</p>}
+        <Markdown>{issue.description}</Markdown>
+
+        {issue.question && (
+          <div className="card issue-detail__question">
+            <p data-testid="issue-question">{issue.question}</p>
+          </div>
+        )}
 
         {isOpen && (
-          <>
+          <div className="card issue-detail__resolve-card">
             {options.length > 0 && (
-              <fieldset>
+              <fieldset className="issue-detail__options">
                 <legend>Suggested options</legend>
                 {options.map((option) => (
                   <label key={option.id}>
@@ -285,7 +303,7 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
               </fieldset>
             )}
 
-            <label>
+            <label className="field">
               Decision
               <textarea
                 data-testid="decision-text"
@@ -293,7 +311,7 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
                 onChange={(event) => setDecisionText(event.target.value)}
               />
             </label>
-            <label>
+            <label className="field">
               Clarification (optional)
               <textarea
                 data-testid="clarification-text"
@@ -301,60 +319,72 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
                 onChange={(event) => setClarificationText(event.target.value)}
               />
             </label>
-          </>
+
+            <div className="toolbar" aria-label="Resolve">
+              <button
+                type="button"
+                disabled={decisionText.trim().length === 0 || resolving}
+                onClick={handleResolveClarification}
+              >
+                Resolve as clarification
+              </button>
+              {issue.blocking ? (
+                <button
+                  type="button"
+                  disabled={decisionText.trim().length === 0 || resolving}
+                  onClick={handleResolveSpecRevision}
+                >
+                  This changes the spec
+                </button>
+              ) : (
+                <p>The agent is not paused and will not be resumed.</p>
+              )}
+            </div>
+            {resolveError && (
+              <p className="alert alert--error" role="alert">
+                {resolveError}
+              </p>
+            )}
+          </div>
+        )}
+
+        {!isOpen && (
+          <div className="card" aria-label="Resolution">
+            <h2>Resolution</h2>
+            <p data-testid="resolution-decision">{decision?.decision ?? issue.resolution ?? "No decision recorded."}</p>
+            <p data-testid="resolution-kind">{humanizeEnum(issue.resolutionKind ?? issue.status)}</p>
+            <p data-testid="resolution-time">
+              <Time value={issue.resolvedAt} />
+            </p>
+          </div>
         )}
       </section>
 
-      {isOpen ? (
-        <section aria-label="Resolve">
-          <button
-            type="button"
-            disabled={decisionText.trim().length === 0 || resolving}
-            onClick={handleResolveClarification}
-          >
-            Resolve as clarification
-          </button>
-          {issue.blocking ? (
-            <button
-              type="button"
-              disabled={decisionText.trim().length === 0 || resolving}
-              onClick={handleResolveSpecRevision}
-            >
-              This changes the spec
-            </button>
-          ) : (
-            <p>The agent is not paused and will not be resumed.</p>
-          )}
-          {resolveError && <p role="alert">{resolveError}</p>}
-        </section>
-      ) : (
-        <section aria-label="Resolution">
-          <h2>Resolution</h2>
-          <p data-testid="resolution-decision">{decision?.decision ?? issue.resolution ?? "No decision recorded."}</p>
-          <p data-testid="resolution-kind">{issue.resolutionKind ?? issue.status}</p>
-          <p data-testid="resolution-time">{issue.resolvedAt}</p>
-        </section>
-      )}
-
       <section aria-label="Thread">
         <h2>Thread</h2>
-        <ul data-testid="thread">
+        <ul data-testid="thread" className="issue-detail__thread">
           {messages.map((message) => (
-            <li key={message.id} data-testid="thread-message">
-              <strong>{message.authorKind}</strong> ({message.createdAt}): {message.body}
+            <li key={message.id} data-testid="thread-message" className="issue-detail__bubble">
+              <div className="issue-detail__bubble-meta">
+                <strong>{message.authorKind}</strong> <Time value={message.createdAt} />
+              </div>
+              {message.body}
             </li>
           ))}
           {liveReply && (
-            <li data-testid="thread-live-reply" data-final={liveReply.final}>
-              <strong>agent</strong>: {liveReply.text}
+            <li data-testid="thread-live-reply" data-final={liveReply.final} className="issue-detail__bubble issue-detail__bubble--live">
+              <div className="issue-detail__bubble-meta">
+                <strong>agent</strong>
+              </div>
+              {liveReply.text}
               {!liveReply.final && " ..."}
             </li>
           )}
         </ul>
       </section>
 
-      <section aria-label="Composer">
-        <label>
+      <section aria-label="Composer" className="card issue-detail__composer">
+        <label className="field">
           Message
           <textarea
             data-testid="composer-text"
@@ -363,15 +393,25 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
             onChange={(event) => setMessageText(event.target.value)}
           />
         </label>
-        <button
-          type="button"
-          disabled={composerDisabledReason !== null || posting || messageText.trim().length === 0}
-          onClick={() => void handleSend()}
-        >
-          Send
-        </button>
-        {composerDisabledReason && <p role="alert">{composerDisabledReason}</p>}
-        {messageError && <p role="alert">{messageError}</p>}
+        <div className="toolbar">
+          <button
+            type="button"
+            disabled={composerDisabledReason !== null || posting || messageText.trim().length === 0}
+            onClick={() => void handleSend()}
+          >
+            Send
+          </button>
+        </div>
+        {composerDisabledReason && (
+          <p className="issue-detail__disabled-reason" role="alert">
+            {composerDisabledReason}
+          </p>
+        )}
+        {messageError && (
+          <p className="alert alert--error" role="alert">
+            {messageError}
+          </p>
+        )}
       </section>
     </main>
   );
