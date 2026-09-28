@@ -513,6 +513,64 @@ describe("ClaudeAdapter query options (design.md §7.1)", () => {
     }
   });
 
+  for (const policy of ["implementation", "spec"] as const) {
+    it(`start (${policy}): options.env.ORCHESTRA_TOKEN is req.mcp.token even when req.env and process.env carry different stale values (design.md §8, §9.9)`, async () => {
+      process.env.ORCHESTRA_TOKEN = "stale-token-from-process-env";
+      try {
+        const fake = scripted([systemInit, resultSuccess()]);
+        const adapter = new ClaudeAdapter({ query: fake.fn });
+
+        await collect(
+          adapter.start(
+            {
+              ...startRequest,
+              allowedTools: policy,
+              env: {
+                ...startRequest.env,
+                ORCHESTRA_TOKEN: "stale-token-from-req-env",
+              },
+            },
+            new AbortController().signal,
+          ),
+        );
+
+        expect(fake.calls[0]?.options?.env?.ORCHESTRA_TOKEN).toBe(
+          startRequest.mcp.token,
+        );
+      } finally {
+        delete process.env.ORCHESTRA_TOKEN;
+      }
+    });
+
+    it(`resume (${policy}): options.env.ORCHESTRA_TOKEN is req.mcp.token even when req.env and process.env carry different stale values (design.md §8, §9.9)`, async () => {
+      process.env.ORCHESTRA_TOKEN = "stale-token-from-process-env";
+      try {
+        const fake = scripted([systemInit, resultSuccess()]);
+        const adapter = new ClaudeAdapter({ query: fake.fn });
+
+        await collect(
+          adapter.resume(
+            {
+              ...resumeRequest,
+              allowedTools: policy,
+              env: {
+                ...resumeRequest.env,
+                ORCHESTRA_TOKEN: "stale-token-from-req-env",
+              },
+            },
+            new AbortController().signal,
+          ),
+        );
+
+        expect(fake.calls[0]?.options?.env?.ORCHESTRA_TOKEN).toBe(
+          resumeRequest.mcp.token,
+        );
+      } finally {
+        delete process.env.ORCHESTRA_TOKEN;
+      }
+    });
+  }
+
   it("still withholds the orchestra MCP server and token from a review run that also carries a testCommand", async () => {
     const fake = scripted([systemInit, resultSuccess()]);
     const adapter = new ClaudeAdapter({ query: fake.fn });
