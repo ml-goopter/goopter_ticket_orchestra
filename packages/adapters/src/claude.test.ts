@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
+import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type {
   Options,
   SDKMessage,
@@ -386,13 +387,16 @@ describe("ClaudeAdapter query options (design.md §7.1)", () => {
     );
 
     const options = fake.calls[0]?.options;
+    // The header names ORCHESTRA_TOKEN, which the CLI expands from its env,
+    // so the token never lands on the `--mcp-config` argv (design.md §8).
     expect(options?.mcpServers).toEqual({
       orchestra: {
         type: "http",
         url: "http://127.0.0.1:4599/mcp",
-        headers: { Authorization: `Bearer ${TOKEN}` },
+        headers: { Authorization: "Bearer ${ORCHESTRA_TOKEN}" },
       },
     });
+    expect(options?.env?.ORCHESTRA_TOKEN).toBe(TOKEN);
     expect(JSON.stringify(events)).not.toContain(TOKEN);
   });
 
@@ -448,6 +452,144 @@ describe("ClaudeAdapter query options (design.md §7.1)", () => {
       expect(options?.allowedTools).toEqual(allowedToolsFor(policy));
     });
   }
+
+  it("never configures the orchestra MCP server for a review run, and never puts ORCHESTRA_TOKEN in its env even when req.env carries one (start) (commit cadff5c, design.md §9.8)", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(
+      adapter.start(
+        {
+          ...startRequest,
+          allowedTools: "review",
+          env: { ...startRequest.env, ORCHESTRA_TOKEN: TOKEN },
+        },
+        new AbortController().signal,
+      ),
+    );
+
+    const options = fake.calls[0]?.options;
+    expect(options?.mcpServers).not.toHaveProperty("orchestra");
+    expect(options?.env).not.toHaveProperty("ORCHESTRA_TOKEN");
+  });
+
+  it("never configures the orchestra MCP server for a review run, and never puts ORCHESTRA_TOKEN in its env even when req.env carries one (resume) (commit cadff5c, design.md §9.8)", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(
+      adapter.resume(
+        {
+          ...resumeRequest,
+          allowedTools: "review",
+          env: { ...resumeRequest.env, ORCHESTRA_TOKEN: TOKEN },
+        },
+        new AbortController().signal,
+      ),
+    );
+
+    const options = fake.calls[0]?.options;
+    expect(options?.mcpServers).not.toHaveProperty("orchestra");
+    expect(options?.env).not.toHaveProperty("ORCHESTRA_TOKEN");
+  });
+
+  it("strips an ORCHESTRA_TOKEN inherited from process.env for a review run, not merely omits adding one (commit cadff5c, design.md §9.8)", async () => {
+    process.env.ORCHESTRA_TOKEN = "leaked-from-process-env";
+    try {
+      const fake = scripted([systemInit, resultSuccess()]);
+      const adapter = new ClaudeAdapter({ query: fake.fn });
+
+      await collect(
+        adapter.start(
+          { ...startRequest, allowedTools: "review", env: {} },
+          new AbortController().signal,
+        ),
+      );
+
+      const options = fake.calls[0]?.options;
+      expect(options?.env).not.toHaveProperty("ORCHESTRA_TOKEN");
+    } finally {
+      delete process.env.ORCHESTRA_TOKEN;
+    }
+  });
+
+  for (const policy of ["implementation", "spec"] as const) {
+    it(`start (${policy}): options.env.ORCHESTRA_TOKEN is req.mcp.token even when req.env and process.env carry different stale values (design.md §8, §9.9)`, async () => {
+      process.env.ORCHESTRA_TOKEN = "stale-token-from-process-env";
+      try {
+        const fake = scripted([systemInit, resultSuccess()]);
+        const adapter = new ClaudeAdapter({ query: fake.fn });
+
+        await collect(
+          adapter.start(
+            {
+              ...startRequest,
+              allowedTools: policy,
+              env: {
+                ...startRequest.env,
+                ORCHESTRA_TOKEN: "stale-token-from-req-env",
+              },
+            },
+            new AbortController().signal,
+          ),
+        );
+
+        expect(fake.calls[0]?.options?.env?.ORCHESTRA_TOKEN).toBe(
+          startRequest.mcp.token,
+        );
+      } finally {
+        delete process.env.ORCHESTRA_TOKEN;
+      }
+    });
+
+    it(`resume (${policy}): options.env.ORCHESTRA_TOKEN is req.mcp.token even when req.env and process.env carry different stale values (design.md §8, §9.9)`, async () => {
+      process.env.ORCHESTRA_TOKEN = "stale-token-from-process-env";
+      try {
+        const fake = scripted([systemInit, resultSuccess()]);
+        const adapter = new ClaudeAdapter({ query: fake.fn });
+
+        await collect(
+          adapter.resume(
+            {
+              ...resumeRequest,
+              allowedTools: policy,
+              env: {
+                ...resumeRequest.env,
+                ORCHESTRA_TOKEN: "stale-token-from-req-env",
+              },
+            },
+            new AbortController().signal,
+          ),
+        );
+
+        expect(fake.calls[0]?.options?.env?.ORCHESTRA_TOKEN).toBe(
+          resumeRequest.mcp.token,
+        );
+      } finally {
+        delete process.env.ORCHESTRA_TOKEN;
+      }
+    });
+  }
+
+  it("still withholds the orchestra MCP server and token from a review run that also carries a testCommand", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(
+      adapter.start(
+        {
+          ...startRequest,
+          allowedTools: "review",
+          testCommand: "pnpm -r test",
+        },
+        new AbortController().signal,
+      ),
+    );
+
+    const options = fake.calls[0]?.options;
+    expect(options?.mcpServers).not.toHaveProperty("orchestra");
+    expect(options?.env).not.toHaveProperty("ORCHESTRA_TOKEN");
+  });
 
   it("grants Bash(<testCommand>) to a review run that carries one (design.md §7.1)", async () => {
     const fake = scripted([systemInit, resultSuccess()]);
@@ -1705,4 +1847,203 @@ describe("ClaudeAdapter stderr tail on a spawner crash (F1, design.md §7.1, §9
       },
     ]);
   });
+});
+
+// --- execution token stays off the CLI argv (design.md §8, §9.9) -----------
+// The Agent SDK serialises `mcpServers` into a `--mcp-config <json>` argument,
+// and argv is readable by any user on the host (`ps`) and shows up in a
+// `docker exec` command line. These cases drive the real SDK `query` so the
+// argv recorded is the one the SDK would actually launch the CLI with.
+
+/** Records every CLI launch the real SDK makes: command, argv and env. */
+interface CliLaunch {
+  command: string;
+  args: readonly string[];
+  env: Record<string, string | undefined>;
+}
+
+/**
+ * An SDK `SpawnedProcess` for a CLI that exits at once with code 1, so the
+ * real SDK query fails fast after it has built and handed over its argv.
+ */
+function exitingSpawnedProcess(): SpawnedProcess {
+  const child = fakeProcess();
+  (child.process.stdout as PassThrough).end();
+  setImmediate(() => child.exit({ code: 1, signal: null }));
+  return {
+    stdin: child.process.stdin,
+    stdout: child.process.stdout,
+    killed: false,
+    exitCode: null,
+    signalCode: null,
+    kill: () => true,
+    on: (event: string, listener: (...args: never[]) => void) => {
+      if (event === "exit") {
+        void child.process.exit.then((o) =>
+          (listener as (c: number | null, s: null) => void)(o.code, null),
+        );
+      }
+    },
+    once: (event: string, listener: (...args: never[]) => void) => {
+      if (event === "exit") {
+        void child.process.exit.then((o) =>
+          (listener as (c: number | null, s: null) => void)(o.code, null),
+        );
+      }
+    },
+    off: () => {},
+  } as unknown as SpawnedProcess;
+}
+
+/**
+ * Host mode: no `ProcessSpawner`, so the SDK would spawn the CLI itself. The
+ * real SDK `query` runs with a recording `spawnClaudeCodeProcess` added only
+ * here, after the adapter has built its options, so the recorded argv is the
+ * one the SDK builds for a host launch.
+ */
+function hostModeRecorder(): { query: ClaudeQueryFn; launches: CliLaunch[] } {
+  const launches: CliLaunch[] = [];
+  const query: ClaudeQueryFn = (params) => {
+    if (params.options?.spawnClaudeCodeProcess) {
+      throw new Error("host mode must not install a spawner");
+    }
+    return sdkQuery({
+      prompt: params.prompt,
+      options: {
+        ...params.options,
+        spawnClaudeCodeProcess: (spawnOptions) => {
+          launches.push({
+            command: spawnOptions.command,
+            args: spawnOptions.args,
+            env: spawnOptions.env,
+          });
+          return exitingSpawnedProcess();
+        },
+      },
+    });
+  };
+  return { query, launches };
+}
+
+/** Spawner mode: the adapter's own `ProcessSpawner` path, real SDK `query`. */
+function spawnerModeRecorder(): { spawn: ProcessSpawner; launches: CliLaunch[] } {
+  const launches: CliLaunch[] = [];
+  const spawn: ProcessSpawner = (command, args, options) => {
+    launches.push({ command, args, env: options.env });
+    const child = fakeProcess();
+    (child.process.stdout as PassThrough).end();
+    setImmediate(() => child.exit({ code: 1, signal: null }));
+    return child.process;
+  };
+  return { spawn, launches };
+}
+
+/** The `--mcp-config` JSON the SDK put on argv, parsed. */
+function mcpConfigArg(args: readonly string[]): {
+  mcpServers: Record<string, { headers?: Record<string, string> }>;
+} {
+  const at = args.indexOf("--mcp-config");
+  if (at < 0 || at + 1 >= args.length) throw new Error("no --mcp-config on argv");
+  return JSON.parse(args[at + 1]!);
+}
+
+describe("ClaudeAdapter keeps the execution token off the CLI argv (design.md §8, §9.9)", () => {
+  let cwd: string;
+  const argvCases: {
+    mode: string;
+    call: "start" | "resume";
+  }[] = [
+    { mode: "host", call: "start" },
+    { mode: "host", call: "resume" },
+    { mode: "spawner", call: "start" },
+    { mode: "spawner", call: "resume" },
+  ];
+
+  async function launch(
+    mode: string,
+    call: "start" | "resume",
+    env: Record<string, string> = startRequest.env,
+  ): Promise<{ launches: CliLaunch[]; events: AgentEvent[] }> {
+    cwd = await makeSessionRoot();
+    let adapter: ClaudeAdapter;
+    let launches: CliLaunch[];
+    if (mode === "host") {
+      const recorder = hostModeRecorder();
+      adapter = new ClaudeAdapter({ query: recorder.query });
+      launches = recorder.launches;
+    } else {
+      const recorder = spawnerModeRecorder();
+      adapter = new ClaudeAdapter({ spawn: recorder.spawn });
+      launches = recorder.launches;
+    }
+    const signal = new AbortController().signal;
+    const stream =
+      call === "start"
+        ? adapter.start({ ...startRequest, cwd, env }, signal)
+        : adapter.resume({ ...resumeRequest, cwd, env }, signal);
+    const events = await collect(stream);
+    return { launches, events };
+  }
+
+  it.each(argvCases)(
+    "$mode mode $call: no CLI argument contains the token",
+    async ({ mode, call }) => {
+      const { launches, events } = await launch(mode, call);
+
+      expect(launches).toHaveLength(1);
+      const { command, args } = launches[0]!;
+      expect(command).not.toContain(TOKEN);
+      for (const arg of args) expect(arg).not.toContain(TOKEN);
+      // The MCP server is still configured on argv, just without the secret.
+      expect(args).toContain("--mcp-config");
+      expect(JSON.stringify(events)).not.toContain(TOKEN);
+    },
+  );
+
+  it.each(argvCases)(
+    "$mode mode $call: the MCP header references ORCHESTRA_TOKEN, which the CLI env carries",
+    async ({ mode, call }) => {
+      // The request env deliberately lacks ORCHESTRA_TOKEN: the adapter must
+      // supply it from `mcp.token`, as the Codex adapter does (design.md §7.2).
+      const { launches } = await launch(mode, call, { PATH: "/usr/bin" });
+
+      const { args, env } = launches[0]!;
+      expect(mcpConfigArg(args).mcpServers.orchestra?.headers).toEqual({
+        Authorization: "Bearer ${ORCHESTRA_TOKEN}",
+      });
+      expect(env.ORCHESTRA_TOKEN).toBe(TOKEN);
+    },
+  );
+
+  it.each(argvCases)(
+    "$mode mode $call: a review run's recorded CLI launch carries no ORCHESTRA_TOKEN and no orchestra entry in --mcp-config (commit cadff5c, design.md §9.8)",
+    async ({ mode, call }) => {
+      cwd = await makeSessionRoot();
+      let adapter: ClaudeAdapter;
+      let launches: CliLaunch[];
+      if (mode === "host") {
+        const recorder = hostModeRecorder();
+        adapter = new ClaudeAdapter({ query: recorder.query });
+        launches = recorder.launches;
+      } else {
+        const recorder = spawnerModeRecorder();
+        adapter = new ClaudeAdapter({ spawn: recorder.spawn });
+        launches = recorder.launches;
+      }
+      const signal = new AbortController().signal;
+      const stream =
+        call === "start"
+          ? adapter.start({ ...startRequest, allowedTools: "review", cwd }, signal)
+          : adapter.resume({ ...resumeRequest, allowedTools: "review", cwd }, signal);
+      await collect(stream);
+
+      expect(launches).toHaveLength(1);
+      const { args, env } = launches[0]!;
+      expect(env.ORCHESTRA_TOKEN).toBeUndefined();
+      for (const arg of args) expect(arg).not.toContain(TOKEN);
+      if (args.includes("--mcp-config")) {
+        expect(mcpConfigArg(args).mcpServers).not.toHaveProperty("orchestra");
+      }
+    },
+  );
 });
