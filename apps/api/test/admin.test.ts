@@ -21,6 +21,7 @@ import {
   seedAgentWorker,
   seedExecutionOnHost,
   seedProject,
+  seedRepository,
   seedTask,
 } from "./admin-seed.js";
 
@@ -284,6 +285,123 @@ describe("admin routes", () => {
         payload: { max_budget_usd: -5 },
       });
       expect(patchRes.statusCode).toBe(400);
+    });
+  });
+
+  describe("DELETE /api/projects/:id (GOT.52)", () => {
+    it("deletes a project and all its repositories when no task references it", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "DELP1" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "delp1-repo",
+      });
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: `/api/projects/${project.id}`,
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(204);
+      expect(res.body).toBe("");
+
+      const getProjectRes = await app.inject({
+        method: "GET",
+        url: `/api/projects/${project.id}`,
+        headers: { cookie },
+      });
+      expect(getProjectRes.statusCode).toBe(404);
+
+      const getRepoRes = await app.inject({
+        method: "GET",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+      });
+      expect(getRepoRes.statusCode).toBe(404);
+    });
+
+    it("returns 409 with the reason and task count, deleting nothing, when a task references the project", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "DELP2" });
+      await seedTask(testDb.db, { projectId: project.id, jiraKey: "DELP2-1" });
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: `/api/projects/${project.id}`,
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(409);
+      const body = res.json();
+      expect(body.error.code).toBe("REFERENCED_BY_TASKS");
+      expect(body.error.task_count).toBe(1);
+      expect(typeof body.error.message).toBe("string");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/projects/${project.id}`,
+        headers: { cookie },
+      });
+      expect(getRes.statusCode).toBe(200);
+    });
+
+    it("returns 409 with the task count when a task only references one of the project's repositories", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "DELP3" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "delp3-repo",
+      });
+      await seedTask(testDb.db, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "DELP3-1",
+      });
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: `/api/projects/${project.id}`,
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error.task_count).toBe(1);
+
+      const getRepoRes = await app.inject({
+        method: "GET",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+      });
+      expect(getRepoRes.statusCode).toBe(200);
+    });
+
+    it("returns 404 for an unknown project id", async () => {
+      const app = await withAuthedApp();
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/api/projects/00000000-0000-0000-0000-000000000000",
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it("rejects a malformed project id with 400", async () => {
+      const app = await withAuthedApp();
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/api/projects/not-a-uuid",
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects an unauthenticated request with 401", async () => {
+      clock = createClock();
+      app = await buildTestApp(testDb, clock);
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/api/projects/00000000-0000-0000-0000-000000000000",
+      });
+      expect(res.statusCode).toBe(401);
     });
   });
 
@@ -817,6 +935,95 @@ describe("admin routes", () => {
         payload: { ...payload, project_id: otherProject.id },
       });
       expect(otherRes.statusCode).toBe(201);
+    });
+  });
+
+  describe("DELETE /api/repositories/:id (GOT.52)", () => {
+    it("deletes a repository when no task references it", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "DELR1" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "delr1-repo",
+      });
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(204);
+      expect(res.body).toBe("");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+      });
+      expect(getRes.statusCode).toBe(404);
+    });
+
+    it("returns 409 with the reason and task count, deleting nothing, when a task references the repository", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "DELR2" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "delr2-repo",
+      });
+      await seedTask(testDb.db, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "DELR2-1",
+      });
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(409);
+      const body = res.json();
+      expect(body.error.code).toBe("REFERENCED_BY_TASKS");
+      expect(body.error.task_count).toBe(1);
+      expect(typeof body.error.message).toBe("string");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+      });
+      expect(getRes.statusCode).toBe(200);
+    });
+
+    it("returns 404 for an unknown repository id", async () => {
+      const app = await withAuthedApp();
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/api/repositories/00000000-0000-0000-0000-000000000000",
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it("rejects a malformed repository id with 400", async () => {
+      const app = await withAuthedApp();
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/api/repositories/not-a-uuid",
+        headers: { cookie },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects an unauthenticated request with 401", async () => {
+      clock = createClock();
+      app = await buildTestApp(testDb, clock);
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/api/repositories/00000000-0000-0000-0000-000000000000",
+      });
+      expect(res.statusCode).toBe(401);
     });
   });
 
