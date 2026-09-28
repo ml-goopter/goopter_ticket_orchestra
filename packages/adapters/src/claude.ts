@@ -72,6 +72,13 @@ const UNKNOWN_ERROR = "unknown adapter error";
 /** Replacement for the execution token in anything the adapter emits. */
 const REDACTED = "[redacted]";
 
+/**
+ * Environment variable carrying the execution token to the CLI (design.md
+ * §9.9), referenced as `${ORCHESTRA_TOKEN}` from the MCP header so the token
+ * never appears on argv. Same name as codex.ts's `CODEX_MCP_TOKEN_ENV`.
+ */
+const MCP_TOKEN_ENV = "ORCHESTRA_TOKEN";
+
 /** Bytes of stderr kept for a crash message (matches codex.ts). */
 const STDERR_TAIL_BYTES = 4096;
 
@@ -380,18 +387,24 @@ function baseOptions(req: StartRequest | ResumeRequest): Options {
     // `permissions.allow` could re-grant a read-only or unrestricted-Bash
     // role tools this adapter deliberately withholds.
     settingSources: settingSourcesFor(policy),
+    // The SDK passes `mcpServers` to the CLI as a `--mcp-config <json>`
+    // argument, readable by any host user via `ps` and visible in a
+    // `docker exec` command line. The header therefore names an environment
+    // variable, which the CLI expands when it loads the config, and the token
+    // itself travels only in the CLI's environment (design.md §8, §9.9).
     mcpServers: {
       orchestra: {
         type: "http",
         url: req.mcp.url,
-        headers: { Authorization: `Bearer ${req.mcp.token}` },
+        headers: { Authorization: `Bearer \${${MCP_TOKEN_ENV}}` },
       },
     },
     permissionMode,
     // `Options.env` REPLACES the subprocess environment rather than merging
     // it (sdk.d.ts), so the inherited environment is spread first: without it
-    // the CLI subprocess loses PATH, HOME and its credentials.
-    env: { ...process.env, ...req.env },
+    // the CLI subprocess loses PATH, HOME and its credentials. The token is
+    // set last so the header above always expands to this execution's token.
+    env: { ...process.env, ...req.env, [MCP_TOKEN_ENV]: req.mcp.token },
   };
   const tools = builtinToolsFor(policy, policyOpts);
   if (tools !== undefined) options.tools = tools;
