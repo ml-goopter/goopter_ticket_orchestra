@@ -30,6 +30,8 @@ function repositoryJson(overrides: Partial<Record<string, unknown>> = {}) {
     required_capability: null,
     setup_command: null,
     test_command: null,
+    agent_container: false,
+    agent_image: null,
     created_at: "2026-01-01T00:00:00.000Z",
     ...overrides,
   };
@@ -193,6 +195,8 @@ describe("createAdminApi", () => {
         requiredCapability: null,
         setupCommand: null,
         testCommand: null,
+        agentContainer: false,
+        agentImage: null,
         createdAt: "2026-01-01T00:00:00.000Z",
       });
     });
@@ -212,6 +216,8 @@ describe("createAdminApi", () => {
         requiredCapability: "docker",
         setupCommand: "pnpm install",
         testCommand: "pnpm test",
+        agentContainer: true,
+        agentImage: "orchestra/agent:custom",
       });
 
       expect(request).toHaveBeenCalledWith("POST", "/repositories", {
@@ -226,6 +232,8 @@ describe("createAdminApi", () => {
           required_capability: "docker",
           setup_command: "pnpm install",
           test_command: "pnpm test",
+          agent_container: true,
+          agent_image: "orchestra/agent:custom",
         },
       });
     });
@@ -238,6 +246,17 @@ describe("createAdminApi", () => {
 
       expect(request).toHaveBeenCalledWith("PATCH", "/repositories/repo-1", {
         body: { test_command: "npm run test:unit" },
+      });
+    });
+
+    it("patchRepository() sends agent_container and agent_image when present", async () => {
+      const request = vi.fn().mockResolvedValue(repositoryJson({ agent_container: true, agent_image: "orchestra/agent:custom" }));
+      const api = createAdminApi(request);
+
+      await api.patchRepository("repo-1", { agentContainer: true, agentImage: "orchestra/agent:custom" });
+
+      expect(request).toHaveBeenCalledWith("PATCH", "/repositories/repo-1", {
+        body: { agent_container: true, agent_image: "orchestra/agent:custom" },
       });
     });
 

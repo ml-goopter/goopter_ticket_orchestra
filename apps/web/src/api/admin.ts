@@ -51,6 +51,9 @@ export interface Repository {
   requiredCapability: string | null;
   setupCommand: string | null;
   testCommand: string | null;
+  /** design.md §9.9, D20. */
+  agentContainer: boolean;
+  agentImage: string | null;
   createdAt: string;
 }
 
@@ -65,6 +68,8 @@ export interface CreateRepositoryInput {
   requiredCapability: string | null;
   setupCommand: string | null;
   testCommand: string | null;
+  agentContainer: boolean;
+  agentImage: string | null;
 }
 
 export type PatchRepositoryInput = Partial<CreateRepositoryInput>;
@@ -144,6 +149,8 @@ const RepositorySchema = z.object({
   required_capability: z.string().nullable(),
   setup_command: z.string().nullable(),
   test_command: z.string().nullable(),
+  agent_container: z.boolean(),
+  agent_image: z.string().nullable(),
   created_at: z.string(),
 });
 
@@ -195,6 +202,8 @@ function mapRepository(row: z.infer<typeof RepositorySchema>): Repository {
     requiredCapability: row.required_capability,
     setupCommand: row.setup_command,
     testCommand: row.test_command,
+    agentContainer: row.agent_container,
+    agentImage: row.agent_image,
     createdAt: row.created_at,
   };
 }
@@ -262,6 +271,8 @@ function repositoryCreateBody(input: CreateRepositoryInput) {
     required_capability: input.requiredCapability,
     setup_command: input.setupCommand,
     test_command: input.testCommand,
+    agent_container: input.agentContainer,
+    agent_image: input.agentImage,
   };
 }
 
@@ -277,6 +288,8 @@ function repositoryPatchBody(patch: PatchRepositoryInput): Record<string, unknow
   if (patch.requiredCapability !== undefined) body.required_capability = patch.requiredCapability;
   if (patch.setupCommand !== undefined) body.setup_command = patch.setupCommand;
   if (patch.testCommand !== undefined) body.test_command = patch.testCommand;
+  if (patch.agentContainer !== undefined) body.agent_container = patch.agentContainer;
+  if (patch.agentImage !== undefined) body.agent_image = patch.agentImage;
   return body;
 }
 
