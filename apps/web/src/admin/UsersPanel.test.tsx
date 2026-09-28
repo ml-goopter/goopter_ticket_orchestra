@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client.js";
 import type { AdminApi, AdminUser } from "../api/admin.js";
+import { formatDateTime } from "../ui/datetime.js";
 import { UsersPanel } from "./UsersPanel.js";
 
 afterEach(cleanup);
@@ -70,7 +71,13 @@ describe("UsersPanel", () => {
 
     await waitFor(() => expect(screen.getByText("newuser@example.com")).toBeTruthy());
     expect(screen.getByText("New User")).toBeTruthy();
-    expect(screen.getByText("2026-01-01T00:00:00.000Z")).toBeTruthy();
+    // createdAt is far enough in the past that formatRelativeTime falls back
+    // to the same absolute string formatDateTime produces (ui/datetime.ts),
+    // so this stays true regardless of when the suite runs.
+    const created = screen.getByText(formatDateTime("2026-01-01T00:00:00.000Z"));
+    expect(created.tagName).toBe("TIME");
+    expect(created.getAttribute("dateTime")).toBe("2026-01-01T00:00:00.000Z");
+    expect(created.getAttribute("title")).toBe(formatDateTime("2026-01-01T00:00:00.000Z"));
     expect(screen.getAllByText("Active").length).toBe(1);
     expect(screen.getAllByText("Disabled").length).toBe(1);
   });

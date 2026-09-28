@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createApiClient, type ApiClient } from "../api/client.js";
 import { createCostsApi, type CostGroup, type CostRow } from "../api/costs.js";
-import { formatCostUsd } from "../board/format.js";
+import { formatNumber, formatUsd } from "../ui/number.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
 
 export interface CostsViewProps {
@@ -20,14 +20,40 @@ function dateInputToIso(value: string): string {
   return new Date(`${value}T00:00:00.000Z`).toISOString();
 }
 
+interface RowTotals {
+  costUsd: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  mainCostUsd: number;
+  reviewCostUsd: number;
+  resumeCostUsd: number;
+}
+
+/** Sums the numeric columns across every row (contract point 4: a totals row once there is more than one). */
+function sumRows(rows: CostRow[]): RowTotals {
+  return rows.reduce<RowTotals>(
+    (acc, row) => ({
+      costUsd: acc.costUsd + row.costUsd,
+      inputTokens: acc.inputTokens + row.inputTokens,
+      cachedInputTokens: acc.cachedInputTokens + row.cachedInputTokens,
+      outputTokens: acc.outputTokens + row.outputTokens,
+      mainCostUsd: acc.mainCostUsd + row.byKind.main.costUsd,
+      reviewCostUsd: acc.reviewCostUsd + row.byKind.review.costUsd,
+      resumeCostUsd: acc.resumeCostUsd + row.byKind.resume.costUsd,
+    }),
+    { costUsd: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, mainCostUsd: 0, reviewCostUsd: 0, resumeCostUsd: 0 },
+  );
+}
+
 /**
- * Costs (design.md §14, §12.5 `GET /costs`, task contract GOT.44 part 5):
- * group by project, task, or runtime; filter by an optional from/to date
- * range; USD and token totals with a by-kind (main/review/resume)
- * sub-breakdown. The Claude SDK's `total_cost_usd` is an estimate under a
- * subscription login (C28/OI2), so the runtime grouping's `claude` row
- * carries an "estimated" badge -- project/task rows can mix runtimes and so
- * do not.
+ * Costs (design.md §14, §12.5 `GET /costs`, task contract GOT.44 part 5;
+ * restyled by U5): group by project, task, or runtime; filter by an
+ * optional from/to date range; USD and token totals with a by-kind
+ * (main/review/resume) sub-breakdown. The Claude SDK's `total_cost_usd` is
+ * an estimate under a subscription login (C28/OI2), so the runtime
+ * grouping's `claude` row carries an "estimated" badge -- project/task
+ * rows can mix runtimes and so do not.
  */
 export function CostsView({ request }: CostsViewProps = {}) {
   const costsApi = useMemo(() => createCostsApi(request ?? createApiClient().request), [request]);
@@ -60,45 +86,78 @@ export function CostsView({ request }: CostsViewProps = {}) {
     void fetchRows();
   }, [fetchRows]);
 
+  const totals = rows && rows.length > 1 ? sumRows(rows) : null;
+
   return (
-    <main>
-      <h1>Costs</h1>
-      <form onSubmit={(event) => event.preventDefault()}>
-        <label>
-          Group by
-          <select value={group} onChange={(event) => setGroup(event.target.value as CostGroup)}>
-            {GROUPS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          From
-          <input type="date" value={from} onChange={(event) => setFrom(event.target.value)} />
-        </label>
-        <label>
-          To
-          <input type="date" value={to} onChange={(event) => setTo(event.target.value)} />
-        </label>
+    <>
+      <div className="page-header">
+        <h1 className="page-header__title">Costs</h1>
+      </div>
+
+      <form className="toolbar" onSubmit={(event) => event.preventDefault()}>
+        <div className="field">
+          <label>
+            Group by
+            <select value={group} onChange={(event) => setGroup(event.target.value as CostGroup)}>
+              {GROUPS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="field">
+          <label>
+            From
+            <input type="date" value={from} onChange={(event) => setFrom(event.target.value)} />
+          </label>
+        </div>
+        <div className="field">
+          <label>
+            To
+            <input type="date" value={to} onChange={(event) => setTo(event.target.value)} />
+          </label>
+        </div>
       </form>
 
-      {error && <p role="alert">{error}</p>}
+      {error && (
+        <p className="alert alert--error" role="alert">
+          {error}
+        </p>
+      )}
       {!error && rows === null && <p>Loading...</p>}
-      {rows && rows.length === 0 && <p>No costs recorded yet.</p>}
+      {rows && rows.length === 0 && (
+        <div className="empty-state">
+          <p>No costs recorded yet.</p>
+        </div>
+      )}
       {rows && rows.length > 0 && (
         <table>
           <thead>
             <tr>
               <th scope="col">Name</th>
-              <th scope="col">Cost</th>
-              <th scope="col">Input tokens</th>
-              <th scope="col">Cached input tokens</th>
-              <th scope="col">Output tokens</th>
-              <th scope="col">Main</th>
-              <th scope="col">Review</th>
-              <th scope="col">Resume</th>
+              <th scope="col" className="num">
+                Cost
+              </th>
+              <th scope="col" className="num">
+                Input tokens
+              </th>
+              <th scope="col" className="num">
+                Cached input tokens
+              </th>
+              <th scope="col" className="num">
+                Output tokens
+              </th>
+              <th scope="col" className="num">
+                Main
+              </th>
+              <th scope="col" className="num">
+                Review
+              </th>
+              <th scope="col" className="num">
+                Resume
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -108,24 +167,38 @@ export function CostsView({ request }: CostsViewProps = {}) {
                 <tr key={row.key.id}>
                   <td>
                     {row.key.label}
-                    {estimated && <span> (estimated)</span>}
+                    {estimated && <span className="badge badge--neutral"> (estimated)</span>}
                   </td>
-                  <td>
-                    {formatCostUsd(row.costUsd)}
+                  <td className="num">
+                    {formatUsd(row.costUsd)}
                     {row.unpricedRows > 0 && <span> ({row.unpricedRows} unpriced)</span>}
                   </td>
-                  <td>{row.inputTokens}</td>
-                  <td>{row.cachedInputTokens}</td>
-                  <td>{row.outputTokens}</td>
-                  <td>{formatCostUsd(row.byKind.main.costUsd)}</td>
-                  <td>{formatCostUsd(row.byKind.review.costUsd)}</td>
-                  <td>{formatCostUsd(row.byKind.resume.costUsd)}</td>
+                  <td className="num">{formatNumber(row.inputTokens)}</td>
+                  <td className="num">{formatNumber(row.cachedInputTokens)}</td>
+                  <td className="num">{formatNumber(row.outputTokens)}</td>
+                  <td className="num">{formatUsd(row.byKind.main.costUsd)}</td>
+                  <td className="num">{formatUsd(row.byKind.review.costUsd)}</td>
+                  <td className="num">{formatUsd(row.byKind.resume.costUsd)}</td>
                 </tr>
               );
             })}
           </tbody>
+          {totals && (
+            <tfoot>
+              <tr>
+                <th scope="row">Total</th>
+                <td className="num">{formatUsd(totals.costUsd)}</td>
+                <td className="num">{formatNumber(totals.inputTokens)}</td>
+                <td className="num">{formatNumber(totals.cachedInputTokens)}</td>
+                <td className="num">{formatNumber(totals.outputTokens)}</td>
+                <td className="num">{formatUsd(totals.mainCostUsd)}</td>
+                <td className="num">{formatUsd(totals.reviewCostUsd)}</td>
+                <td className="num">{formatUsd(totals.resumeCostUsd)}</td>
+              </tr>
+            </tfoot>
+          )}
         </table>
       )}
-    </main>
+    </>
   );
 }

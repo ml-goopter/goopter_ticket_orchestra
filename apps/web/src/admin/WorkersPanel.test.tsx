@@ -46,14 +46,25 @@ describe("WorkersPanel", () => {
     await waitFor(() => expect(screen.getByText("No workers registered.")).toBeTruthy());
   });
 
-  it("lists host, capabilities, slots, and the formatted heartbeat age", async () => {
+  it("lists host, capabilities as badges, slots as used/max, and the formatted heartbeat age", async () => {
     const adminApi = fakeAdminApi({ listWorkers: vi.fn().mockResolvedValue([worker()]) });
     render(<WorkersPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("admin-test-host")).toBeTruthy());
-    expect(screen.getByText("default, docker")).toBeTruthy();
+    expect(screen.getByText("default")).toBeTruthy();
+    expect(screen.getByText("docker")).toBeTruthy();
+    expect(screen.getByText("1/3")).toBeTruthy();
     expect(screen.getByText("1m ago")).toBeTruthy();
     expect(screen.queryByTestId("stale-marker")).toBeNull();
+  });
+
+  it("shows a muted em dash when a worker has no capabilities", async () => {
+    const adminApi = fakeAdminApi({ listWorkers: vi.fn().mockResolvedValue([worker({ capabilities: [] })]) });
+    render(<WorkersPanel adminApi={adminApi} />);
+
+    await waitFor(() => expect(screen.getByText("admin-test-host")).toBeTruthy());
+    const dash = screen.getByText("—");
+    expect(dash.className).toContain("admin-table__muted");
   });
 
   it("marks a worker stale once its heartbeat age exceeds 15 minutes", async () => {
