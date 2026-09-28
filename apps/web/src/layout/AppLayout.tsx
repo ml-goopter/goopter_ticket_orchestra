@@ -18,27 +18,36 @@ export function AppLayout({ client }: AppLayoutProps = {}) {
   const { user, logout } = useSession();
   const apiClient = useMemo(() => client ?? createApiClient(), [client]);
 
+  const navLinkClassName = ({ isActive }: { isActive: boolean }) =>
+    `app-shell__nav-link${isActive ? " app-shell__nav-link--active" : ""}`;
+
   return (
-    <div>
-      <header>
-        <span>Orchestra</span>
-        <nav>
-          <NavLink to="/">Board</NavLink>
-          <NavLink to="/admin">Admin</NavLink>
-          <NavLink to="/costs">Costs</NavLink>
+    <div className="app-shell">
+      <header className="app-shell__bar">
+        <span className="app-shell__brand">Orchestra</span>
+        <nav className="app-shell__nav">
+          <NavLink to="/" end className={navLinkClassName}>
+            Board
+          </NavLink>
+          <NavLink to="/admin" className={navLinkClassName}>
+            Admin
+          </NavLink>
+          <NavLink to="/costs" className={navLinkClassName}>
+            Costs
+          </NavLink>
         </nav>
-        <div>
-          {user && <span>{user.displayName}</span>}
+        <AttentionDrawer client={apiClient} />
+        <div className="app-shell__user">
+          {user && <span className="app-shell__user-name">{user.displayName}</span>}
           <button type="button" onClick={() => void logout()}>
             Log out
           </button>
         </div>
       </header>
-      <div>
-        <main>
+      <div className="app-shell__main">
+        <main className="page">
           <Outlet />
         </main>
-        <AttentionDrawer client={apiClient} />
       </div>
     </div>
   );

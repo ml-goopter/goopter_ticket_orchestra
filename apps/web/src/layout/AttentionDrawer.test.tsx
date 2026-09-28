@@ -382,4 +382,96 @@ describe("AttentionDrawer", () => {
     // Only the failed markNotificationRead call; no refetch follows a rejection.
     expect(client.listNotifications).toHaveBeenCalledTimes(1);
   });
+
+  it("links a notification's title to its issue when issueId is set, else to its task (V3)", async () => {
+    const fixtures: Fixtures = {
+      issues: [],
+      tasks: [makeTask({ id: "t1", jiraKey: "AAA-1", state: "READY" })],
+      notifications: [
+        makeNotification({ id: "n1", taskId: "t1", issueId: "i9", title: "Has an issue", readAt: null }),
+        makeNotification({ id: "n2", taskId: "t1", issueId: null, title: "No issue", readAt: null }),
+      ],
+    };
+    const client = makeClient(fixtures);
+    renderDrawer(client);
+
+    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("2"));
+    await openDrawer();
+
+    const unreadSection = screen.getByRole("region", { name: "Unread notifications" });
+    expect(within(unreadSection).getByRole("link", { name: "Has an issue" }).getAttribute("href")).toBe(
+      "/issues/i9",
+    );
+    expect(within(unreadSection).getByRole("link", { name: "No issue" }).getAttribute("href")).toBe("/tasks/t1");
+    expect(within(unreadSection).getAllByText("AAA-1")).toHaveLength(2);
+  });
+
+  describe("dialog behaviour (U1)", () => {
+    it("is a dialog with an accessible name, closed by default and opened by the trigger", async () => {
+      const client = makeClient({ issues: [], tasks: [], notifications: [] });
+      renderDrawer(client);
+      await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+
+      await openDrawer();
+
+      const dialog = screen.getByRole("dialog", { name: "Attention" });
+      expect(dialog).toBeTruthy();
+    });
+
+    it("moves focus into the panel on open and back to the trigger on close via the close button", async () => {
+      const client = makeClient({ issues: [], tasks: [], notifications: [] });
+      renderDrawer(client);
+      await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+
+      const toggle = screen.getByRole("button", { name: /attention/i });
+      await openDrawer();
+
+      const dialog = screen.getByRole("dialog", { name: "Attention" });
+      expect(dialog.contains(document.activeElement)).toBe(true);
+
+      const closeButton = screen.getByRole("button", { name: "Close" });
+      await act(async () => {
+        closeButton.click();
+      });
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(toggle);
+    });
+
+    it("closes on Escape and returns focus to the trigger", async () => {
+      const client = makeClient({ issues: [], tasks: [], notifications: [] });
+      renderDrawer(client);
+      await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+
+      const toggle = screen.getByRole("button", { name: /attention/i });
+      await openDrawer();
+      expect(screen.getByRole("dialog", { name: "Attention" })).toBeTruthy();
+
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      });
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(toggle);
+    });
+
+    it("closes on a backdrop click", async () => {
+      const client = makeClient({ issues: [], tasks: [], notifications: [] });
+      renderDrawer(client);
+      await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+
+      await openDrawer();
+      expect(screen.getByRole("dialog", { name: "Attention" })).toBeTruthy();
+
+      const backdrop = document.querySelector(".drawer__backdrop");
+      expect(backdrop).toBeTruthy();
+      await act(async () => {
+        (backdrop as HTMLElement).click();
+      });
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+  });
 });

@@ -1,0 +1,8 @@
+/**
+ * Single stylesheet entry point, imported once from main.tsx (U1).
+ * Order matters: tokens define custom properties, base styles bare
+ * elements, components the shared classes later view tasks reuse.
+ */
+@import "./tokens.css";
+@import "./base.css";
+@import "./components.css";
