@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,8 @@ import type {
   SDKMessage,
   SDKResultMessage,
   SDKUserMessage,
+  SpawnedProcess,
+  SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   allowedToolsFor,
@@ -16,6 +19,7 @@ import {
   settingSourcesFor,
 } from "./policies.js";
 import { classifyRetriable } from "./retriable.js";
+import type { AgentProcess, ProcessSpawner } from "./spawner.js";
 import type {
   AgentAdapter,
   AgentEvent,
@@ -50,6 +54,12 @@ export interface ClaudeAdapterOptions {
    * Injectable so `canResume` can be tested without a real session.
    */
   sessionRoot?: string;
+  /**
+   * Injected process spawner (design.md §9.9), handed to the SDK as
+   * `spawnClaudeCodeProcess` on start and resume. Omitted, the SDK spawns
+   * the CLI itself on the host.
+   */
+  spawn?: ProcessSpawner;
 }
 
 /** Model reported on a usage event when the session never announced one. */
@@ -92,10 +102,13 @@ export class ClaudeAdapter implements AgentAdapter {
 
   readonly #query: ClaudeQueryFn;
   readonly #sessionRoot: string;
+  readonly #spawnProcess: SdkSpawnFn | undefined;
 
   constructor(options: ClaudeAdapterOptions = {}) {
     this.#query = options.query ?? sdkQuery;
     this.#sessionRoot = options.sessionRoot ?? defaultSessionRoot();
+    this.#spawnProcess =
+      options.spawn === undefined ? undefined : sdkSpawnFor(options.spawn);
   }
 
   start(req: StartRequest, signal: AbortSignal): AsyncIterable<AgentEvent> {
@@ -103,6 +116,7 @@ export class ClaudeAdapter implements AgentAdapter {
     let options: Options;
     try {
       options = { ...baseOptions(req), systemPrompt: req.systemPrompt };
+      if (this.#spawnProcess) options.spawnClaudeCodeProcess = this.#spawnProcess;
     } catch (error) {
       if (error instanceof InvalidTestCommandError) {
         return invalidTestCommandStream(error, redact);
@@ -125,6 +139,7 @@ export class ClaudeAdapter implements AgentAdapter {
     let options: Options;
     try {
       options = { ...baseOptions(req), resume: req.sessionId };
+      if (this.#spawnProcess) options.spawnClaudeCodeProcess = this.#spawnProcess;
     } catch (error) {
       if (error instanceof InvalidTestCommandError) {
         return invalidTestCommandStream(error, redact);
@@ -171,6 +186,113 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     return false;
   }
+}
+
+type SdkSpawnFn = (options: SpawnOptions) => SpawnedProcess;
+
+/**
+ * Adapts a `ProcessSpawner` to the SDK's `spawnClaudeCodeProcess` hook. The
+ * SDK passes the CLI command, args, cwd and env; a missing cwd falls back to
+ * the current directory, as a host spawn would.
+ */
+function sdkSpawnFor(spawn: ProcessSpawner): SdkSpawnFn {
+  return (options) =>
+    toSpawnedProcess(
+      spawn(options.command, options.args, {
+        cwd: options.cwd ?? process.cwd(),
+        env: options.env,
+      }),
+      options.signal,
+    );
+}
+
+type ExitListener = (code: number | null, signal: NodeJS.Signals | null) => void;
+type ErrorListener = (error: Error) => void;
+
+/**
+ * Presents an `AgentProcess` as the SDK's `SpawnedProcess`: `exit` and
+ * `error` events from the exit promise, `exitCode`/`signalCode` once it
+ * settles, and `kill(signal)` forwarded to the spawner's group kill.
+ *
+ * The SDK stops the CLI by ending stdin, then `kill("SIGTERM")`, then
+ * `kill("SIGKILL")`, and aborts `signal` after its grace window. An abort
+ * sends SIGTERM, as Node's `spawn({ signal })` does for a host spawn. Once
+ * the process has exited, kill is a no-op so a reused process group id is
+ * never signalled.
+ */
+function toSpawnedProcess(
+  child: AgentProcess,
+  signal: AbortSignal,
+): SpawnedProcess {
+  const events = new EventEmitter();
+  let exited = false;
+  let killed = false;
+  let exitCode: number | null = null;
+  let signalCode: NodeJS.Signals | null = null;
+
+  const kill = (sig: NodeJS.Signals): boolean => {
+    if (exited) return false;
+    killed = true;
+    child.kill(sig);
+    return true;
+  };
+  const onAbort = (): void => {
+    kill("SIGTERM");
+  };
+
+  // The SDK reads stderr only from a process it spawned itself. Draining it
+  // keeps a full pipe from stalling the CLI.
+  child.stderr.on("error", () => {});
+  child.stderr.resume();
+
+  void child.exit.then(
+    (outcome) => {
+      exited = true;
+      signal.removeEventListener("abort", onAbort);
+      exitCode = outcome.code;
+      signalCode = outcome.signal as NodeJS.Signals | null;
+      events.emit("exit", exitCode, signalCode);
+    },
+    (error: unknown) => {
+      exited = true;
+      signal.removeEventListener("abort", onAbort);
+      // An EventEmitter throws on an unheard `error`.
+      if (events.listenerCount("error") > 0) {
+        events.emit("error", error instanceof Error ? error : new Error(String(error)));
+      }
+    },
+  );
+
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
+
+  const on = (event: "exit" | "error", listener: ExitListener | ErrorListener): void => {
+    events.on(event, listener);
+  };
+  const once = (event: "exit" | "error", listener: ExitListener | ErrorListener): void => {
+    events.once(event, listener);
+  };
+  const off = (event: "exit" | "error", listener: ExitListener | ErrorListener): void => {
+    events.off(event, listener);
+  };
+
+  return {
+    stdin: child.stdin,
+    stdout: child.stdout,
+    get killed() {
+      return killed;
+    },
+    get exitCode() {
+      return exitCode;
+    },
+    get signalCode() {
+      return signalCode;
+    },
+    kill,
+    on,
+    once,
+    off,
+  };
 }
 
 /**
