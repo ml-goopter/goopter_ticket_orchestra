@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router";
 import { SessionProvider } from "./auth/SessionProvider.js";
 import { AppRouter } from "./router.js";
+import "./styles/index.css";
 
 const rootElement = document.getElementById("root");
 if (!rootElement) {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { createApiClient, type BoardApiClient } from "../api/client.js";
 import type { Issue, Notification, TaskCard } from "../api/types.js";
@@ -32,6 +32,35 @@ export function AttentionDrawer({ client, createEventSource }: AttentionDrawerPr
   const [notifications, setNotifications] = useState<Notification[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const { begin, isCurrent } = useLatestRequest();
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const wasOpenRef = useRef(false);
+
+  const close = useCallback(() => setOpen(false), []);
+
+  // Focus moves into the panel on open, and back to the trigger on close
+  // (not on initial mount, which is why this tracks the prior open state
+  // rather than reacting to `!open` directly).
+  useEffect(() => {
+    if (open) {
+      wasOpenRef.current = true;
+      panelRef.current?.focus();
+    } else if (wasOpenRef.current) {
+      wasOpenRef.current = false;
+      triggerRef.current?.focus();
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        close();
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [open, close]);
 
   const fetchAll = useCallback(async () => {
     const generation = begin();
@@ -103,98 +132,144 @@ export function AttentionDrawer({ client, createEventSource }: AttentionDrawerPr
 
   return (
     <aside aria-label="Attention">
-      <button type="button" aria-expanded={open} onClick={() => setOpen((prev) => !prev)}>
-        Attention <span data-testid="attention-count">{count}</span>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="attention-trigger__button"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={() => setOpen((prev) => !prev)}
+      >
+        Attention{" "}
+        <span className="badge badge--attention attention-trigger__count" data-testid="attention-count">
+          {count}
+        </span>
       </button>
       {open && (
-        <div>
-          {error && <p role="alert">{error}</p>}
+        <>
+          <div className="drawer__backdrop" onClick={close} />
+          <div className="drawer" role="dialog" aria-label="Attention" aria-modal="true" ref={panelRef} tabIndex={-1}>
+            <div className="drawer__header">
+              <h2 className="drawer__title">Attention</h2>
+              <button type="button" className="drawer__close" aria-label="Close" onClick={close}>
+                &times;
+              </button>
+            </div>
+            <div className="drawer__body">
+              {error && (
+                <p className="alert alert--error" role="alert">
+                  {error}
+                </p>
+              )}
 
-          <section aria-label="Blocking issues">
-            <h2>Blocking issues</h2>
-            {blockingIssues.length === 0 ? (
-              <p>No blocking issues.</p>
-            ) : (
-              <ul>
-                {blockingIssues.map((issue) => {
-                  const task = taskById.get(issue.taskId);
-                  return (
-                    <li key={issue.id}>
-                      <Link to={`/issues/${issue.id}`}>
-                        {task ? `${task.jiraKey}: ${issue.title}` : issue.title}
-                      </Link>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </section>
+              <section className="drawer__section" aria-label="Blocking issues">
+                <h2>Blocking issues</h2>
+                {blockingIssues.length === 0 ? (
+                  <p>No blocking issues.</p>
+                ) : (
+                  <ul className="drawer__list">
+                    {blockingIssues.map((issue) => {
+                      const task = taskById.get(issue.taskId);
+                      return (
+                        <li className="drawer__list-item" key={issue.id}>
+                          <Link className="drawer__item-title" to={`/issues/${issue.id}`}>
+                            {task ? `${task.jiraKey}: ${issue.title}` : issue.title}
+                          </Link>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </section>
 
-          <section aria-label="Spec reviews requested">
-            <h2>Spec reviews requested</h2>
-            {specReviews.length === 0 ? (
-              <p>No spec reviews requested.</p>
-            ) : (
-              <ul>
-                {specReviews.map((task) => (
-                  <li key={task.id}>
-                    <Link to={`/tasks/${task.id}/spec`}>{task.jiraKey}</Link>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
+              <section className="drawer__section" aria-label="Spec reviews requested">
+                <h2>Spec reviews requested</h2>
+                {specReviews.length === 0 ? (
+                  <p>No spec reviews requested.</p>
+                ) : (
+                  <ul className="drawer__list">
+                    {specReviews.map((task) => (
+                      <li className="drawer__list-item" key={task.id}>
+                        <Link className="drawer__item-title" to={`/tasks/${task.id}/spec`}>
+                          {task.jiraKey}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
 
-          <section aria-label="Needs human">
-            <h2>Needs human</h2>
-            {needsHuman.length === 0 ? (
-              <p>No tasks need a human.</p>
-            ) : (
-              <ul>
-                {needsHuman.map((task) => (
-                  <li key={task.id}>
-                    <Link to={`/tasks/${task.id}`}>{task.jiraKey}</Link>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
+              <section className="drawer__section" aria-label="Needs human">
+                <h2>Needs human</h2>
+                {needsHuman.length === 0 ? (
+                  <p>No tasks need a human.</p>
+                ) : (
+                  <ul className="drawer__list">
+                    {needsHuman.map((task) => (
+                      <li className="drawer__list-item" key={task.id}>
+                        <Link className="drawer__item-title" to={`/tasks/${task.id}`}>
+                          {task.jiraKey}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
 
-          <section aria-label="Ready for merge">
-            <h2>Ready for merge</h2>
-            {readyForMerge.length === 0 ? (
-              <p>No tasks ready for merge.</p>
-            ) : (
-              <ul>
-                {readyForMerge.map((task) => (
-                  <li key={task.id}>
-                    <Link to={`/tasks/${task.id}`}>{task.jiraKey}</Link>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
+              <section className="drawer__section" aria-label="Ready for merge">
+                <h2>Ready for merge</h2>
+                {readyForMerge.length === 0 ? (
+                  <p>No tasks ready for merge.</p>
+                ) : (
+                  <ul className="drawer__list">
+                    {readyForMerge.map((task) => (
+                      <li className="drawer__list-item" key={task.id}>
+                        <Link className="drawer__item-title" to={`/tasks/${task.id}`}>
+                          {task.jiraKey}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
 
-          <section aria-label="Unread notifications">
-            <h2>Unread notifications</h2>
-            {unread.length === 0 ? (
-              <p>No unread notifications.</p>
-            ) : (
-              <ul>
-                {unread.map((notification) => (
-                  <li key={notification.id}>
-                    {notification.title}
-                    <button type="button" onClick={() => void handleMarkRead(notification.id)}>
-                      Mark read
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
+              <section className="drawer__section" aria-label="Unread notifications">
+                <h2>Unread notifications</h2>
+                {unread.length === 0 ? (
+                  <p>No unread notifications.</p>
+                ) : (
+                  <ul className="drawer__list">
+                    {unread.map((notification) => {
+                      const task = taskById.get(notification.taskId);
+                      const href = notification.issueId
+                        ? `/issues/${notification.issueId}`
+                        : `/tasks/${notification.taskId}`;
+                      return (
+                        <li className="drawer__list-item" key={notification.id}>
+                          <span className="drawer__item-text">
+                            <Link className="drawer__item-title" to={href}>
+                              {notification.title}
+                            </Link>
+                            {task && <span className="drawer__item-meta">{task.jiraKey}</span>}
+                          </span>
+                          <button
+                            type="button"
+                            className="drawer__item-action"
+                            onClick={() => void handleMarkRead(notification.id)}
+                          >
+                            Mark read
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </section>
 
-          {count === 0 && <p>Nothing needs attention.</p>}
-        </div>
+              {count === 0 && <p>Nothing needs attention.</p>}
+            </div>
+          </div>
+        </>
       )}
     </aside>
   );

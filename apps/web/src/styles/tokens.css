@@ -1,0 +1,79 @@
+/**
+ * Design tokens (U1, docs/design.md §14). Light theme only (user decision).
+ * Every later view task styles against these custom properties instead of
+ * hard-coding colours, spacing, radii, or shadows.
+ */
+:root {
+  color-scheme: light;
+
+  /* Type */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --font-size-xs: 12px;
+  --font-size-sm: 13px;
+  --font-size-base: 14px;
+  --font-size-md: 15px;
+  --font-size-lg: 18px;
+  --font-size-xl: 22px;
+  --font-size-2xl: 28px;
+  --line-height-base: 1.5;
+
+  /* 4px spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* Radii */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-full: 999px;
+
+  /* Neutral surfaces and text (slate) */
+  --color-surface: #ffffff;
+  --color-surface-raised: #f8fafc;
+  --color-surface-sunken: #f1f5f9;
+  --color-border: #cbd5e1;
+  --color-border-strong: #94a3b8;
+  --color-text: #0f172a;
+  --color-text-muted: #475569;
+  --color-text-faint: #64748b;
+
+  /* Accent, primary actions and links */
+  --color-accent: #2563eb;
+  --color-accent-hover: #1d4ed8;
+  --color-accent-contrast: #ffffff;
+  --color-link: var(--color-accent);
+
+  /* Status colours: attention/amber, progress/blue, success/green,
+     danger/red, neutral/grey. Each has a background + foreground pair
+     meeting WCAG AA for the foreground text on the background. */
+  --color-attention-bg: #fef3c7;
+  --color-attention-fg: #7c4a03;
+  --color-progress-bg: #dbeafe;
+  --color-progress-fg: #1e3a8a;
+  --color-success-bg: #dcfce7;
+  --color-success-fg: #14532d;
+  --color-danger-bg: #fee2e2;
+  --color-danger-fg: #7f1d1d;
+  --color-neutral-bg: #e2e8f0;
+  --color-neutral-fg: #334155;
+
+  /* Feedback surfaces (alerts) reuse the status pairs above. */
+  --color-danger: #b91c1c;
+
+  /* Shadows */
+  --shadow-raised: 0 1px 2px rgba(15, 23, 42, 0.08), 0 1px 1px rgba(15, 23, 42, 0.04);
+  --shadow-drawer: -8px 0 24px rgba(15, 23, 42, 0.18);
+
+  /* Focus ring, visible on every interactive element */
+  --focus-ring: 0 0 0 2px var(--color-surface), 0 0 0 4px var(--color-accent);
+}

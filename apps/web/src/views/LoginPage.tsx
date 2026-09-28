@@ -23,34 +23,44 @@ export function LoginPage() {
   }
 
   return (
-    <main>
-      <h1>Log in</h1>
-      <form onSubmit={(event) => void handleSubmit(event)}>
-        <label>
-          Email
-          <input
-            type="email"
-            value={email}
-            autoComplete="username"
-            onChange={(event) => setEmail(event.target.value)}
-            required
-          />
-        </label>
-        <label>
-          Password
-          <input
-            type="password"
-            value={password}
-            autoComplete="current-password"
-            onChange={(event) => setPassword(event.target.value)}
-            required
-          />
-        </label>
-        <button type="submit" disabled={submitting}>
-          Log in
-        </button>
-      </form>
-      {error && <p role="alert">{error}</p>}
+    <main className="page login-page">
+      <div className="card login-page__card">
+        <h1>Log in</h1>
+        <form onSubmit={(event) => void handleSubmit(event)}>
+          <div className="field">
+            <label>
+              Email
+              <input
+                type="email"
+                value={email}
+                autoComplete="username"
+                onChange={(event) => setEmail(event.target.value)}
+                required
+              />
+            </label>
+          </div>
+          <div className="field">
+            <label>
+              Password
+              <input
+                type="password"
+                value={password}
+                autoComplete="current-password"
+                onChange={(event) => setPassword(event.target.value)}
+                required
+              />
+            </label>
+          </div>
+          <button type="submit" className="primary" disabled={submitting}>
+            Log in
+          </button>
+        </form>
+        {error && (
+          <p className="alert alert--error" role="alert">
+            {error}
+          </p>
+        )}
+      </div>
     </main>
   );
 }

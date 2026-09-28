@@ -1,0 +1,564 @@
+/**
+ * Component classes (U1, docs/design.md §14 layouts). Every class below is
+ * shared: later view tasks (board, spec builder, issue detail, task
+ * detail, admin, costs) may use these plus their own local classes in
+ * their own stylesheet files, but must not invent duplicates of these.
+ * Naming: BEM-ish, `.block`, `.block__part`, `.block--modifier`.
+ */
+
+/* --------------------------------------------------------------------
+ * App shell: fixed top bar (brand, nav, user, attention trigger) plus the
+ * page area below it. Used once, by layout/AppLayout.tsx.
+ * ------------------------------------------------------------------ */
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-shell__bar {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 20;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  padding: 0 var(--space-5);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.app-shell__brand {
+  font-weight: 700;
+  font-size: var(--font-size-md);
+  color: var(--color-text);
+}
+
+.app-shell__nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex: 1;
+}
+
+.app-shell__nav-link {
+  color: var(--color-text-muted);
+  font-weight: 600;
+  font-size: var(--font-size-sm);
+  text-decoration: none;
+  padding: var(--space-2) 0;
+  border-bottom: 2px solid transparent;
+}
+
+.app-shell__nav-link:hover {
+  color: var(--color-text);
+}
+
+.app-shell__nav-link--active {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent);
+}
+
+.app-shell__user {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.app-shell__user-name {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.app-shell__main {
+  padding-top: 56px;
+}
+
+/*
+ * Attention trigger: an ordinary flex item in the top bar (AppLayout.tsx
+ * renders `<AttentionDrawer>` between the nav and the user block), so it
+ * takes its natural width and never overlaps neighbouring controls. Its
+ * open drawer panel and backdrop are `position: fixed` (below), so they
+ * still cover the full viewport regardless of where the trigger sits in
+ * the DOM.
+ */
+.attention-trigger__button {
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+}
+
+.attention-trigger__button:hover:not(:disabled) {
+  color: var(--color-text);
+  border: none;
+}
+
+.attention-trigger__count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--space-1);
+}
+
+/* --------------------------------------------------------------------
+ * Drawer: slide-over panel from the right (AttentionDrawer), with a
+ * backdrop. Closed state simply omits `.drawer` and `.drawer__backdrop`
+ * from the DOM.
+ * ------------------------------------------------------------------ */
+.drawer__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 31;
+  width: min(420px, 100vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--color-surface);
+  box-shadow: var(--shadow-drawer);
+}
+
+.drawer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.drawer__title {
+  margin: 0;
+  font-size: var(--font-size-lg);
+}
+
+.drawer__close {
+  height: 28px;
+  width: 28px;
+  padding: 0;
+}
+
+.drawer__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-4) var(--space-5);
+}
+
+.drawer__section + .drawer__section {
+  margin-top: var(--space-5);
+}
+
+.drawer__section h2 {
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-2);
+}
+
+/* Drawer item rows: no bullets, title/meta/action on one line. */
+.drawer__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.drawer__list-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+}
+
+.drawer__item-text {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  flex: 1;
+}
+
+.drawer__item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drawer__item-meta {
+  flex-shrink: 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+}
+
+.drawer__item-action {
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-xs);
+}
+
+/* --------------------------------------------------------------------
+ * Page container and header: title plus a right-aligned actions row.
+ * ------------------------------------------------------------------ */
+.page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5);
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.page-header__title {
+  margin: 0;
+}
+
+.page-header__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* --------------------------------------------------------------------
+ * Card: a raised surface for grouped content.
+ * ------------------------------------------------------------------ */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-raised);
+  padding: var(--space-5);
+}
+
+/* --------------------------------------------------------------------
+ * Badge: a small status pill. `.badge--attention|progress|success|danger|
+ * neutral` map to the status colour pairs in tokens.css.
+ * ------------------------------------------------------------------ */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.badge--attention {
+  background: var(--color-attention-bg);
+  color: var(--color-attention-fg);
+}
+
+.badge--progress {
+  background: var(--color-progress-bg);
+  color: var(--color-progress-fg);
+}
+
+.badge--success {
+  background: var(--color-success-bg);
+  color: var(--color-success-fg);
+}
+
+.badge--danger {
+  background: var(--color-danger-bg);
+  color: var(--color-danger-fg);
+}
+
+.badge--neutral {
+  background: var(--color-neutral-bg);
+  color: var(--color-neutral-fg);
+}
+
+/* --------------------------------------------------------------------
+ * Toolbar: a wrapping row of filter controls above a table or board.
+ * ------------------------------------------------------------------ */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.toolbar label {
+  margin-bottom: var(--space-1);
+}
+
+/* --------------------------------------------------------------------
+ * Form grid: two columns on wide screens, one column below 720px.
+ * ------------------------------------------------------------------ */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4) var(--space-5);
+}
+
+@media (max-width: 720px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.form-grid__full {
+  grid-column: 1 / -1;
+}
+
+/* --------------------------------------------------------------------
+ * Field: label above its control, with optional help and error text.
+ * ------------------------------------------------------------------ */
+.field {
+  display: flex;
+  flex-direction: column;
+}
+
+.field__help {
+  margin-top: var(--space-1);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+}
+
+.field__error {
+  margin-top: var(--space-1);
+  font-size: var(--font-size-xs);
+  color: var(--color-danger);
+}
+
+/* --------------------------------------------------------------------
+ * Empty state: centred muted placeholder inside a card or panel.
+ * ------------------------------------------------------------------ */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-8) var(--space-4);
+  color: var(--color-text-faint);
+  text-align: center;
+}
+
+/* --------------------------------------------------------------------
+ * Alert: an info or error banner, e.g. for a form-level or fetch error.
+ * ------------------------------------------------------------------ */
+.alert {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  font-size: var(--font-size-sm);
+}
+
+.alert--info {
+  background: var(--color-progress-bg);
+  color: var(--color-progress-fg);
+}
+
+.alert--error {
+  background: var(--color-danger-bg);
+  color: var(--color-danger-fg);
+}
+
+/* --------------------------------------------------------------------
+ * Split layout: two independently scrolling panes side by side, stacked
+ * below 900px. E.g. the spec builder's chat pane plus structured form.
+ * ------------------------------------------------------------------ */
+.split {
+  display: flex;
+  gap: var(--space-5);
+  align-items: stretch;
+  min-height: 0;
+}
+
+.split__pane {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+@media (max-width: 900px) {
+  .split {
+    flex-direction: column;
+  }
+
+  .split__pane {
+    overflow-y: visible;
+  }
+}
+
+/* --------------------------------------------------------------------
+ * Main-plus-sidebar layout: a growing main column with a fixed-width
+ * side panel. E.g. the task detail timeline plus its side panel.
+ * ------------------------------------------------------------------ */
+.main-sidebar {
+  display: flex;
+  gap: var(--space-5);
+  align-items: flex-start;
+}
+
+.main-sidebar__main {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.main-sidebar__aside {
+  flex: 0 0 320px;
+}
+
+@media (max-width: 900px) {
+  .main-sidebar {
+    flex-direction: column;
+  }
+
+  .main-sidebar__aside {
+    flex-basis: auto;
+    width: 100%;
+  }
+}
+
+/* --------------------------------------------------------------------
+ * Tabs: a row of tab buttons with an active indicator.
+ * ------------------------------------------------------------------ */
+.tabs {
+  display: flex;
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  margin-bottom: var(--space-4);
+}
+
+.tabs__tab {
+  height: auto;
+  padding: var(--space-2) 0;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.tabs__tab:hover:not(:disabled) {
+  color: var(--color-text);
+}
+
+.tabs__tab--active {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent);
+}
+
+/* --------------------------------------------------------------------
+ * Kanban: a horizontally scrolling row of fixed-width columns. The
+ * "Waiting for You" / "Needs Human" columns take the `--highlighted`
+ * modifier (design.md §14: always leftmost and highlighted).
+ * ------------------------------------------------------------------ */
+.kanban {
+  display: flex;
+  gap: var(--space-4);
+  overflow-x: auto;
+  padding-bottom: var(--space-3);
+  align-items: flex-start;
+}
+
+.kanban__column {
+  flex: 0 0 280px;
+  width: 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  max-height: calc(100vh - 56px - var(--space-12));
+}
+
+.kanban__column--highlighted {
+  border-color: var(--color-attention-fg);
+  background: var(--color-attention-bg);
+}
+
+.kanban__column-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.kanban__column-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 var(--space-3) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* --------------------------------------------------------------------
+ * Markdown: rendered ui/Markdown.tsx output.
+ * ------------------------------------------------------------------ */
+.markdown p {
+  margin: 0 0 var(--space-3);
+}
+
+.markdown ul,
+.markdown ol {
+  margin: 0 0 var(--space-3);
+}
+
+.markdown pre {
+  margin: 0 0 var(--space-3);
+}
+
+.markdown blockquote {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-3);
+  border-left: 3px solid var(--color-border);
+  color: var(--color-text-muted);
+}
+
+.markdown table {
+  margin: 0 0 var(--space-3);
+}
+
+.markdown > *:last-child {
+  margin-bottom: 0;
+}
+
+/* --------------------------------------------------------------------
+ * Login page: a centred card with stacked fields (views/LoginPage.tsx).
+ * ------------------------------------------------------------------ */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.login-page__card {
+  width: min(360px, 100%);
+}
+
+.login-page__card .field + .field {
+  margin-top: var(--space-4);
+}
+
+.login-page__card button[type="submit"] {
+  width: 100%;
+  margin-top: var(--space-5);
+}
