@@ -27,17 +27,20 @@
 }
 
 /*
- * Column widths and gap (B1/B3): three tiers, narrowest first, each
+ * Column widths and gap (B1/B3, U7): three tiers, narrowest first, each
  * overriding the last via selector specificity (`.board-bleed .kanban__column`
  * beats components.css's single-class `.kanban__column`; adding a second
  * class beats that in turn), so this doesn't touch components.css itself
  * and doesn't depend on stylesheet import order.
  *   - default (populated, any column): 260px, same as before minus a hair.
  *   - highlighted and empty ("Waiting for You" / "Needs Human" with
- *     nothing in them): narrower, 220px, still a full header+body column.
- *   - empty and not highlighted: collapses to a 56px rail (below).
+ *     nothing in them): narrower, 180px, still a full header+body column.
+ *   - empty and not highlighted: collapses to a 96px compact column
+ *     (below).
  * The 12px gap (rather than components.css's 16px) is part of fitting all
- * ten columns in the viewport at once (B3).
+ * ten columns in the viewport at once (B3). At a 1440px viewport this is
+ * 2 highlighted (180px) + 7 compact (96px) + 1 populated (260px) + 9 gaps
+ * (12px) = 1,400px, inside the 1,400px board width (U7).
  */
 .board-bleed .kanban {
   gap: var(--space-3);
@@ -49,21 +52,21 @@
 }
 
 .board-bleed .kanban__column.board-column--highlighted-empty {
-  flex: 0 0 220px;
-  width: 220px;
+  flex: 0 0 180px;
+  width: 180px;
 }
 
 /*
- * Compact rail (B3): an empty, non-highlighted column collapses to a
- * narrow rail with no card area -- just its header, the count on top and
- * the column name rotated to read bottom-to-top below it. The `h2` stays
- * in the DOM as a real heading with its full text (only its rendering is
- * rotated), so the column's accessible name and heading role are
- * unaffected by the visual collapse.
+ * Compact column (B3, U7): an empty, non-highlighted column collapses to a
+ * narrow 96px column with no card area -- just its header, the count badge
+ * on top and the column name below it, horizontal and wrapped onto up to
+ * three lines (no rotation). The `h2` stays a real heading with its full
+ * text, so the column's accessible name and heading role are unaffected
+ * by the visual collapse.
  */
 .board-bleed .kanban__column.board-column--compact {
-  flex: 0 0 56px;
-  width: 56px;
+  flex: 0 0 96px;
+  width: 96px;
 }
 
 .board-column--compact .kanban__column-header {
@@ -79,10 +82,19 @@
   order: -1;
 }
 
+/*
+ * Compact column name (U7): the count badge sits above the name (`order:
+ * -1` above). The name itself wraps on word boundaries onto up to three
+ * lines at a smaller size (e.g. "Awaiting Spec Approval" reads as three
+ * lines) instead of the single-line, ellipsized, full-width style below,
+ * so the full name stays on screen without rotation or clipping.
+ */
 .board-column--compact .kanban__column-header h2 {
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
-  white-space: nowrap;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  text-align: center;
+  font-size: var(--font-size-xs);
 }
 
 /*
