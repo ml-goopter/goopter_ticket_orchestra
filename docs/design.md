@@ -1136,6 +1136,21 @@ Suggested sequence so each step is testable on its own.
 | OI4 | Jira comment noise on busy projects | a per-project `jira_comments_enabled` flag if needed |
 | OI5 | Base branch other than the default | add `base_branch` to `SpecContent` when a ticket needs it |
 
+### 17.1 First end-to-end run (2026-09-28, GOT.48)
+
+Ran against `ml-goopter/sandbox` and Jira project SCRUM with the Claude runtime on a subscription login. Two tickets covered the three journeys in §16 step 7:
+
+- SCRUM-92, plain: NEEDS_SPEC → spec proposed in one turn → approved → claimed → one review round (clean) → PR #1 → CI passed → READY_FOR_MERGE → merged by hand → DONE. Nine minutes ticket to DONE, 1.16 USD estimated.
+- SCRUM-93, blocking issue and revision: the spec agent raised a blocking issue for the missing languages (resolved as a clarification, session resumed in place); the approved spec deliberately left the Spanish strings undecided, the implementer raised a blocking issue, a user message on the issue got a reply and the execution returned to WAITING_FOR_USER, the issue was resolved as a spec revision, the revised spec was approved and the same session resumed with the diff header (`execution.resumed` carries `previous_spec_revision_id`), three review rounds (findings, findings, clean), PR #2, CI passed, merged, DONE. 1.29 USD estimated.
+
+Jira received the spec-approved, PR-opened and CI-passed comments on both tickets. No worker errors or warnings were logged. Observations, none requiring a design change:
+
+- OI2 confirmed: the SDK reports `total_cost_usd` on a subscription login; it is stored and labelled estimated.
+- The spec role raises blocking issues itself, so decisions and messages must reach spec executions (built as C54 in PR #46).
+- An implementation execution keeps receiving `agent.tool_call` and `usage.recorded` events for a few seconds after `execution.completed`, until the runner notices the stop. Accepted in PR #45.
+- Resolving as a spec revision writes one `spec.revised` event for the copied draft and another for each user edit of that draft.
+- Jira ticket status is never transitioned (D6, comments only); both tickets stayed in To Do after DONE.
+
 ---
 
 ## Appendix A. Decisions
