@@ -17,7 +17,7 @@ import { agentWorkers, executions } from "../schema/executions.js";
 import { projects, repositories } from "../schema/projects.js";
 import { tasks } from "../schema/tasks.js";
 import type { DbOrTx, Tx } from "../transition.js";
-import { holdsCapacity } from "./scheduler.js";
+import { containerModeMatches, holdsCapacity } from "./scheduler.js";
 import type { ExecutionRow, ProjectRow, TaskRow } from "./task-aggregate.js";
 
 /**
@@ -150,7 +150,7 @@ const queuedEvent = alias(executionEvents, "queued_event");
  * `execution.queued` event's `not_before` has passed at `now`, whose task
  * is `IMPLEMENTING` or `REVIEWING` with no other live execution, whose
  * runtime this worker detected, whose repository this worker is capable of
- * (D16) and is below `max_concurrent_worktrees` on this host (§6.3),
+ * (D16), matches in container mode (§9.9) and is below `max_concurrent_worktrees` on this host (§6.3),
  * counted per `holdsCapacity` (GOT.56: an idle spec session does not count).
  *
  * Locks the task row `FOR UPDATE OF tasks SKIP LOCKED`, so a concurrent
@@ -227,6 +227,7 @@ export async function selectRetryCandidate(
               ),
           ),
         ),
+        containerModeMatches(tx, input.workerId),
         sql`coalesce(${busy.n}, 0) < ${repositories.maxConcurrentWorktrees}`,
       ),
     )
