@@ -53,6 +53,7 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | containers | GOT.74 | repositories: agent_container and agent_image settings (C6) | #58 |
 | containers | GOT.69 | deploy: orchestra/agent container image (C1) | #59 |
 | containers | GOT.79 | adapters: agent-tools token off the Claude CLI command line (C3b) | #60 |
+| fixes | GOT.54 | web: spec repository field is a dropdown of project repositories | #61 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
