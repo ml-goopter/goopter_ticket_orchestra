@@ -217,6 +217,32 @@ const capabilityMatches = (db: DbOrTx, workerId: string): SQL =>
     ),
   )!;
 
+/** Capability a worker registers when it can run agent containers (§9.9). */
+const DOCKER_CAPABILITY = "docker";
+
+/**
+ * Repository container mode matches the worker (§9.9 Scheduling, D20): a
+ * repository with `agent_container = true` needs `docker` among the worker's
+ * capabilities, the same filter §7.3 applies to runtimes. Host-mode
+ * repositories match every worker. Reads the worker row without locking it,
+ * so it adds no lock to the claim statement it sits in.
+ */
+export const containerModeMatches = (db: DbOrTx, workerId: string): SQL =>
+  or(
+    eq(repositories.agentContainer, false),
+    exists(
+      db
+        .select({ one: sql`1` })
+        .from(agentWorkers)
+        .where(
+          and(
+            eq(agentWorkers.id, workerId),
+            sql`${DOCKER_CAPABILITY} = any(${agentWorkers.capabilities})`,
+          ),
+        ),
+    ),
+  )!;
+
 export interface ClaimCandidateInput {
   workerId: string;
   host: string;
@@ -235,7 +261,8 @@ export interface ClaimCandidate {
 /**
  * design.md §6.3 candidate query. Picks the most urgent (`jira_priority`,
  * then oldest `jira_created_at`) `READY` task with no live execution, whose
- * repository this worker is capable of, whose repository is below `max_concurrent_worktrees` on
+ * repository this worker is capable of (D16) and matches in container mode
+ * (§9.9), whose repository is below `max_concurrent_worktrees` on
  * this host (counted per `holdsCapacity`), and whose effective runtime is detected. Locks the task row
  * `FOR UPDATE OF tasks SKIP LOCKED`, so a concurrent claimer skips it and
  * takes the next one. The task lock follows the worker row lock
@@ -276,6 +303,7 @@ export async function selectClaimCandidate(
         eq(tasks.state, "READY"),
         noLiveExecution(tx),
         capabilityMatches(tx, input.workerId),
+        containerModeMatches(tx, input.workerId),
         sql`coalesce(${busy.n}, 0) < ${repositories.maxConcurrentWorktrees}`,
         inArray(effectiveRuntime, [...input.runtimes]),
       ),
