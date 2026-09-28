@@ -26,6 +26,7 @@ import type {
   AgentEvent,
   ResumeRequest,
   StartRequest,
+  ToolPolicy,
   UsageBaseline,
 } from "./types.js";
 
@@ -392,7 +393,13 @@ function baseOptions(req: StartRequest | ResumeRequest): Options {
     // `docker exec` command line. The header therefore names an environment
     // variable, which the CLI expands when it loads the config, and the token
     // itself travels only in the CLI's environment (design.md §8, §9.9).
-    mcpServers: {
+    //
+    // `review` gets neither: `REVIEW_TOOLS` (policies.ts) grants no orchestra
+    // MCP tools, and the role may run the repository's own test command via
+    // `Bash(<testCommand>)`, so the reviewed repository's code must never be
+    // able to read the token — no server to authorise, no token to leak
+    // (commit cadff5c, design.md §9.8).
+    mcpServers: policy === "review" ? {} : {
       orchestra: {
         type: "http",
         url: req.mcp.url,
@@ -400,11 +407,7 @@ function baseOptions(req: StartRequest | ResumeRequest): Options {
       },
     },
     permissionMode,
-    // `Options.env` REPLACES the subprocess environment rather than merging
-    // it (sdk.d.ts), so the inherited environment is spread first: without it
-    // the CLI subprocess loses PATH, HOME and its credentials. The token is
-    // set last so the header above always expands to this execution's token.
-    env: { ...process.env, ...req.env, [MCP_TOKEN_ENV]: req.mcp.token },
+    env: envFor(policy, req.env, req.mcp.token),
   };
   const tools = builtinToolsFor(policy, policyOpts);
   if (tools !== undefined) options.tools = tools;
@@ -415,6 +418,36 @@ function baseOptions(req: StartRequest | ResumeRequest): Options {
   if (req.model !== undefined) options.model = req.model;
   if (req.maxBudgetUsd !== undefined) options.maxBudgetUsd = req.maxBudgetUsd;
   return options;
+}
+
+/**
+ * Subprocess env for the CLI (design.md §9.9). The inherited environment is
+ * spread first — `Options.env` REPLACES the subprocess environment rather
+ * than merging it (sdk.d.ts), so without it the CLI subprocess loses PATH,
+ * HOME and its credentials — then `req.env` on top of that.
+ *
+ * `review` never gets the execution token (commit cadff5c, design.md §9.8):
+ * that role has no orchestra MCP tools to call, and it can run the
+ * repository's own test command through `Bash(<testCommand>)`, so the code
+ * under review must never be able to read the secret that authorises the
+ * agent-tools server. The token is stripped even when it arrived through the
+ * inherited `process.env` or the caller's `req.env` — deleted, not merely
+ * left unset — so neither source can put it back. Every other policy gets
+ * the token set last, so the MCP header always expands to this execution's
+ * token.
+ */
+function envFor(
+  policy: ToolPolicy,
+  reqEnv: NodeJS.ProcessEnv | undefined,
+  token: string,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...reqEnv };
+  if (policy === "review") {
+    delete env[MCP_TOKEN_ENV];
+    return env;
+  }
+  env[MCP_TOKEN_ENV] = token;
+  return env;
 }
 
 /**

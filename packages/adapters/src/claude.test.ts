@@ -453,6 +453,86 @@ describe("ClaudeAdapter query options (design.md §7.1)", () => {
     });
   }
 
+  it("never configures the orchestra MCP server for a review run, and never puts ORCHESTRA_TOKEN in its env even when req.env carries one (start) (commit cadff5c, design.md §9.8)", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(
+      adapter.start(
+        {
+          ...startRequest,
+          allowedTools: "review",
+          env: { ...startRequest.env, ORCHESTRA_TOKEN: TOKEN },
+        },
+        new AbortController().signal,
+      ),
+    );
+
+    const options = fake.calls[0]?.options;
+    expect(options?.mcpServers).not.toHaveProperty("orchestra");
+    expect(options?.env).not.toHaveProperty("ORCHESTRA_TOKEN");
+  });
+
+  it("never configures the orchestra MCP server for a review run, and never puts ORCHESTRA_TOKEN in its env even when req.env carries one (resume) (commit cadff5c, design.md §9.8)", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(
+      adapter.resume(
+        {
+          ...resumeRequest,
+          allowedTools: "review",
+          env: { ...resumeRequest.env, ORCHESTRA_TOKEN: TOKEN },
+        },
+        new AbortController().signal,
+      ),
+    );
+
+    const options = fake.calls[0]?.options;
+    expect(options?.mcpServers).not.toHaveProperty("orchestra");
+    expect(options?.env).not.toHaveProperty("ORCHESTRA_TOKEN");
+  });
+
+  it("strips an ORCHESTRA_TOKEN inherited from process.env for a review run, not merely omits adding one (commit cadff5c, design.md §9.8)", async () => {
+    process.env.ORCHESTRA_TOKEN = "leaked-from-process-env";
+    try {
+      const fake = scripted([systemInit, resultSuccess()]);
+      const adapter = new ClaudeAdapter({ query: fake.fn });
+
+      await collect(
+        adapter.start(
+          { ...startRequest, allowedTools: "review", env: {} },
+          new AbortController().signal,
+        ),
+      );
+
+      const options = fake.calls[0]?.options;
+      expect(options?.env).not.toHaveProperty("ORCHESTRA_TOKEN");
+    } finally {
+      delete process.env.ORCHESTRA_TOKEN;
+    }
+  });
+
+  it("still withholds the orchestra MCP server and token from a review run that also carries a testCommand", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(
+      adapter.start(
+        {
+          ...startRequest,
+          allowedTools: "review",
+          testCommand: "pnpm -r test",
+        },
+        new AbortController().signal,
+      ),
+    );
+
+    const options = fake.calls[0]?.options;
+    expect(options?.mcpServers).not.toHaveProperty("orchestra");
+    expect(options?.env).not.toHaveProperty("ORCHESTRA_TOKEN");
+  });
+
   it("grants Bash(<testCommand>) to a review run that carries one (design.md §7.1)", async () => {
     const fake = scripted([systemInit, resultSuccess()]);
     const adapter = new ClaudeAdapter({ query: fake.fn });
@@ -1874,6 +1954,38 @@ describe("ClaudeAdapter keeps the execution token off the CLI argv (design.md §
         Authorization: "Bearer ${ORCHESTRA_TOKEN}",
       });
       expect(env.ORCHESTRA_TOKEN).toBe(TOKEN);
+    },
+  );
+
+  it.each(argvCases)(
+    "$mode mode $call: a review run's recorded CLI launch carries no ORCHESTRA_TOKEN and no orchestra entry in --mcp-config (commit cadff5c, design.md §9.8)",
+    async ({ mode, call }) => {
+      cwd = await makeSessionRoot();
+      let adapter: ClaudeAdapter;
+      let launches: CliLaunch[];
+      if (mode === "host") {
+        const recorder = hostModeRecorder();
+        adapter = new ClaudeAdapter({ query: recorder.query });
+        launches = recorder.launches;
+      } else {
+        const recorder = spawnerModeRecorder();
+        adapter = new ClaudeAdapter({ spawn: recorder.spawn });
+        launches = recorder.launches;
+      }
+      const signal = new AbortController().signal;
+      const stream =
+        call === "start"
+          ? adapter.start({ ...startRequest, allowedTools: "review", cwd }, signal)
+          : adapter.resume({ ...resumeRequest, allowedTools: "review", cwd }, signal);
+      await collect(stream);
+
+      expect(launches).toHaveLength(1);
+      const { args, env } = launches[0]!;
+      expect(env.ORCHESTRA_TOKEN).toBeUndefined();
+      for (const arg of args) expect(arg).not.toContain(TOKEN);
+      if (args.includes("--mcp-config")) {
+        expect(mcpConfigArg(args).mcpServers).not.toHaveProperty("orchestra");
+      }
     },
   );
 });
