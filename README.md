@@ -92,3 +92,78 @@ tears the stack down:
 ```sh
 bash scripts/compose-smoke.sh
 ```
+
+## Starting and stopping
+
+After the first run, day-to-day start-up is two steps.
+
+1. Start Postgres, the api and the web UI:
+
+   ```sh
+   docker compose up -d
+   ```
+
+2. Start the worker, which runs the agents. If it is installed as a service
+   (`deploy/`), it is already running. Otherwise run it in the foreground
+   from the repository root, with `.env.worker` created from
+   `deploy/worker.env.example` (`docs/runbook.md` §6):
+
+   ```sh
+   corepack pnpm --filter @orchestra/worker build
+   set -a; source .env.worker; set +a
+   node apps/worker/dist/index.js
+   ```
+
+   A clean start logs `worker registered`, `detected agent runtimes` and
+   `worker started`. A warning that Jira credentials are missing means no
+   tickets will be imported.
+
+To stop, press Ctrl-C in the worker terminal (or stop the service), then
+run `docker compose down`. Do not pass `-v` for a routine stop: it deletes
+the database volume.
+
+After pulling changes to `apps/web`, rebuild the UI with
+`docker compose build web && docker compose up -d web`.
+
+## Using it
+
+Open <http://localhost:8080> and log in with a user created by `users:add`.
+The project and repository must already be registered (`docs/runbook.md`
+§4-5), and the worker's `GITHUB_TOKEN` must be able to push to the
+repository and open pull requests.
+
+1. **File a ticket.** Create a Jira ticket that matches the project's JQL,
+   for example by adding the label the JQL filters on
+   (`orchestra-managed` in the runbook example). The worker polls Jira every
+   minute; the ticket appears on the board in **Needs Spec**.
+2. **Write the spec.** Open the task, click **Open spec builder**, then
+   **Start spec session**. The spec agent reads the repository and proposes
+   a specification in the right pane. Chat with it in the left pane, or edit
+   the form directly and click **Save Draft**.
+3. **Approve.** Click **Request Review**, then **Approve**. The runtime
+   defaults to the repository's; change it only to override this task. The
+   task moves to **Ready** and the worker claims it within seconds.
+4. **Watch it work.** The agent implements the change, runs the test
+   command, has a fresh-context reviewer check the diff, pushes a branch and
+   opens a pull request. The task page timeline shows each step; the side
+   panel shows the spec, executions, cost, and pull request.
+5. **Answer questions.** When an agent needs a decision it raises an issue
+   and pauses. The **Attention** button in the top bar shows the count.
+   Open the issue, reply in the thread if you need to, then resolve it:
+   - **Resolve as clarification**: the agent resumes with your answer.
+   - **This changes the spec**: the task returns to the spec builder with a
+     new draft; edit it and approve again, and the agent resumes against the
+     new version.
+6. **Merge.** When CI passes, the task moves to **Ready for Merge**. Review
+   and merge the pull request on GitHub; the task moves to **Done** within a
+   minute.
+
+If a task lands in **Needs Human** (retries exhausted, CI round limit, or
+the agent gave up), the reason is on the task page. Use **Retry** to start a
+fresh execution or **Cancel** to stop.
+
+Jira receives a comment at each milestone (spec approved, pull request
+opened, CI passed, needs human). The ticket's Jira status is never changed.
+
+Costs per project, task and runtime are under **Costs**. Projects,
+repositories, users and worker health are under **Admin**.

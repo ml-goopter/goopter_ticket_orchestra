@@ -170,6 +170,8 @@ Types: `id` is `uuid` default `gen_random_uuid()`. Timestamps are `timestamptz`.
 | max_concurrent_worktrees | int default 1 | capacity, D7 |
 | required_capability | text nullable | matched against `agent_workers.capabilities`, D16 |
 | setup_command | text nullable | run once per fresh worktree, e.g. `pnpm install` |
+| agent_container | boolean not null default false | run this repository's agent processes in a container, §9.9, D20 |
+| agent_image | text nullable | image override for container mode, built `FROM orchestra/agent`, §9.9 |
 | created_at | timestamptz |  |
 
 Unique on `(project_id, name)`.
@@ -898,6 +900,70 @@ A small Node binary built from `packages/review-wrapper` and placed on the agent
 
 The reviewer has no access to the implementer's transcript. Its only inputs are the contract and the code. This is what makes it independent in the sense §24 wants.
 
+### 9.9 Agent containers (D20)
+
+Without containers every process an agent drives runs on the worker host with the worker's user, filesystem and environment. For a repository with `agent_container = true`, those processes run in a container instead. That includes the spec session, the implementation session, the `orchestra-review` subagent, and the repository's `setup_command`.
+
+What stays on the host: the worker process, git fetch and `worktree add` on the bare clone, the agent-tools server, the pollers and sweepers. The worker needs no new privileges beyond access to the Docker daemon.
+
+**Lifecycle.** There is one container per execution, named `orchestra-exec-<execution.id>` and labelled `orchestra.execution=<id>` and `orchestra.task=<id>`.
+
+- **Creation.** The container is created after worktree preparation and before the first agent turn.
+- **Between turns.** It idles on `sleep infinity`, so it holds memory but no CPU.
+- **Reuse.** Every turn, resume and `setup_command` in the execution runs through `docker exec`.
+- **Removal.** It is removed when the execution ends, or when its worktree is evicted.
+- **Recreation.** No state lives only in the container. A resume that finds the container missing, for example after a worker restart, recreates it with the same mounts.
+- **Orphans.** The worktree sweeper (§6.6) removes containers whose labelled execution is terminal or unknown.
+
+**Launching processes.** Adapters take a process spawner and stay unaware of Docker.
+
+| process | container mode |
+| --- | --- |
+| Claude session | SDK option `spawnClaudeCodeProcess`, running `docker exec -i -w <cwd> <env> <container> <command> <args>` |
+| Codex session | the adapter's injected spawner, same form |
+| `setup_command` | `docker exec -w <worktree> <container> sh -c <command>` |
+| `orchestra-review` | runs inside the container from the image's PATH; its nested review session is a child process in the same container |
+
+Each launched process runs under an in-container launcher that starts a new process group and records its id in `/run/orchestra/<turn>.pid`. Cancel and the quiet timeout kill that process group through `docker exec`, then the exec client. Killing the client alone does not stop the process inside the container.
+
+**Mounts.** Paths are the same inside and outside the container. That keeps git's worktree pointers, the session stores' cwd keys, and the paths in `.orchestra/context.json` valid in both places.
+
+| host path | mode | purpose |
+| --- | --- | --- |
+| `<workspace_root>/work/<execution.id>` | rw, ro for role `spec` | the worktree |
+| `<workspace_root>/repos/<repository.name>.git` | rw, ro for role `spec` | the bare clone the worktree points at; commits write objects and refs here |
+| `<workspace_root>/agent-home/<task.id>` | rw | the container's `$HOME`, holding `.claude/` and `.codex/` session stores. Keyed by task so retries and the fresh-session fallback on the same host can resume |
+
+Nothing else from the host is mounted: no host home directory, no keychain, no SSH agent, no Docker socket.
+
+**Environment.** The container receives only these variables. The worker's `DATABASE_URL` and Jira credentials never enter it.
+
+| variable | value |
+| --- | --- |
+| `ORCHESTRA_URL` | agent-tools URL reachable from the container (below) |
+| `ORCHESTRA_TOKEN` | the per-execution bearer token (§8) |
+| `GITHUB_TOKEN` | from the worker's environment |
+| `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | Claude auth, D20 |
+| `OPENAI_API_KEY` | Codex repositories only |
+| `HOME`, `PATH` | the mounted agent home; the image PATH with the review wrapper first |
+
+**Auth.** The operator runs `claude setup-token` once on any machine with the subscription login. The resulting long-lived token goes into `CLAUDE_CODE_OAUTH_TOKEN` in the worker environment, which keeps usage on the subscription. `ANTHROPIC_API_KEY` is the fallback and bills per token. Cost stays labelled estimated (OI2).
+
+**Network.** Containers join a dedicated bridge network, `orchestra-agents`, with open egress. The agent-tools server keeps its loopback listener for host-mode agents and adds a listener reachable from that network. On Docker Desktop that is `http://host.docker.internal:<WORKER_TOOLS_PORT>/mcp`. On Linux it is the bridge gateway address. The bearer token remains the only authentication. An egress allow-list is OI7.
+
+**Image.** `orchestra/agent:<version>` is built from `deploy/agent-image/Dockerfile`.
+
+- **Contents.** A Debian slim base with `git`, `gh`, Node 22, the `claude` CLI, the `codex` CLI, and the built `orchestra-review` wrapper. It carries no repository toolchains.
+- **Per-repository images.** A repository whose tests need more sets `agent_image` to an image built `FROM orchestra/agent`.
+- **File ownership.** Containers run as the worker's uid and gid, so files written in the worktree belong to the operator.
+- **Limits.** Each container is capped at `AGENT_CONTAINER_CPUS` and `AGENT_CONTAINER_MEMORY`.
+
+**Scheduling.** At start-up the worker adds the capability `docker` when `docker info` succeeds and the configured image is present. A task whose repository has `agent_container = true` is claimable only by a worker with that capability, the same filter §7.3 applies to runtimes. If Docker becomes unavailable mid-execution, the execution fails as `adapter_error` retriable (§9.5).
+
+**Rollout.** Container mode is opt-in per repository and defaults to off. The default flips once the sandbox repository passes the §16 step 7 journeys in container mode. Host mode remains for repositories whose toolchain cannot run in a Linux container, such as iOS builds.
+
+Container mode also closes the carry-forward risk that `setup_command` inherits the full worker environment: in container mode it sees only the variables above.
+
 ---
 
 ## 10. Issues and decisions
@@ -1086,6 +1152,8 @@ pnpm --filter worker start
 
 Run under launchd on macOS or systemd on Linux with restart on failure. Requires on PATH: `git`, `gh` (authenticated), `node` 22+, `claude`, and `codex` for Codex repositories, plus each repository's toolchain.
 
+For repositories in container mode (§9.9), the worker host also needs Docker (Docker Desktop on macOS) and the `orchestra/agent` image. The host no longer needs those repositories' toolchains.
+
 ### 15.3 Environment
 
 | variable | used by | notes |
@@ -1105,6 +1173,10 @@ Run under launchd on macOS or systemd on Linux with restart on failure. Requires
 | `AGENT_QUIET_TIMEOUT_MS` | worker | default 1200000 |
 | `PRICING_FILE` | worker | default `config/pricing.json` |
 | `PUBLIC_URL` | api, worker | for links in Jira comments |
+| `CLAUDE_CODE_OAUTH_TOKEN` | worker, passed to agent containers | subscription token from `claude setup-token`, §9.9 |
+| `AGENT_CONTAINER_IMAGE` | worker | default `orchestra/agent:<version>` |
+| `AGENT_CONTAINER_CPUS` | worker | default 2 |
+| `AGENT_CONTAINER_MEMORY` | worker | default `4g` |
 
 No secrets are stored in Postgres.
 
@@ -1135,6 +1207,9 @@ Suggested sequence so each step is testable on its own.
 | OI3 | Test command per repository for the review role's allow list | add `test_command` to `repositories` in step 6 if a single command is insufficient |
 | OI4 | Jira comment noise on busy projects | a per-project `jira_comments_enabled` flag if needed |
 | OI5 | Base branch other than the default | add `base_branch` to `SpecContent` when a ticket needs it |
+| OI6 | Whether `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` authenticates the CLI inside a Linux container on the subscription | verify in the first container build step before anything depends on it; fall back to `ANTHROPIC_API_KEY` |
+| OI7 | Egress allow-list for agent containers (GitHub, Anthropic, OpenAI, package registries) | after container mode is default; a proxy on the `orchestra-agents` network |
+| OI8 | Bind-mount performance of worktrees on Docker Desktop for large repositories | measure on the sandbox and one real repository during the container E2E |
 
 ### 17.1 First end-to-end run (2026-09-28, GOT.48)
 
@@ -1176,3 +1251,4 @@ Jira received the spec-approved, PR-opened and CI-passed comments on both ticket
 | D17 | Cost per execution: tokens and USD on `executions`, per-round rows in `execution_usage`, Codex priced from a config table. |
 | D18 | Runtime per repository with per-task override at approval. Spec executions use the repository default. |
 | D19 | Out of scope list in section 1.3. Dependencies included as a table and a `READY` gate. |
+| D20 | Agent processes run in a container per execution when the repository opts in (§9.9). Subscription token for auth with API key fallback, container kept across turns, one default image with a per-repository override, open egress first, opt-in rollout. The worker stays on the host. |
