@@ -8,11 +8,14 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   Options,
   SDKMessage,
   SDKUserMessage,
+  SpawnedProcess,
+  SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   ClaudeAdapter,
@@ -20,6 +23,13 @@ import {
   encodeProjectDir,
 } from "./claude.js";
 import { allowedToolsFor, builtinToolsFor } from "./policies.js";
+import { classifyRetriable } from "./retriable.js";
+import type {
+  AgentProcess,
+  ProcessExit,
+  ProcessSpawner,
+  ProcessSpawnOptions,
+} from "./spawner.js";
 import type { AgentEvent, ResumeRequest, StartRequest } from "./types.js";
 
 const SESSION_ID = "11111111-2222-3333-4444-555555555555";
@@ -1292,5 +1302,407 @@ describe("ClaudeAdapter.canResume (SDK session store on disk)", () => {
 describe("ClaudeAdapter identity", () => {
   it("reports the claude runtime", () => {
     expect(new ClaudeAdapter().runtime).toBe("claude");
+  });
+});
+
+// --- injected process spawner (design.md §9.9) ------------------------------
+
+interface SpawnerCall {
+  command: string;
+  args: readonly string[];
+  options: ProcessSpawnOptions;
+}
+
+interface FakeProcess {
+  process: AgentProcess;
+  kills: (NodeJS.Signals | undefined)[];
+  exit: (outcome: ProcessExit) => void;
+  fail: (error: Error) => void;
+}
+
+function fakeProcess(): FakeProcess {
+  let exit!: (outcome: ProcessExit) => void;
+  let fail!: (error: Error) => void;
+  const exitP = new Promise<ProcessExit>((resolve, reject) => {
+    exit = resolve;
+    fail = reject;
+  });
+  const kills: (NodeJS.Signals | undefined)[] = [];
+  return {
+    process: {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      exit: exitP,
+      kill(signal) {
+        kills.push(signal);
+      },
+    },
+    kills,
+    exit,
+    fail,
+  };
+}
+
+function recordingSpawner(): {
+  spawn: ProcessSpawner;
+  calls: SpawnerCall[];
+  children: FakeProcess[];
+} {
+  const calls: SpawnerCall[] = [];
+  const children: FakeProcess[] = [];
+  const spawn: ProcessSpawner = (command, args, options) => {
+    calls.push({ command, args, options });
+    const child = fakeProcess();
+    children.push(child);
+    return child.process;
+  };
+  return { spawn, calls, children };
+}
+
+/** The SDK spawn hook the adapter handed to `query` on its first call. */
+function sdkSpawnHook(fake: Fake): NonNullable<Options["spawnClaudeCodeProcess"]> {
+  const hook = fake.calls[0]?.options?.spawnClaudeCodeProcess;
+  if (hook === undefined) throw new Error("spawnClaudeCodeProcess was not set");
+  return hook;
+}
+
+const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+const sdkSpawnOptions = (
+  signal: AbortSignal = new AbortController().signal,
+): SpawnOptions => ({
+  command: "/usr/local/bin/claude",
+  args: ["--output-format", "stream-json", "--verbose"],
+  cwd: "/work/exec-1",
+  env: { PATH: "/usr/bin", ORCHESTRA_TOKEN: TOKEN },
+  signal,
+});
+
+describe("ClaudeAdapter process spawner (design.md §9.9)", () => {
+  it("does not set spawnClaudeCodeProcess on start or resume without a spawner", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(adapter.start(startRequest, new AbortController().signal));
+    await collect(adapter.resume(resumeRequest, new AbortController().signal));
+
+    expect(fake.calls).toHaveLength(2);
+    for (const call of fake.calls) {
+      expect(call.options).toBeDefined();
+      expect("spawnClaudeCodeProcess" in call.options!).toBe(false);
+    }
+  });
+
+  it("sets spawnClaudeCodeProcess on both start and resume with a spawner", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const { spawn } = recordingSpawner();
+    const adapter = new ClaudeAdapter({ query: fake.fn, spawn });
+
+    await collect(adapter.start(startRequest, new AbortController().signal));
+    await collect(adapter.resume(resumeRequest, new AbortController().signal));
+
+    expect(fake.calls).toHaveLength(2);
+    for (const call of fake.calls) {
+      expect(typeof call.options?.spawnClaudeCodeProcess).toBe("function");
+    }
+    // Resume still carries the session and no system prompt.
+    expect(fake.calls[1]!.options?.resume).toBe(SESSION_ID);
+    expect("systemPrompt" in fake.calls[1]!.options!).toBe(false);
+  });
+
+  it("passes the SDK's command, args, cwd and env through to the spawner", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const spawner = recordingSpawner();
+    await collect(
+      new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn }).start(
+        startRequest,
+        new AbortController().signal,
+      ),
+    );
+
+    const options = sdkSpawnOptions();
+    const spawned = sdkSpawnHook(fake)(options);
+
+    expect(spawner.calls).toEqual([
+      {
+        command: "/usr/local/bin/claude",
+        args: ["--output-format", "stream-json", "--verbose"],
+        options: { cwd: "/work/exec-1", env: options.env },
+      },
+    ]);
+    const child = spawner.children[0]!.process;
+    expect(spawned.stdin).toBe(child.stdin);
+    expect(spawned.stdout).toBe(child.stdout);
+  });
+
+  it("falls back to the current directory when the SDK gives no cwd", async () => {
+    const fake = scripted([systemInit, resultSuccess()]);
+    const spawner = recordingSpawner();
+    await collect(
+      new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn }).start(
+        startRequest,
+        new AbortController().signal,
+      ),
+    );
+    const options = sdkSpawnOptions();
+    delete options.cwd;
+    sdkSpawnHook(fake)(options);
+    expect(spawner.calls[0]!.options.cwd).toBe(process.cwd());
+  });
+
+  describe("the returned process meets the SDK's SpawnedProcess contract", () => {
+    async function spawned(signal?: AbortSignal): Promise<{
+      proc: SpawnedProcess;
+      child: FakeProcess;
+    }> {
+      const fake = scripted([systemInit, resultSuccess()]);
+      const spawner = recordingSpawner();
+      await collect(
+        new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn }).start(
+          startRequest,
+          new AbortController().signal,
+        ),
+      );
+      const proc = sdkSpawnHook(fake)(sdkSpawnOptions(signal));
+      return { proc, child: spawner.children[0]! };
+    }
+
+    it("reports running, then emits exit with code and signal and records them", async () => {
+      const { proc, child } = await spawned();
+      expect(proc.exitCode).toBeNull();
+      expect(proc.signalCode ?? null).toBeNull();
+      expect(proc.killed).toBe(false);
+
+      const onExit: [number | null, NodeJS.Signals | null][] = [];
+      const onceExit: [number | null, NodeJS.Signals | null][] = [];
+      proc.on("exit", (code, signal) => onExit.push([code, signal]));
+      proc.once("exit", (code, signal) => onceExit.push([code, signal]));
+
+      child.exit({ code: 0, signal: null });
+      await tick();
+
+      expect(onExit).toEqual([[0, null]]);
+      expect(onceExit).toEqual([[0, null]]);
+      expect(proc.exitCode).toBe(0);
+      expect(proc.signalCode ?? null).toBeNull();
+    });
+
+    it("records a signal exit as signalCode with a null exitCode", async () => {
+      const { proc, child } = await spawned();
+      const seen: [number | null, NodeJS.Signals | null][] = [];
+      proc.on("exit", (code, signal) => seen.push([code, signal]));
+
+      child.exit({ code: null, signal: "SIGTERM" });
+      await tick();
+
+      expect(seen).toEqual([[null, "SIGTERM"]]);
+      expect(proc.exitCode).toBeNull();
+      expect(proc.signalCode).toBe("SIGTERM");
+    });
+
+    it("off removes an exit listener", async () => {
+      const { proc, child } = await spawned();
+      const seen: number[] = [];
+      const listener = (): void => {
+        seen.push(1);
+      };
+      proc.on("exit", listener);
+      proc.off("exit", listener);
+
+      child.exit({ code: 0, signal: null });
+      await tick();
+      expect(seen).toEqual([]);
+    });
+
+    it("emits error when the process never started", async () => {
+      const { proc, child } = await spawned();
+      const errors: Error[] = [];
+      const exits: unknown[] = [];
+      proc.on("error", (error) => errors.push(error));
+      proc.on("exit", (...args) => exits.push(args));
+
+      child.fail(Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" }));
+      await tick();
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0]!.message).toBe("spawn docker ENOENT");
+      expect(exits).toEqual([]);
+    });
+
+    it("does not throw when the process fails with no error listener", async () => {
+      const { child } = await spawned();
+      child.fail(new Error("spawn docker ENOENT"));
+      await tick();
+    });
+
+    it("kill forwards the SDK's signal to the spawner's group kill and marks the process killed", async () => {
+      const { proc, child } = await spawned();
+
+      expect(proc.kill("SIGTERM")).toBe(true);
+      expect(proc.killed).toBe(true);
+      expect(proc.kill("SIGKILL")).toBe(true);
+      expect(child.kills).toEqual(["SIGTERM", "SIGKILL"]);
+    });
+
+    it("kill after exit is a no-op that reaches no process group", async () => {
+      const { proc, child } = await spawned();
+      child.exit({ code: 0, signal: null });
+      await tick();
+
+      expect(proc.kill("SIGTERM")).toBe(false);
+      expect(proc.killed).toBe(false);
+      expect(child.kills).toEqual([]);
+    });
+
+    it("kills the group with SIGTERM when the SDK's forwarded signal aborts", async () => {
+      const controller = new AbortController();
+      const { proc, child } = await spawned(controller.signal);
+      expect(child.kills).toEqual([]);
+
+      controller.abort();
+      expect(child.kills).toEqual(["SIGTERM"]);
+      expect(proc.killed).toBe(true);
+    });
+
+    it("kills at once when the forwarded signal is already aborted", async () => {
+      const controller = new AbortController();
+      controller.abort();
+      const { child } = await spawned(controller.signal);
+      expect(child.kills).toEqual(["SIGTERM"]);
+    });
+
+    it("ignores the forwarded signal once the process has exited", async () => {
+      const controller = new AbortController();
+      const { child } = await spawned(controller.signal);
+      child.exit({ code: 0, signal: null });
+      await tick();
+
+      controller.abort();
+      expect(child.kills).toEqual([]);
+    });
+
+    it("drains stderr so a full pipe cannot stall the CLI", async () => {
+      const { child } = await spawned();
+      const stderr = child.process.stderr as PassThrough;
+      // Far past the default high-water mark: a stream nobody reads stops
+      // accepting writes and `write` returns false.
+      const chunk = "x".repeat(64 * 1024);
+      for (let i = 0; i < 8; i++) stderr.write(chunk);
+      await tick();
+      expect(stderr.readableFlowing).toBe(true);
+      expect(stderr.readableLength).toBe(0);
+    });
+  });
+});
+
+// --- stderr tail on a spawner crash (F1, design.md §7.1, §9.5) -------------
+
+/**
+ * Scripts a query that spawns through the SDK's hook, writes `stderrText` to
+ * the spawned process's stderr, exits it non-zero, then throws `thrown` —
+ * the shape of a real crash: with a custom spawner the SDK's own thrown exit
+ * error carries no stderr text of its own (F1).
+ */
+function crashingSpawnerQuery(
+  spawner: ReturnType<typeof recordingSpawner>,
+  stderrText: string,
+  thrown: string,
+): Fake {
+  return fakeQuery(async function* (_self, call) {
+    const hook = call.options?.spawnClaudeCodeProcess;
+    if (!hook) throw new Error("no spawner installed");
+    hook(sdkSpawnOptions(call.options?.abortController?.signal));
+    const child = spawner.children[0]!.process.stderr as PassThrough;
+    child.write(stderrText);
+    await tick();
+    spawner.children[0]!.exit({ code: 1, signal: null });
+    await tick();
+    throw new Error(thrown);
+  });
+}
+
+describe("ClaudeAdapter stderr tail on a spawner crash (F1, design.md §7.1, §9.5)", () => {
+  it("includes the spawned process's stderr in the thrown error and reclassifies it via classifyRetriable", async () => {
+    const spawner = recordingSpawner();
+    // The thrown SDK error alone ("exited with code 1") matches no terminal
+    // pattern, so without the stderr tail this would wrongly retry a
+    // terminal auth failure.
+    const fake = crashingSpawnerQuery(
+      spawner,
+      "authentication_failed: invalid api key\n",
+      "Claude Code process exited with code 1",
+    );
+    const adapter = new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn });
+
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+
+    expect(events).toHaveLength(1);
+    const error = events[0] as { type: string; message: string; retriable: boolean };
+    expect(error.type).toBe("error");
+    expect(error.message).toContain("Claude Code process exited with code 1");
+    expect(error.message).toContain("authentication_failed: invalid api key");
+    expect(error.retriable).toBe(classifyRetriable(error.message));
+    expect(error.retriable).toBe(false);
+  });
+
+  it("redacts the execution token out of the stderr tail", async () => {
+    const spawner = recordingSpawner();
+    const fake = crashingSpawnerQuery(
+      spawner,
+      `fatal: request failed, Authorization: Bearer ${TOKEN}\n`,
+      "Claude Code process exited with code 1",
+    );
+    const adapter = new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn });
+
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+
+    expect(JSON.stringify(events)).not.toContain(TOKEN);
+    const error = events[0] as { message: string };
+    expect(error.message).toContain("[redacted]");
+  });
+
+  it("keeps only the last 4096 characters of a long stderr stream", async () => {
+    const spawner = recordingSpawner();
+    const filler = "x".repeat(5000);
+    const fake = crashingSpawnerQuery(
+      spawner,
+      `${filler}TAIL-MARKER`,
+      "Claude Code process exited with code 1",
+    );
+    const adapter = new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn });
+
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+
+    const error = events[0] as { message: string };
+    expect(error.message).toContain("TAIL-MARKER");
+    const detail = error.message.split("Claude Code process exited with code 1: ")[1]!;
+    expect(detail.length).toBeLessThanOrEqual(4096);
+  });
+
+  it("does not append a stderr tail when no spawner is configured", async () => {
+    // eslint-disable-next-line require-yield
+    const fake = fakeQuery(async function* () {
+      throw new Error("Claude Code process exited with code 1");
+    });
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+
+    expect(events).toEqual([
+      {
+        type: "error",
+        message: "Claude Code process exited with code 1",
+        retriable: true,
+      },
+    ]);
   });
 });

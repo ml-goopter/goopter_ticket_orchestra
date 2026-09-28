@@ -17,5 +17,6 @@ export function placeholder(): string {
 export * from "./types.js";
 export * from "./policies.js";
 export * from "./retriable.js";
+export * from "./spawner.js";
 export * from "./claude.js";
 export * from "./codex.js";
