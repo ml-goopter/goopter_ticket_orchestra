@@ -349,12 +349,15 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
         )}
 
         {!isOpen && (
-          <div className="card" aria-label="Resolution">
+          <div className="card issue-detail__resolution" aria-label="Resolution">
             <h2>Resolution</h2>
             <p data-testid="resolution-decision">{decision?.decision ?? issue.resolution ?? "No decision recorded."}</p>
-            <p data-testid="resolution-kind">{humanizeEnum(issue.resolutionKind ?? issue.status)}</p>
-            <p data-testid="resolution-time">
-              <Time value={issue.resolvedAt} />
+            <p className="issue-detail__resolution-meta">
+              <span data-testid="resolution-kind">{humanizeEnum(issue.resolutionKind ?? issue.status)}</span>
+              {" · "}
+              <span data-testid="resolution-time">
+                <Time value={issue.resolvedAt} />
+              </span>
             </p>
           </div>
         )}

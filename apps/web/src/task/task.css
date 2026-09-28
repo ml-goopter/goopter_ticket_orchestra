@@ -11,14 +11,16 @@
 }
 
 /* Side panel: sticky on wide screens, stacked below the timeline once
- * `.main-sidebar` itself switches to a column layout (<900px). */
+ * `.main-sidebar` itself switches to a column layout (<900px). `top`/
+ * `max-height` account for `.app-shell__bar`'s fixed 56px height
+ * (components.css) so the panel doesn't stick under the bar. */
 .task-detail .main-sidebar__aside {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
   position: sticky;
-  top: var(--space-5);
-  max-height: calc(100vh - var(--space-8));
+  top: calc(56px + var(--space-5));
+  max-height: calc(100vh - 56px - var(--space-8));
   overflow-y: auto;
 }
 
