@@ -123,7 +123,10 @@ describe("IssueDetailView", () => {
 
     expect(screen.getByRole("link", { name: "TSK-70" }).getAttribute("href")).toBe("/tasks/task-1");
     expect(screen.getByRole("link", { name: "Spec revision" }).getAttribute("href")).toBe("/tasks/task-1/spec");
-    expect(screen.getByText(/implementation - WAITING_FOR_USER \(claude\)/)).toBeTruthy();
+    const executionLine = screen.getByTestId("issue-execution").textContent ?? "";
+    expect(executionLine).toContain("implementation");
+    expect(executionLine).toContain("Waiting for user");
+    expect(executionLine).toContain("(claude)");
   });
 
   it("posts a message and refetches the thread (AC3)", async () => {
@@ -218,7 +221,7 @@ describe("IssueDetailView", () => {
 
     await waitFor(() => expect(screen.getByTestId("issue-status").textContent).toBe("RESOLVED"));
     expect(screen.getByTestId("resolution-decision").textContent).toBe("Use cursor pagination");
-    expect(screen.getByTestId("resolution-kind").textContent).toBe("clarification");
+    expect(screen.getByTestId("resolution-kind").textContent).toBe("Clarification");
   });
 
   it("both resolve buttons are disabled until the decision text is non-empty", async () => {
@@ -311,8 +314,10 @@ describe("IssueDetailView", () => {
 
     await waitFor(() => expect(screen.getByTestId("issue-status").textContent).toBe("RESOLVED"));
     expect(screen.getByTestId("resolution-decision").textContent).toBe("Use cursor pagination");
-    expect(screen.getByTestId("resolution-kind").textContent).toBe("clarification");
-    expect(screen.getByTestId("resolution-time").textContent).toBe("2026-01-02T00:00:00.000Z");
+    expect(screen.getByTestId("resolution-kind").textContent).toBe("Clarification");
+    expect(screen.getByTestId("resolution-time").querySelector("time")?.getAttribute("dateTime")).toBe(
+      "2026-01-02T00:00:00.000Z",
+    );
     expect(screen.queryByRole("button", { name: "Resolve as clarification" })).toBeNull();
     expect(screen.queryByTestId("decision-text")).toBeNull();
   });
@@ -397,5 +402,40 @@ describe("IssueDetailView", () => {
     expect((screen.getByTestId("decision-text") as HTMLTextAreaElement).value).toBe("");
     expect(sourceA.closed).toBe(true);
     await waitFor(() => expect(FakeEventSource.instances.length).toBe(2));
+  });
+
+  it("renders 'Blocking' once, a humanized kind, and local times instead of raw ISO strings (AC4)", async () => {
+    const client = makeFakeClient({
+      getIssue: vi.fn().mockResolvedValue(
+        makeIssueDetail({
+          issue: { ...makeIssueDetail().issue, status: "RESOLVED", resolutionKind: "clarification", resolvedAt: "2026-01-02T00:00:00.000Z" },
+          decision: {
+            id: "decision-x",
+            taskId: "task-1",
+            issueId: "issue-2",
+            decision: "Use cursor pagination",
+            clarification: null,
+            chosenOption: "cursor",
+            decidedBy: "user-1",
+            decidedAt: "2026-01-02T00:00:00.000Z",
+          },
+        }),
+      ),
+    });
+    renderIssue(client);
+
+    await waitFor(() => expect(screen.getByTestId("issue-status").textContent).toBe("RESOLVED"));
+
+    expect(screen.getAllByText("Blocking")).toHaveLength(1);
+    expect(screen.getByText("Decision required")).toBeTruthy();
+    expect(screen.queryByText(/blocking Blocking/)).toBeNull();
+
+    // Raw ISO strings must not appear verbatim anywhere for the resolution
+    // time or the thread message time; both render through <Time>.
+    expect(screen.queryByText("2026-01-02T00:00:00.000Z")).toBeNull();
+    expect(screen.getByTestId("resolution-time").querySelector("time")?.getAttribute("dateTime")).toBe(
+      "2026-01-02T00:00:00.000Z",
+    );
+    expect(screen.getByTestId("thread-message").querySelector("time")).toBeTruthy();
   });
 });

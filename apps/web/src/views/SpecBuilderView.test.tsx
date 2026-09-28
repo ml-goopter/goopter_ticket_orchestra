@@ -933,4 +933,182 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(FakeEventSource.instances.length).toBe(2));
     expect(currentSource().url).toBe("/api/tasks/task-b/stream");
   });
+
+  it("renders chat and draft inside a two-pane split (AC1)", async () => {
+    const client = makeFakeClient({ getTask: vi.fn().mockResolvedValue(aggregateInProgress()) });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state")).toBeTruthy());
+
+    const chatPane = screen.getByLabelText("Spec chat");
+    const draftPane = screen.getByLabelText("Spec draft");
+    expect(chatPane.className).toContain("split__pane");
+    expect(draftPane.className).toContain("split__pane");
+    expect(chatPane.parentElement).toBe(draftPane.parentElement);
+    expect(chatPane.parentElement?.className).toContain("split");
+  });
+
+  it("renders an agent message's markdown formatted in the chat (AC2)", async () => {
+    const client = makeFakeClient({ getTask: vi.fn().mockResolvedValue(aggregateInProgress()) });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({
+          id: 1,
+          executionId: "exec-spec-1",
+          type: "agent.message",
+          payload: { text: "**bold** point" },
+        }),
+        "1",
+      );
+    });
+
+    await waitFor(() => expect(screen.getByTestId("chat-message").querySelector("strong")).toBeTruthy());
+    expect(screen.getByTestId("chat-message").querySelector("strong")?.textContent).toBe("bold");
+  });
+
+  it("shows the approved spec read-only when there is an approvedRevision and no draft, with its version (AC3)", async () => {
+    const approved = makeRevision({ id: "rev-approved", version: 3, status: "approved", content: validSpecContent });
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "SPEC_APPROVED" },
+          revisions: [approved],
+          approvedRevision: approved,
+          approvals: [
+            {
+              id: "approval-1",
+              revisionId: "rev-approved",
+              approvedBy: "user-1",
+              approvedAt: "2026-01-03T00:00:00.000Z",
+              runtime: "claude",
+            },
+          ],
+        }),
+      ),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("approved-spec")).toBeTruthy());
+    expect(screen.getByText("Approved specification, version 3")).toBeTruthy();
+    expect(screen.getByText("Do the thing")).toBeTruthy();
+    expect(screen.queryByLabelText("Objective")).toBeNull();
+  });
+
+  it("still shows the editable draft form when a draft revision exists, not the approved read-only view (AC3)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision({ content: validSpecContent })] })),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByLabelText("Objective")).toBeTruthy());
+    expect(screen.queryByTestId("approved-spec")).toBeNull();
+  });
+
+  it("renders each revision as a compact row with version, status badge and Time, no raw ISO text (S1)", async () => {
+    const revisionA = makeRevision({
+      id: "rev-a",
+      version: 1,
+      status: "superseded",
+      content: validSpecContent,
+      createdAt: "2026-09-28T16:56:06.357Z",
+    });
+    const revisionB = makeRevision({
+      id: "rev-b",
+      version: 2,
+      status: "draft",
+      content: validSpecContent,
+      createdAt: "2026-09-28T17:00:00.000Z",
+    });
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [revisionA, revisionB] })),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("revision-list")).toBeTruthy());
+    const list = screen.getByTestId("revision-list");
+    expect(list.querySelectorAll("li")).toHaveLength(2);
+    expect(list.querySelectorAll("time")).toHaveLength(2);
+    expect(list.querySelectorAll(".badge")).toHaveLength(2);
+    expect(list.textContent).not.toContain("2026-09-28T16:56:06.357Z");
+    expect(list.textContent).not.toContain("2026-09-28T17:00:00.000Z");
+    expect(list.textContent).toContain("v1");
+    expect(list.textContent).toContain("v2");
+  });
+
+  it("keeps the compare/diff controls inside a closed <details> by default (S1)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision()] })),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByText("Compare revisions")).toBeTruthy());
+    const details = screen.getByText("Compare revisions").closest("details");
+    expect(details).toBeTruthy();
+    expect(details?.hasAttribute("open")).toBe(false);
+    // The diff controls still exist in the dom (so they're ready once
+    // opened) rather than only mounting on user interaction.
+    expect(screen.getByLabelText("Compare from")).toBeTruthy();
+  });
+
+  it("labels the draft pane heading 'Specification' for the approved read-only view (S2)", async () => {
+    const approved = makeRevision({ id: "rev-approved", version: 2, status: "approved", content: validSpecContent });
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "SPEC_APPROVED" },
+          revisions: [approved],
+          approvedRevision: approved,
+        }),
+      ),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("approved-spec")).toBeTruthy());
+    expect(screen.getByRole("heading", { level: 2, name: "Specification" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 2, name: "Draft" })).toBeNull();
+  });
+
+  it("keeps the draft pane heading 'Draft' when a draft revision is editable (S2)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision({ content: validSpecContent })] })),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByLabelText("Objective")).toBeTruthy());
+    expect(screen.getByRole("heading", { level: 2, name: "Draft" })).toBeTruthy();
+  });
+
+  it("titles the Revise button with the task state reason when disabled (S3)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress({ task: { ...makeTaskAggregate().task, state: "DONE" } })),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("DONE"));
+    const reviseButton = screen.getByRole("button", { name: "Revise" }) as HTMLButtonElement;
+    expect(reviseButton.disabled).toBe(true);
+    expect(reviseButton.title).toContain("Done");
+  });
+
+  it("titles the chat Send button with the disabled reason when the task is not in progress (S3)", async () => {
+    const base = makeTaskAggregate();
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "SPEC_REVIEW" },
+          latestExecutions: { spec: { ...base.executions[0]!, state: "RUNNING" }, implementation: null },
+        }),
+      ),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+    const sendButton = screen.getByRole("button", { name: "Send" }) as HTMLButtonElement;
+    expect(sendButton.title).toBe("The task is not in progress.");
+  });
 });

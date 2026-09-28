@@ -1,0 +1,102 @@
+/**
+ * Issue detail (U4, docs/design.md §14 Issue detail row). Builds on
+ * `.page-header`, `.card`, `.badge`, `.field`, `.alert`, `.toolbar`,
+ * `.markdown` from styles/components.css; only classes local to this view
+ * live here.
+ */
+
+/* Visually hides a machine-readable helper node (e.g. the raw issue-status
+ * text kept for tests) while leaving it in the accessibility tree. */
+.issue-detail__sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.issue-detail__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.issue-detail__meta-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.issue-detail__question {
+  margin-bottom: var(--space-4);
+}
+
+.issue-detail__question p {
+  margin: 0;
+  font-weight: 600;
+}
+
+.issue-detail__options {
+  margin: 0 0 var(--space-4);
+  border: none;
+  padding: 0;
+}
+
+.issue-detail__options legend {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-2);
+}
+
+.issue-detail__options label {
+  display: block;
+  margin-bottom: var(--space-2);
+}
+
+.issue-detail__resolve-card .field + .field {
+  margin-top: var(--space-3);
+}
+
+.issue-detail__resolve-card .toolbar {
+  margin-top: var(--space-4);
+  margin-bottom: 0;
+}
+
+.issue-detail__thread {
+  list-style: none;
+  margin: 0 0 var(--space-4);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.issue-detail__bubble {
+  max-width: 85%;
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3);
+}
+
+.issue-detail__bubble--live {
+  align-self: flex-start;
+}
+
+.issue-detail__bubble-meta {
+  margin-bottom: var(--space-1);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+}
+
+.issue-detail__composer .field {
+  margin-bottom: var(--space-3);
+}
