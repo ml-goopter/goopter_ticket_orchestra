@@ -148,21 +148,40 @@ export async function getClaimWorker(
 }
 
 /**
- * Executions on `host` holding a worker slot (§6.3): `ASSIGNED` and
- * `RUNNING`, except a spec execution `RUNNING` between turns. `WAITING_FOR_USER`
- * frees its slot (D5).
+ * The execution row counts against capacity: both the worker's
+ * `max_concurrent` slots and its repository's `max_concurrent_worktrees` on
+ * the host (§6.3, D7). `ASSIGNED` and `RUNNING`, except a spec execution
+ * `RUNNING` between turns. `WAITING_FOR_USER` frees its slot (D5). Every
+ * capacity count uses this one fragment, so the rule cannot drift.
  *
- * GOT.56 (O1): a spec execution stays `RUNNING` between chat turns (C42) but
- * has no agent process then. Its agent-tools token is issued before each
- * turn's adapter call and revoked when the turn ends (§8, §9.3), so a
- * `RUNNING` spec execution holds a slot only while `tools_token_hash` is set.
- * An `ASSIGNED` spec execution (first turn starting) always holds one.
+ * GOT.56 (O1, extended to the repository limit): a spec execution stays
+ * `RUNNING` between chat turns (C42) but has no agent process then. Its
+ * agent-tools token is issued before each turn's adapter call and revoked
+ * when the turn ends (§8, §9.3), so a `RUNNING` spec execution counts only
+ * while `tools_token_hash` is set. An `ASSIGNED` spec execution (first turn
+ * starting) always counts.
  *
  * Race bound: spec turns start without a capacity check (they never did), and
- * a turn whose token commits after this count read is not seen by that claim.
- * Live agent processes can therefore exceed `max_concurrent` by at most the spec
- * turns in flight, each only until its turn ends. No claim lands while this
- * count is at `max_concurrent`.
+ * a turn whose token commits after a claim's count read is not seen by that
+ * claim. Live agent processes can therefore exceed `max_concurrent`, and a
+ * repository's `max_concurrent_worktrees`, by at most the spec turns in
+ * flight, each only until its turn ends. No claim lands while a count is at
+ * its limit.
+ */
+export const holdsCapacity = (): SQL =>
+  and(
+    inArray(executions.state, [...SLOT_HOLDING_STATES]),
+    not(
+      and(
+        eq(executions.role, "spec"),
+        eq(executions.state, "RUNNING"),
+        isNull(executions.toolsTokenHash),
+      )!,
+    ),
+  )!;
+
+/**
+ * Executions on `host` holding a worker slot (§6.3), per `holdsCapacity`.
  */
 export async function countSlotHoldingExecutions(
   db: DbOrTx,
@@ -171,19 +190,7 @@ export async function countSlotHoldingExecutions(
   const [row] = await db
     .select({ n: sql<number>`count(*)::int` })
     .from(executions)
-    .where(
-      and(
-        eq(executions.host, host),
-        inArray(executions.state, [...SLOT_HOLDING_STATES]),
-        not(
-          and(
-            eq(executions.role, "spec"),
-            eq(executions.state, "RUNNING"),
-            isNull(executions.toolsTokenHash),
-          )!,
-        ),
-      ),
-    );
+    .where(and(eq(executions.host, host), holdsCapacity()));
   return row?.n ?? 0;
 }
 
@@ -229,7 +236,7 @@ export interface ClaimCandidate {
  * design.md §6.3 candidate query. Picks the most urgent (`jira_priority`,
  * then oldest `jira_created_at`) `READY` task with no live execution, whose
  * repository this worker is capable of, whose repository is below `max_concurrent_worktrees` on
- * this host, and whose effective runtime is detected. Locks the task row
+ * this host (counted per `holdsCapacity`), and whose effective runtime is detected. Locks the task row
  * `FOR UPDATE OF tasks SKIP LOCKED`, so a concurrent claimer skips it and
  * takes the next one. The task lock follows the worker row lock
  * (`getClaimWorker`) and precedes any execution row, per the
@@ -249,12 +256,7 @@ export async function selectClaimCandidate(
       })
       .from(executions)
       .innerJoin(tasks, eq(tasks.id, executions.taskId))
-      .where(
-        and(
-          eq(executions.host, input.host),
-          inArray(executions.state, [...SLOT_HOLDING_STATES]),
-        ),
-      )
+      .where(and(eq(executions.host, input.host), holdsCapacity()))
       .groupBy(tasks.repositoryId),
   );
 

@@ -8,7 +8,7 @@ import type {
   ResumeRequest,
   StartRequest,
 } from "@orchestra/adapters";
-import type { EndReason, TaskState } from "@orchestra/core";
+import type { EndReason, ExecutionState, TaskState } from "@orchestra/core";
 import {
   executionUsage,
   lockExecutionForTool,
@@ -28,6 +28,7 @@ import {
 } from "vitest";
 import { createExecutionRegistry } from "../src/agent-tools/index.js";
 import { LEASE_TTL_MS } from "../src/agent-tools/lease.js";
+import { issueToken, revokeToken } from "../src/agent-tools/tokens.js";
 import type { LogFields, Logger } from "../src/logger.js";
 import {
   PROTOCOL_VIOLATION_DETAIL,
@@ -536,6 +537,174 @@ describe("retry starter claim (C25, AC7)", () => {
     await raw("update executions set state = 'COMPLETED' where id = $1", [busy]);
     const taken = await runRetryStarter(starterOptions(s, spy.runner, due));
     expect(taken.map((c) => c.executionId)).toEqual([s.retryId]);
+  });
+
+  describe("spec sessions against max_concurrent_worktrees (GOT.56 ext)", () => {
+    /**
+     * A spec execution stays RUNNING between chat turns (C42) and holds an
+     * agent-tools token only while a turn runs (§9.3). Only a live turn
+     * counts against the repository's worktree limit.
+     */
+    async function repositoryOf(taskId: string) {
+      const [row] = await raw<{ project_id: string; repository_id: string }>(
+        "select project_id, repository_id from tasks where id = $1",
+        [taskId],
+      );
+      return row!;
+    }
+
+    async function limitRepository(s: Seeded, limit: number): Promise<string> {
+      const repo = await repositoryOf(s.taskId);
+      await raw("update repositories set max_concurrent_worktrees = $1 where id = $2", [
+        limit,
+        repo.repository_id,
+      ]);
+      return repo.repository_id;
+    }
+
+    let specSeq = 0;
+
+    /** A spec session on HOST, on `s`'s repository, RUNNING between turns by default. */
+    async function specSessionOn(
+      s: Seeded,
+      state: ExecutionState = "RUNNING",
+    ): Promise<{ taskId: string; executionId: string }> {
+      const repo = await repositoryOf(s.taskId);
+      const [task] = await raw<{ id: string }>(
+        `insert into tasks (project_id, repository_id, jira_key, jira_summary, jira_priority,
+           jira_created_at, jira_synced_at, state)
+         values ($1, $2, $3, 'spec session', 1, $4, $4, 'SPEC_IN_PROGRESS') returning id`,
+        [repo.project_id, repo.repository_id, `${s.jiraKey}-S${++specSeq}`, NOW.toISOString()],
+      );
+      const executionId = await seedExecutionRow(db, {
+        taskId: task!.id,
+        role: "spec",
+        state,
+        host: HOST,
+        workerId: s.workerId,
+      });
+      return { taskId: task!.id, executionId };
+    }
+
+    /** The runner's token issue for a spec turn: task, then execution. */
+    const startSpecTurn = (session: { taskId: string; executionId: string }) =>
+      db.transaction(async (tx) => {
+        await lockTaskForTool(tx, session.taskId, "key share");
+        await lockExecutionForTool(tx, session.executionId);
+        return issueToken(tx, session.executionId);
+      });
+
+    /** Live agents on `repositoryId` and HOST, by the live-turn rule. */
+    const liveOnRepo = async (repositoryId: string): Promise<number> => {
+      const [row] = await raw<{ n: number }>(
+        `select count(*)::int as n from executions e join tasks t on t.id = e.task_id
+         where t.repository_id = $1 and e.host = $2 and (
+           (e.role = 'implementation' and e.state in ('ASSIGNED', 'RUNNING'))
+           or (e.role = 'spec' and e.state = 'ASSIGNED')
+           or (e.role = 'spec' and e.state = 'RUNNING' and e.tools_token_hash is not null))`,
+        [repositoryId, HOST],
+      );
+      return row!.n;
+    };
+
+    it("an idle spec session on a 1-worktree repository does not block starting a retry there", async () => {
+      const s = await seedRetry({ maxConcurrent: 4 });
+      await limitRepository(s, 1);
+      await specSessionOn(s);
+      const spy = spyRunner();
+
+      const taken = await runRetryStarter(starterOptions(s, spy.runner, at(30 * SECOND)));
+      expect(taken.map((c) => c.executionId)).toEqual([s.retryId]);
+      expect((await executionRow(s.retryId)).state).toBe("ASSIGNED");
+    });
+
+    it("a spec session mid-turn on a 1-worktree repository blocks starting a retry there until its turn ends", async () => {
+      const s = await seedRetry({ maxConcurrent: 4 });
+      await limitRepository(s, 1);
+      const session = await specSessionOn(s);
+      const spy = spyRunner();
+      const due = at(30 * SECOND);
+
+      await startSpecTurn(session);
+      expect(await runRetryStarter(starterOptions(s, spy.runner, due))).toEqual([]);
+      expect(spy.calls).toHaveLength(0);
+      expect(await executionRow(s.retryId)).toMatchObject({ state: "QUEUED", host: null });
+
+      await revokeToken(db, session.executionId);
+      const taken = await runRetryStarter(starterOptions(s, spy.runner, due));
+      expect(taken.map((c) => c.executionId)).toEqual([s.retryId]);
+    });
+
+    it("an ASSIGNED spec session on a 1-worktree repository blocks starting a retry there", async () => {
+      const s = await seedRetry({ maxConcurrent: 4 });
+      await limitRepository(s, 1);
+      await specSessionOn(s, "ASSIGNED");
+      const spy = spyRunner();
+
+      expect(await runRetryStarter(starterOptions(s, spy.runner, at(30 * SECOND)))).toEqual([]);
+      expect((await executionRow(s.retryId)).state).toBe("QUEUED");
+    });
+
+    it("a spec turn starting mid-claim overshoots the repository by that turn only, and no retry starts there until it ends", async () => {
+      // Worker slots are plentiful: only the repository limit binds.
+      const s = await seedRetry({ maxConcurrent: 10 });
+      const repo = await limitRepository(s, 2);
+      const { project_id: projectId } = await repositoryOf(s.taskId);
+      const [neighbour] = await raw<{ id: string }>(
+        `insert into tasks (project_id, repository_id, jira_key, jira_summary, jira_priority,
+           jira_created_at, jira_synced_at, state)
+         values ($1, $2, $3, 'neighbour', 1, $4, $4, 'IMPLEMENTING') returning id`,
+        [projectId, repo, `${s.jiraKey}-N`, NOW.toISOString()],
+      );
+      const busy = await seedExecutionRow(db, {
+        taskId: neighbour!.id,
+        state: "RUNNING",
+        host: HOST,
+        workerId: s.workerId,
+      });
+      const sessionA = await specSessionOn(s);
+      await specSessionOn(s);
+      // A second, younger retry on the same repository.
+      const s2 = await seedRetry();
+      await raw("update tasks set project_id = $1, repository_id = $2 where id = $3", [
+        projectId,
+        repo,
+        s2.taskId,
+      ]);
+      const due = at(30 * SECOND);
+
+      // The spec turn commits after the candidate select read the repository
+      // at 1 busy worktree of 2.
+      const claimed = await claimNextRetry({
+        db,
+        workerId: s.workerId,
+        runtimes: ["claude"],
+        now: due,
+        beforeLock: async () => {
+          await startSpecTurn(sessionA);
+        },
+      });
+
+      // One over the repository limit: exactly the in-flight spec turn.
+      expect(claimed?.executionId).toBe(s.retryId);
+      expect(await liveOnRepo(repo)).toBe(3);
+
+      // No retry starts on the repository while the overshoot lasts.
+      const spy = spyRunner();
+      expect(await runRetryStarter(starterOptions(s, spy.runner, due))).toEqual([]);
+      expect((await executionRow(s2.retryId)).state).toBe("QUEUED");
+
+      // The turn ends: back to the limit, which is still full.
+      await revokeToken(db, sessionA.executionId);
+      expect(await liveOnRepo(repo)).toBe(2);
+      expect(await runRetryStarter(starterOptions(s, spy.runner, due))).toEqual([]);
+
+      // An implementation worktree frees: the next retry starts, at the limit.
+      await raw("update executions set state = 'COMPLETED' where id = $1", [busy]);
+      const taken = await runRetryStarter(starterOptions(s, spy.runner, due));
+      expect(taken.map((c) => c.executionId)).toEqual([s2.retryId]);
+      expect(await liveOnRepo(repo)).toBe(2);
+    });
   });
 
   it("a sibling resumed to RUNNING between the select and the lock is seen by the re-check: null, row untouched (F4)", async () => {
