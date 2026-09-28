@@ -120,12 +120,12 @@ describe("BoardView", () => {
     expect(needsHumanSection.className).toContain("kanban__column--highlighted");
     expect(readySection.className).not.toContain("kanban__column--highlighted");
 
-    // Compact rail modifier (B1/B3): an empty, non-highlighted column
-    // ("Needs Spec", no cards in this fixture) collapses to a rail --
-    // header only, no "No tasks." line -- but its heading and count are
-    // still in the DOM with their normal text, just rotated by CSS. A
-    // populated column ("Ready") and an empty but highlighted column
-    // ("Waiting for You") are never compact.
+    // Compact column modifier (B1/B3, U7): an empty, non-highlighted
+    // column ("Needs Spec", no cards in this fixture) collapses to a
+    // narrow column -- header only, no "No tasks." line -- but its
+    // heading and count are still in the DOM with their normal,
+    // horizontal (unrotated) text. A populated column ("Ready") and an
+    // empty but highlighted column ("Waiting for You") are never compact.
     const needsSpecSection = screen.getByRole("region", { name: "Needs Spec" });
     expect(needsSpecSection.className).toContain("board-column--compact");
     expect(within(needsSpecSection).queryByText("No tasks.")).toBeNull();
@@ -133,6 +133,16 @@ describe("BoardView", () => {
     expect(waitingSection.className).not.toContain("board-column--compact");
     expect(within(needsSpecSection).getByRole("heading", { level: 2 }).textContent).toBe("Needs Spec");
     expect(within(needsSpecSection).getByText("0").className).toContain("badge");
+
+    // A compact column's heading keeps its full, unclipped name even when
+    // it's the longest one on the board (U7): it wraps onto multiple
+    // lines rather than being truncated or rotated.
+    const specApprovalSection = screen.getByRole("region", { name: "Awaiting Spec Approval" });
+    expect(specApprovalSection.className).toContain("board-column--compact");
+    expect(within(specApprovalSection).getByRole("heading", { level: 2 }).textContent).toBe(
+      "Awaiting Spec Approval",
+    );
+    expect(within(specApprovalSection).getByText("0").className).toContain("badge");
 
     // Highlighted-empty modifier (B3): "Waiting for You" has no cards in
     // this fixture, so it's narrower than a populated column, but never
@@ -269,8 +279,8 @@ describe("BoardView", () => {
 
     // Every column is empty. The two highlighted columns stay full height
     // (narrower than a populated column) and show the "No tasks." line;
-    // the other eight, empty and not highlighted, collapse to a rail with
-    // no card area at all (B1/B3).
+    // the other eight, empty and not highlighted, collapse to a compact
+    // column with no card area at all (B1/B3).
     expect(screen.getAllByText("No tasks.")).toHaveLength(2);
     for (const empty of screen.getAllByText("No tasks.")) {
       expect(empty.className).toContain("board-empty");
