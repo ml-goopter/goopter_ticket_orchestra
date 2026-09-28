@@ -7,6 +7,14 @@ export {
   type AgentToolsServerOptions,
 } from "./server.js";
 export {
+  DOCKER_DESKTOP_HOST,
+  agentToolsUrl,
+  isWildcardAddress,
+  resolveContainerEndpoint,
+  type ContainerEndpoint,
+  type ContainerEndpointInput,
+} from "./endpoint.js";
+export {
   ASSIGNED_TOOLS,
   authenticate,
   hashToken,

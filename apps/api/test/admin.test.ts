@@ -416,6 +416,173 @@ describe("admin routes", () => {
       expect(defaultRes.json().test_command).toBeNull();
     });
 
+    describe("C6: agent_container / agent_image (D20)", () => {
+      it("defaults agent_container to false and agent_image to null when omitted", async () => {
+        const app = await withAuthedApp();
+        const project = await createProject(app, "REPOAC1");
+
+        const createRes = await app.inject({
+          method: "POST",
+          url: "/api/repositories",
+          headers: { cookie },
+          payload: {
+            project_id: project.id,
+            name: "no-container-repo",
+            git_url: "git@example.com:goopter/no-container-repo.git",
+            default_branch: "main",
+            default_runtime: "claude",
+          },
+        });
+        expect(createRes.statusCode).toBe(201);
+        const created = createRes.json();
+        expect(created.agent_container).toBe(false);
+        expect(created.agent_image).toBeNull();
+      });
+
+      it("stores agent_container and agent_image on create, returns them on read, and patches them", async () => {
+        const app = await withAuthedApp();
+        const project = await createProject(app, "REPOAC2");
+
+        const createRes = await app.inject({
+          method: "POST",
+          url: "/api/repositories",
+          headers: { cookie },
+          payload: {
+            project_id: project.id,
+            name: "container-repo",
+            git_url: "git@example.com:goopter/container-repo.git",
+            default_branch: "main",
+            default_runtime: "claude",
+            agent_container: true,
+            agent_image: "orchestra/agent:custom",
+          },
+        });
+        expect(createRes.statusCode).toBe(201);
+        const created = createRes.json();
+        expect(created.agent_container).toBe(true);
+        expect(created.agent_image).toBe("orchestra/agent:custom");
+
+        const getRes = await app.inject({
+          method: "GET",
+          url: `/api/repositories/${created.id}`,
+          headers: { cookie },
+        });
+        expect(getRes.json().agent_container).toBe(true);
+        expect(getRes.json().agent_image).toBe("orchestra/agent:custom");
+
+        const patchRes = await app.inject({
+          method: "PATCH",
+          url: `/api/repositories/${created.id}`,
+          headers: { cookie },
+          payload: { agent_container: false, agent_image: null },
+        });
+        expect(patchRes.statusCode).toBe(200);
+        expect(patchRes.json().agent_container).toBe(false);
+        expect(patchRes.json().agent_image).toBeNull();
+      });
+
+      it("accepts an empty-string agent_image the same way setup_command is accepted", async () => {
+        const app = await withAuthedApp();
+        const project = await createProject(app, "REPOAC3");
+
+        const createRes = await app.inject({
+          method: "POST",
+          url: "/api/repositories",
+          headers: { cookie },
+          payload: {
+            project_id: project.id,
+            name: "empty-image-repo",
+            git_url: "git@example.com:goopter/empty-image-repo.git",
+            default_branch: "main",
+            default_runtime: "claude",
+            setup_command: "",
+            agent_image: "",
+          },
+        });
+        expect(createRes.statusCode).toBe(201);
+        const created = createRes.json();
+        expect(created.setup_command).toBe("");
+        expect(created.agent_image).toBe("");
+      });
+
+      it("rejects a non-boolean agent_container with 400 VALIDATION_ERROR", async () => {
+        const app = await withAuthedApp();
+        const project = await createProject(app, "REPOAC4");
+
+        const res = await app.inject({
+          method: "POST",
+          url: "/api/repositories",
+          headers: { cookie },
+          payload: {
+            project_id: project.id,
+            name: "bad-container-repo",
+            git_url: "git@example.com:goopter/bad-container-repo.git",
+            default_branch: "main",
+            default_runtime: "claude",
+            agent_container: "yes",
+          },
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().error.code).toBe("VALIDATION_ERROR");
+      });
+
+      it("rejects a non-string agent_image with 400 VALIDATION_ERROR", async () => {
+        const app = await withAuthedApp();
+        const project = await createProject(app, "REPOAC5");
+
+        const res = await app.inject({
+          method: "POST",
+          url: "/api/repositories",
+          headers: { cookie },
+          payload: {
+            project_id: project.id,
+            name: "bad-image-repo",
+            git_url: "git@example.com:goopter/bad-image-repo.git",
+            default_branch: "main",
+            default_runtime: "claude",
+            agent_image: 123,
+          },
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().error.code).toBe("VALIDATION_ERROR");
+      });
+
+      it("patch rejects a non-boolean agent_container with 400 and keeps the old value", async () => {
+        const app = await withAuthedApp();
+        const project = await createProject(app, "REPOAC6");
+        const createRes = await app.inject({
+          method: "POST",
+          url: "/api/repositories",
+          headers: { cookie },
+          payload: {
+            project_id: project.id,
+            name: "patch-bad-container-repo",
+            git_url: "git@example.com:goopter/patch-bad-container-repo.git",
+            default_branch: "main",
+            default_runtime: "claude",
+            agent_container: true,
+          },
+        });
+        const created = createRes.json();
+
+        const patchRes = await app.inject({
+          method: "PATCH",
+          url: `/api/repositories/${created.id}`,
+          headers: { cookie },
+          payload: { agent_container: "nope" },
+        });
+        expect(patchRes.statusCode).toBe(400);
+        expect(patchRes.json().error.code).toBe("VALIDATION_ERROR");
+
+        const getRes = await app.inject({
+          method: "GET",
+          url: `/api/repositories/${created.id}`,
+          headers: { cookie },
+        });
+        expect(getRes.json().agent_container).toBe(true);
+      });
+    });
+
     describe("GOT.39 F1: test_command must pass the review role's validateTestCommand", () => {
       const BAD_TEST_COMMANDS: Array<[string, string]> = [
         ["empty", ""],

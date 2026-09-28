@@ -1,10 +1,16 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { isIP, type AddressInfo } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { agentTools } from "@orchestra/core";
 import type { Db } from "@orchestra/db";
 import type { Logger } from "../logger.js";
+import {
+  AGENT_TOOLS_PATH,
+  agentToolsUrl,
+  isWildcardAddress,
+  type ContainerEndpoint,
+} from "./endpoint.js";
 import { invokeTool, type ErasedToolDefinition, type InvokeDeps } from "./invoke.js";
 import type { ExecutionRegistry } from "./registry.js";
 import { resolveToken } from "./tokens.js";
@@ -20,9 +26,13 @@ import { TOOL_DEFINITIONS } from "./tools/index.js";
  * token revoked mid-session fails on its very next request. Unknown and
  * revoked tokens are turned away with HTTP 401 before any MCP handling;
  * per-tool state and role checks happen in `invokeTool`.
+ *
+ * A second, container-facing listener (design.md §9.9 "Network") can be
+ * added on the same port for container-mode agents. It shares the request
+ * handler, so the bearer token stays the only authentication.
  */
 
-export const AGENT_TOOLS_PATH = "/mcp";
+export { AGENT_TOOLS_PATH };
 export const DEFAULT_AGENT_TOOLS_HOST = "127.0.0.1";
 /** Largest request body accepted. A full `SpecContent` is a few KB. */
 export const MAX_BODY_BYTES = 1024 * 1024;
@@ -41,6 +51,20 @@ export interface AgentToolsServer {
   stop(): Promise<void>;
   /** `http://host:port/mcp`. Throws before `start` has resolved. */
   readonly url: string;
+  /**
+   * Adds the container-facing listener on the loopback listener's port and
+   * `endpoint.bindHost`, which must be a specific IP literal, never a
+   * wildcard. When `bindHost` equals the loopback listener's address (Docker
+   * Desktop) the loopback socket serves both. Requires `start` first.
+   */
+  startContainerListener(
+    endpoint: Pick<ContainerEndpoint, "bindHost" | "advertiseHost">,
+  ): Promise<void>;
+  /**
+   * `http://<advertiseHost>:port/mcp`, the URL container-mode agents use.
+   * Throws before `startContainerListener` has resolved and after `stop`.
+   */
+  readonly containerUrl: string;
 }
 
 class HttpError extends Error {
@@ -125,6 +149,10 @@ export function createAgentToolsServer(
   const { logger } = options;
   let server: http.Server | undefined;
   let address: AddressInfo | undefined;
+  /** Separate socket; undefined when absent or sharing the loopback one. */
+  let containerServer: http.Server | undefined;
+  let containerUrl: string | undefined;
+  let containerStarting = false;
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
@@ -172,37 +200,93 @@ export function createAgentToolsServer(
     });
   };
 
+  function listen(port: number, host: string): Promise<http.Server> {
+    const created = http.createServer(onRequest);
+    return new Promise<http.Server>((resolve, reject) => {
+      created.once("error", reject);
+      created.listen(port, host, () => {
+        created.off("error", reject);
+        resolve(created);
+      });
+    });
+  }
+
+  function close(target: http.Server): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      target.close((err) => (err ? reject(err) : resolve()));
+      target.closeIdleConnections();
+    });
+  }
+
   return {
     async start(port, host = DEFAULT_AGENT_TOOLS_HOST) {
       if (server) throw new Error("agent-tools server already started");
-      const created = http.createServer(onRequest);
-      await new Promise<void>((resolve, reject) => {
-        created.once("error", reject);
-        created.listen(port, host, () => {
-          created.off("error", reject);
-          resolve();
-        });
-      });
+      const created = await listen(port, host);
       server = created;
       address = created.address() as AddressInfo;
       logger.info({ url: this.url }, "agent-tools server listening");
     },
 
+    async startContainerListener({ bindHost, advertiseHost }) {
+      if (!address) throw new Error("agent-tools server is not listening");
+      if (containerUrl || containerStarting) {
+        throw new Error("agent-tools container listener already started");
+      }
+      if (isIP(bindHost) === 0) {
+        throw new Error(
+          `container listener bind host must be an IP address, got ${JSON.stringify(bindHost)}`,
+        );
+      }
+      if (isWildcardAddress(bindHost)) {
+        throw new Error(
+          `refusing wildcard container listener bind host ${bindHost}: it would bind every interface`,
+        );
+      }
+      if (!advertiseHost) throw new Error("container listener needs an advertise host");
+
+      const { port } = address;
+      const owner = server;
+      if (bindHost !== address.address) {
+        containerStarting = true;
+        try {
+          const created = await listen(port, bindHost);
+          if (server !== owner) {
+            // stop() ran while we were binding.
+            await close(created);
+            throw new Error("agent-tools server stopped during container listener start");
+          }
+          containerServer = created;
+        } finally {
+          containerStarting = false;
+        }
+      }
+      containerUrl = agentToolsUrl(advertiseHost, port);
+      logger.info(
+        { url: containerUrl, bindHost, shared: containerServer === undefined },
+        "agent-tools container listener ready",
+      );
+    },
+
     async stop() {
       const current = server;
       if (!current) return;
+      const container = containerServer;
       server = undefined;
       address = undefined;
-      await new Promise<void>((resolve, reject) => {
-        current.close((err) => (err ? reject(err) : resolve()));
-        current.closeIdleConnections();
-      });
+      containerServer = undefined;
+      containerUrl = undefined;
+      await Promise.all([close(current), container ? close(container) : undefined]);
     },
 
     get url() {
       if (!address) throw new Error("agent-tools server is not listening");
       const host = address.family === "IPv6" ? `[${address.address}]` : address.address;
       return `http://${host}:${address.port}${AGENT_TOOLS_PATH}`;
+    },
+
+    get containerUrl() {
+      if (!containerUrl) throw new Error("agent-tools container listener is not listening");
+      return containerUrl;
     },
   };
 }
