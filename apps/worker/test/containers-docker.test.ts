@@ -53,7 +53,14 @@ function dockerStatus(...args: string[]): number | null {
 }
 
 interface Inspect {
-  Config: { Env: string[]; Labels: Record<string, string>; User: string; Image: string; Cmd: string[] };
+  Config: {
+    Env: string[];
+    Labels: Record<string, string>;
+    User: string;
+    Image: string;
+    Cmd: string[];
+    Entrypoint: string[];
+  };
   HostConfig: { NanoCpus: number; Memory: number };
   Mounts: Array<{ Type: string; Source: string; Destination: string; RW: boolean }>;
   NetworkSettings: { Networks: Record<string, unknown> };
@@ -154,7 +161,10 @@ describe.skipIf(!dockerOk)("agent containers against real Docker (§9.9)", () =>
       "orchestra.owner": owner,
     });
     expect(c.Config.User).toBe(`${process.getuid!()}:${process.getgid!()}`);
-    expect(c.Config.Cmd).toEqual(["sleep", "infinity"]);
+    // §9.9 Lifecycle: idles on `sleep infinity`, forced via --entrypoint so a
+    // per-repository image's own ENTRYPOINT or CMD never wins (F2).
+    expect(c.Config.Entrypoint).toEqual(["sleep"]);
+    expect(c.Config.Cmd).toEqual(["infinity"]);
     expect(c.HostConfig.NanoCpus).toBe(1e9);
     expect(c.HostConfig.Memory).toBe(512 * 1024 * 1024);
     expect(Object.keys(c.NetworkSettings.Networks)).toEqual([network]);
@@ -317,6 +327,36 @@ describe.skipIf(!dockerOk)("agent containers against real Docker (§9.9)", () =>
     await expect(
       manager.runShell({ container: containerName(executionId), cwd: worktree, command: "true", timeoutMs: 30_000 }),
     ).rejects.toBeInstanceOf(DockerError);
+  });
+
+  it("stays running under a per-repository image whose own ENTRYPOINT and CMD are not sleep infinity (F2)", async () => {
+    const tag = `orchestra-agent-test-${randomUUID().slice(0, 8)}`;
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "orchestra-agent-image-"));
+    const id = randomUUID();
+    try {
+      await fs.writeFile(
+        path.join(dir, "Dockerfile"),
+        [`FROM ${IMAGE}`, `ENTRYPOINT ["echo", "should-not-run"]`, `CMD ["hello"]`, ""].join("\n"),
+      );
+      execFileSync("docker", ["build", "-t", tag, dir], { stdio: "ignore" });
+
+      created.add(containerName(id));
+      const handle = await manager.ensure({
+        executionId: id,
+        taskId,
+        repositoryName: "sample_repo",
+        role: "implementation",
+        env: {},
+        image: tag,
+        worktreePath: worktree,
+      });
+
+      expect(handle.created).toBe(true);
+      expect(inspect(handle.name).State.Running).toBe(true);
+    } finally {
+      dockerStatus("rmi", "-f", tag);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("surfaces a missing image as DockerError without pulling", async () => {

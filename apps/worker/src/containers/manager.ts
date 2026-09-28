@@ -353,7 +353,13 @@ export class ContainerManager {
       "-e",
       `HOME=${home}`,
       ...names.flatMap((envName) => ["-e", envName]),
+      // §9.9 Lifecycle: idles on `sleep infinity` between turns, whatever
+      // the image's own ENTRYPOINT or CMD is (a per-repository image FROM
+      // orchestra/agent can redefine either).
+      "--entrypoint",
+      "sleep",
       image,
+      "infinity",
     ];
     const result = await this.#run(args, { timeoutMs: CREATE_TIMEOUT_MS, env: input.env });
     if (result.exitCode !== 0) {
@@ -363,6 +369,18 @@ export class ContainerManager {
         if (now && isUsable(now)) return { ...handle, created: false };
       }
       throw dockerFailure(args, result);
+    }
+    // The daemon accepted the create; confirm it is actually running before
+    // reporting success (a bad mount or a crashing entrypoint can exit
+    // immediately even on a zero-exit `run -d`).
+    const started = await this.#inspect(name);
+    if (!started || !isUsable(started)) {
+      throw dockerFailure(args, {
+        exitCode: result.exitCode,
+        stderr: started
+          ? `container ${name} exited immediately after create`
+          : `container ${name} not found after create`,
+      });
     }
     this.#logger?.info({ container: name, image }, "agent container created");
     return { ...handle, created: true };

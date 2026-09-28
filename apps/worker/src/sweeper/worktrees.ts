@@ -179,7 +179,7 @@ async function removeContainerGuarded(
  * With `options.containers`, whenever a rule removes or evicts a worktree,
  * the execution's agent container is removed too (§9.9 Removal). After rule
  * three, the orphan pass removes containers carrying this deployment's
- * `orchestra.owner` label whose execution has ended on this host or does
+ * `orchestra.owner` label whose execution has ended, on any host, or does
  * not exist (§9.9 Orphans). A container failure is logged and never blocks
  * worktree cleanup; the orphan pass picks up what a failed removal left.
  *
@@ -426,7 +426,7 @@ export async function sweepWorktrees(
     }
   }
 
-  if (containers) await sweepOrphanContainers({ db, host, logger }, containers);
+  if (containers) await sweepOrphanContainers({ db, logger }, containers);
 
   // Rule four.
   const threshold = input.diskHighWaterPct;
@@ -457,18 +457,20 @@ export async function sweepWorktrees(
  * `orchestra.execution` and carrying this deployment's `orchestra.owner`
  * (never any other: a container with no owner or another owner belongs to
  * another stack on the same daemon) and removes each whose label names no
- * execution, or an execution on `host` that has ended. An execution on
- * another host, or on none, is left alone. A container this process has
- * ensured and not removed is the runner's and is left alone too. A known
- * execution is re-checked with its task and execution rows locked; the
- * removal itself runs after that transaction commits, under the guard of
- * `removeContainerGuarded`. Never throws.
+ * execution, or an execution that has ended. This deployment's containers
+ * are exclusively its own regardless of which host the execution's row
+ * currently names: a row released to no host or moved to another host is
+ * still ended, and its container is still this deployment's to reclaim. A
+ * container this process has ensured and not removed is the runner's and is
+ * left alone too. A known execution is re-checked with its task and
+ * execution rows locked; the removal itself runs after that transaction
+ * commits, under the guard of `removeContainerGuarded`. Never throws.
  */
 async function sweepOrphanContainers(
-  input: Pick<WorktreeSweepInput, "db" | "host" | "logger">,
+  input: Pick<WorktreeSweepInput, "db" | "logger">,
   containers: ExecutionContainerOps,
 ): Promise<void> {
-  const { db, host, logger } = input;
+  const { db, logger } = input;
   let listed: LabelledContainer[];
   try {
     listed = (await containers.list()).filter((c) => c.owner === containers.owner);
@@ -491,7 +493,7 @@ async function sweepOrphanContainers(
   }
 
   const ownedAndEnded = (row: ContainerExecution): boolean =>
-    row.host === host && CONTAINER_ENDED_STATES.has(row.state);
+    CONTAINER_ENDED_STATES.has(row.state);
 
   for (const container of listed) {
     const { executionId } = container;

@@ -94,14 +94,22 @@ function fakeDocker(handler: (args: string[], call: number) => Reply = () => und
   return { run, calls, verbs: () => calls.map((c) => c.args.slice(0, 2).join(" ")) };
 }
 
-/** Replies for a first `ensure` on a host where the network exists. */
+/**
+ * Replies for a first `ensure` on a host where the network exists. Once
+ * `run -d` has replied, a later `container inspect` (the post-create check)
+ * reports the container running, as the real daemon would.
+ */
 function freshHost(overrides: (args: string[]) => Reply = () => undefined) {
+  let started = false;
   return (args: string[]): Reply => {
     const o = overrides(args);
     if (o !== undefined) return o;
-    if (args[0] === "container" && args[1] === "inspect") return NOT_FOUND;
+    if (args[0] === "container" && args[1] === "inspect") return started ? RUNNING : NOT_FOUND;
     if (args[0] === "network" && args[1] === "inspect") return NETWORK_OK;
-    if (args[0] === "run") return { stdout: "abc123\n" };
+    if (args[0] === "run") {
+      started = true;
+      return { stdout: "abc123\n" };
+    }
     return undefined;
   };
 }
@@ -234,7 +242,10 @@ describe("ContainerManager.ensure", () => {
       "GITHUB_TOKEN",
       "-e",
       "CLAUDE_CODE_OAUTH_TOKEN",
+      "--entrypoint",
+      "sleep",
       IMAGE,
+      "infinity",
     ]);
     expect(run.options.env).toEqual({
       GITHUB_TOKEN: SECRET_GH,
@@ -249,6 +260,18 @@ describe("ContainerManager.ensure", () => {
       created: true,
     });
     expect(statSync(home).isDirectory()).toBe(true);
+  });
+
+  it("always runs sleep infinity via --entrypoint, whatever the image's own ENTRYPOINT or CMD is (F2)", async () => {
+    const docker = fakeDocker(freshHost());
+    await manager(docker.run).ensure(ensureInput({ image: "registry.local/agent-node:3" }));
+    const run = docker.calls.find((c) => c.args[0] === "run")!;
+    expect(run.args.slice(-4)).toEqual([
+      "--entrypoint",
+      "sleep",
+      "registry.local/agent-node:3",
+      "infinity",
+    ]);
   });
 
   it("never puts a secret value on any docker command line", async () => {
@@ -279,7 +302,7 @@ describe("ContainerManager.ensure", () => {
     const image = async (value: unknown) => {
       const docker = fakeDocker(freshHost());
       await manager(docker.run).ensure(ensureInput({ image: value }));
-      return docker.calls.find((c) => c.args[0] === "run")!.args.at(-1);
+      return docker.calls.find((c) => c.args[0] === "run")!.args.at(-2);
     };
     expect(await image("registry.local/agent-node:3")).toBe("registry.local/agent-node:3");
     expect(await image("")).toBe(IMAGE);
@@ -354,12 +377,23 @@ describe("ContainerManager.ensure", () => {
       { exitCode: 0, stdout: '{"Status":"paused","Running":true,"Paused":true,"Restarting":false}' },
     ],
   ])("removes a %s container and recreates it with the same mounts", async (_label, state) => {
+    let firstInspect = true;
     const docker = fakeDocker(
-      freshHost((args) => (args[0] === "container" && args[1] === "inspect" ? state : undefined)),
+      freshHost((args) => {
+        if (args[0] !== "container" || args[1] !== "inspect" || !firstInspect) return undefined;
+        firstInspect = false;
+        return state;
+      }),
     );
     const handle = await manager(docker.run).ensure(ensureInput());
     expect(handle.created).toBe(true);
-    expect(docker.verbs()).toEqual(["container inspect", "rm -f", "network inspect", "run -d"]);
+    expect(docker.verbs()).toEqual([
+      "container inspect",
+      "rm -f",
+      "network inspect",
+      "run -d",
+      "container inspect",
+    ]);
     expect(docker.calls[1]!.args).toEqual(["rm", "-f", "-v", `orchestra-exec-${EXEC}`]);
   });
 
@@ -432,6 +466,22 @@ describe("ContainerManager.ensure", () => {
     expect(err).toMatchObject({ reason: "failed", exitCode: 125, code: "DOCKER_FAILED" });
     expect((err as DockerError).message).toMatch(/No such image/);
     expect((err as DockerError).message).not.toContain("SECRETVALUE");
+  });
+
+  it("raises DockerError instead of reporting success when the container is not running right after create", async () => {
+    let inspects = 0;
+    const docker = fakeDocker((args) => {
+      if (args[0] === "container" && args[1] === "inspect") {
+        inspects += 1;
+        return inspects === 1 ? NOT_FOUND : EXITED;
+      }
+      if (args[0] === "network" && args[1] === "inspect") return NETWORK_OK;
+      if (args[0] === "run") return { stdout: "abc123\n" };
+      return undefined;
+    });
+    const err = await manager(docker.run).ensure(ensureInput()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DockerError);
+    expect((err as DockerError).message).toMatch(/exited immediately/);
   });
 
   it.each([
@@ -625,10 +675,17 @@ describe("the per-execution container lock and ensure mark (§6.6, §9.9 Recreat
   it("ensure waits while a removal holds the execution's lock, then recreates the removed container", async () => {
     const id = exec(++n);
     let removed = false;
+    let created = false;
     const docker = fakeDocker(
-      freshHost((args) =>
-        args[0] === "container" && args[1] === "inspect" ? (removed ? NOT_FOUND : RUNNING) : undefined,
-      ),
+      freshHost((args) => {
+        if (args[0] === "run") {
+          created = true;
+          return undefined;
+        }
+        if (args[0] !== "container" || args[1] !== "inspect") return undefined;
+        if (!removed) return RUNNING;
+        return created ? RUNNING : NOT_FOUND;
+      }),
     );
     const m = manager(docker.run);
     let release!: () => void;
@@ -650,7 +707,7 @@ describe("the per-execution container lock and ensure mark (§6.6, §9.9 Recreat
     await removal;
     const handle = await ensured;
     expect(handle.created).toBe(true);
-    expect(docker.verbs()).toEqual(["container inspect", "network inspect", "run -d"]);
+    expect(docker.verbs()).toEqual(["container inspect", "network inspect", "run -d", "container inspect"]);
   });
 
   it("locks are per execution: another execution's ensure does not wait", async () => {
@@ -669,8 +726,13 @@ describe("the per-execution container lock and ensure mark (§6.6, §9.9 Recreat
 
   it("recreating a stopped container inside ensure does not deadlock on the lock ensure holds", async () => {
     const id = exec(++n);
+    let firstInspect = true;
     const docker = fakeDocker(
-      freshHost((args) => (args[0] === "container" && args[1] === "inspect" ? EXITED : undefined)),
+      freshHost((args) => {
+        if (args[0] !== "container" || args[1] !== "inspect" || !firstInspect) return undefined;
+        firstInspect = false;
+        return EXITED;
+      }),
     );
     await expect(manager(docker.run).ensure(ensureInput({ executionId: id }))).resolves.toMatchObject({
       created: true,

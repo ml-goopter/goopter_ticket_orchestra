@@ -1497,7 +1497,7 @@ describe("orphan agent containers (§9.9 Orphans)", () => {
     return { taskId: task.id, executionId };
   }
 
-  it("removes containers whose execution is terminal on this host or unknown, and keeps every other", async () => {
+  it("removes containers whose execution is terminal on any host or unknown, and keeps every other", async () => {
     const failed = await seedExecution("FAILED");
     const cancelled = await seedExecution("CANCELLED");
     const completed = await seedExecution("COMPLETED");
@@ -1527,13 +1527,63 @@ describe("orphan agent containers (§9.9 Orphans)", () => {
     await sweep();
 
     expect(containers.removed.sort()).toEqual(
-      ["c-bogus", "c-cancelled", "c-completed", "c-failed", "c-unknown"].sort(),
+      [
+        "c-bogus",
+        "c-cancelled",
+        "c-completed",
+        "c-failed",
+        "c-other-host",
+        "c-no-host",
+        "c-unknown",
+      ].sort(),
     );
     expect(records).toContainEqual(
       expect.objectContaining({
         level: "info",
         msg: "orphan agent container removed",
         fields: expect.objectContaining({ container: "c-unknown", executionId: unknown }),
+      }),
+    );
+  });
+
+  it("removes a terminal execution's container even when its row has been released to no host (F1)", async () => {
+    const released = await seedExecution("FAILED", null);
+    containers = fakeContainers({
+      listed: [labelled("c-released", released.executionId, released.taskId)],
+    });
+
+    await sweep();
+
+    expect(containers.removed).toEqual(["c-released"]);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "info",
+        msg: "orphan agent container removed",
+        fields: expect.objectContaining({
+          container: "c-released",
+          executionId: released.executionId,
+        }),
+      }),
+    );
+  });
+
+  it("removes a terminal execution's container even when its row has moved to another host (F1)", async () => {
+    const moved = await seedExecution("CANCELLED", OTHER_HOST);
+    containers = fakeContainers({
+      listed: [labelled("c-moved", moved.executionId, moved.taskId)],
+    });
+
+    await sweep();
+
+    expect(containers.removed).toEqual(["c-moved"]);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "info",
+        msg: "orphan agent container removed",
+        fields: expect.objectContaining({
+          container: "c-moved",
+          executionId: moved.executionId,
+        }),
       }),
     );
   });
