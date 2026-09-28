@@ -39,6 +39,19 @@
   margin-bottom: var(--space-4);
 }
 
+/* Resolution card: bottom margin so "Thread" below isn't flush against it;
+ * kind + resolved time render as one muted line (`.issue-detail__meta`
+ * styling), e.g. "Spec revision · 3 hr ago". */
+.issue-detail__resolution {
+  margin-bottom: var(--space-4);
+}
+
+.issue-detail__resolution-meta {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
 .issue-detail__question p {
   margin: 0;
   font-weight: 600;

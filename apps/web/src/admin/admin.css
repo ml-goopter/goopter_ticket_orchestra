@@ -41,9 +41,12 @@
 }
 
 /* Space between a panel's table (or its loading/empty/error state) and its
- * create/edit card below it. */
+ * create/edit card below it. `overflow-x: auto` keeps a wide table
+ * scrolling inside this wrapper instead of the whole page scrolling
+ * horizontally at narrow widths (e.g. 768px). */
 .admin-panel__table {
   margin-bottom: var(--space-5);
+  overflow-x: auto;
 }
 
 /* Muted placeholder text, e.g. a worker with no capabilities. */
