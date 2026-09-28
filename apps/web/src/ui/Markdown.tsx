@@ -2,11 +2,17 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 const components: Components = {
-  a: ({ href, children, ...rest }) => (
-    <a {...rest} href={href} target="_blank" rel="noopener noreferrer">
-      {children}
-    </a>
-  ),
+  // react-markdown passes its mdast `node` to every custom renderer; drop
+  // it before spreading `rest` so it doesn't land on the DOM element as a
+  // stray `node="[object Object]"` attribute (F3).
+  a: ({ href, children, node: _node, ...rest }) => {
+    void _node;
+    return (
+      <a {...rest} href={href} target="_blank" rel="noopener noreferrer">
+        {children}
+      </a>
+    );
+  },
 };
 
 export interface MarkdownProps {

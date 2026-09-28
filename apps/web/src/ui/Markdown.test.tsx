@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 import { Markdown } from "./Markdown.js";
+
+afterEach(cleanup);
 
 describe("Markdown", () => {
   it("renders a GFM table", () => {
@@ -38,6 +40,12 @@ describe("Markdown", () => {
     const link = screen.getByRole("link", { name: "here" });
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+  });
+
+  it("does not spread react-markdown's node prop onto the <a> element (F3)", () => {
+    render(<Markdown>{"[here](https://example.com)"}</Markdown>);
+    const link = screen.getByRole("link", { name: "here" });
+    expect(link.hasAttribute("node")).toBe(false);
   });
 
   it("wraps output in a .markdown container", () => {
