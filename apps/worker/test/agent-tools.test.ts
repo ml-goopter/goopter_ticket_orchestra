@@ -254,11 +254,11 @@ async function snapshot(s: Seeded) {
 
 // ------------------------------------------------------------- mcp client
 
-async function connect(token: string): Promise<Client> {
+async function connect(token: string, url = server.url): Promise<Client> {
   const client = new Client({ name: "agent-tools-test", version: "0.0.0" });
   clients.push(client);
   await client.connect(
-    new StreamableHTTPClientTransport(new URL(server.url), {
+    new StreamableHTTPClientTransport(new URL(url), {
       requestInit: { headers: { Authorization: `Bearer ${token}` } },
     }),
   );
@@ -505,6 +505,143 @@ describe("HTTP gate", () => {
       expect.arrayContaining(["type", "severity", "blocking", "title", "description"]),
     );
     expect(raise.outputSchema).toBeDefined();
+  });
+});
+
+// ============================================== design.md §9.9 Network
+
+describe("container-facing listener (design.md §9.9)", () => {
+  /** A second server instance so the shared one's lifecycle is untouched. */
+  async function startSecondServer(): Promise<AgentToolsServer> {
+    const extra = createAgentToolsServer({ db, registry, logger });
+    onTestFinished(() => extra.stop());
+    await extra.start(0, "127.0.0.1");
+    return extra;
+  }
+
+  const unauthenticatedPost = (url: string) =>
+    fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+
+  it("containerUrl throws before the container listener is started", () => {
+    expect(() => server.containerUrl).toThrow(/container listener/);
+  });
+
+  it("serves the same authenticated endpoint on a second address, same port, while loopback keeps working", async () => {
+    const extra = await startSecondServer();
+    const port = new URL(extra.url).port;
+    // ::1 stands in for the bridge gateway: a second, distinct, bindable address.
+    await extra.startContainerListener({ bindHost: "::1", advertiseHost: "::1" });
+
+    expect(extra.containerUrl).toBe(`http://[::1]:${port}/mcp`);
+    expect(extra.url).toBe(`http://127.0.0.1:${port}/mcp`);
+
+    // 401 without a token, 401 with an unknown token.
+    const res = await unauthenticatedPost(extra.containerUrl);
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toMatch(/^Bearer/);
+    await expect(connect("not-a-real-token", extra.containerUrl)).rejects.toThrow(
+      /401|UNAUTHORIZED/,
+    );
+
+    // A valid token works on both listeners with identical tool behaviour.
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const viaContainer = await connect(s.token, extra.containerUrl);
+    const viaLoopback = await connect(s.token, extra.url);
+    const [containerTools, loopbackTools] = await Promise.all([
+      viaContainer.listTools(),
+      viaLoopback.listTools(),
+    ]);
+    expect(containerTools.tools.map((t) => t.name).sort()).toEqual(
+      loopbackTools.tools.map((t) => t.name).sort(),
+    );
+    expectOk(await callOn(viaContainer, "note", { text: "from the container" }));
+    expectOk(await callOn(viaLoopback, "note", { text: "from the host" }));
+    const notes = (await eventsFor(s.taskId))
+      .filter((e) => e.type === "agent.note")
+      .map((e) => (e.payload as { text: string }).text);
+    expect(notes).toEqual(["from the container", "from the host"]);
+
+    // A revoked token is refused on the container listener too.
+    await db.transaction((tx) => revokeToken(tx, s.executionId));
+    expect((await unauthenticatedPost(extra.containerUrl)).status).toBe(401);
+    await expect(connect(s.token, extra.containerUrl)).rejects.toThrow(
+      /401|UNAUTHORIZED/,
+    );
+  });
+
+  it("stop closes both listeners", async () => {
+    const extra = await startSecondServer();
+    await extra.startContainerListener({ bindHost: "::1", advertiseHost: "::1" });
+    const loopbackUrl = extra.url;
+    const containerUrl = extra.containerUrl;
+
+    await extra.stop();
+
+    expect(() => extra.url).toThrow();
+    expect(() => extra.containerUrl).toThrow(/container listener/);
+    await expect(unauthenticatedPost(loopbackUrl)).rejects.toThrow();
+    await expect(unauthenticatedPost(containerUrl)).rejects.toThrow();
+  });
+
+  it("reuses the loopback socket when the container bind address equals it (Docker Desktop)", async () => {
+    const extra = await startSecondServer();
+    const port = new URL(extra.url).port;
+
+    // Binding 127.0.0.1 on the same port twice would fail with EADDRINUSE.
+    await extra.startContainerListener({
+      bindHost: "127.0.0.1",
+      advertiseHost: "host.docker.internal",
+    });
+
+    expect(extra.containerUrl).toBe(`http://host.docker.internal:${port}/mcp`);
+    expect((await unauthenticatedPost(extra.url)).status).toBe(401);
+  });
+
+  for (const bindHost of ["0.0.0.0", "::", "0:0:0:0:0:0:0:0"]) {
+    it(`refuses the wildcard bind address ${bindHost}`, async () => {
+      const extra = await startSecondServer();
+      await expect(
+        extra.startContainerListener({ bindHost, advertiseHost: "x" }),
+      ).rejects.toThrow(/wildcard/);
+      expect(() => extra.containerUrl).toThrow(/container listener/);
+    });
+  }
+
+  it("refuses a bind address that is not an IP literal", async () => {
+    const extra = await startSecondServer();
+    await expect(
+      extra.startContainerListener({ bindHost: "localhost", advertiseHost: "x" }),
+    ).rejects.toThrow(/IP address/);
+  });
+
+  it("refuses to start before the loopback listener or twice", async () => {
+    const idle = createAgentToolsServer({ db, registry, logger });
+    await expect(
+      idle.startContainerListener({ bindHost: "::1", advertiseHost: "::1" }),
+    ).rejects.toThrow(/not listening/);
+
+    const extra = await startSecondServer();
+    await extra.startContainerListener({ bindHost: "::1", advertiseHost: "::1" });
+    await expect(
+      extra.startContainerListener({ bindHost: "::1", advertiseHost: "::1" }),
+    ).rejects.toThrow(/already started/);
+  });
+
+  it("a failed bind leaves no container listener and the server still stops", async () => {
+    const extra = await startSecondServer();
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737): not assigned to any host interface.
+    await expect(
+      extra.startContainerListener({ bindHost: "192.0.2.1", advertiseHost: "192.0.2.1" }),
+    ).rejects.toThrow(/EADDRNOTAVAIL/);
+    expect(() => extra.containerUrl).toThrow(/container listener/);
+    expect((await unauthenticatedPost(extra.url)).status).toBe(401);
   });
 });
 
