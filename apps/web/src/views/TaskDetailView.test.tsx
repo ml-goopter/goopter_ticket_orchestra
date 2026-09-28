@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { EXECUTION_EVENT_TYPES } from "@orchestra/core";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { Link, MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,7 +7,8 @@ import type { BoardApiClient } from "../api/client.js";
 import { ApiError } from "../api/client.js";
 import type { SpecificationRevision, TimelineEvent, TimelinePage } from "../api/types.js";
 import type { EventSourceLike, MessageEventLike } from "../sse/useEventStream.js";
-import { makeTaskAggregate, makeTimelineEvent } from "../task/fixtures.js";
+import { makeEveryEventTypeTimeline, makeTaskAggregate, makeTimelineEvent } from "../task/fixtures.js";
+import { humanizeEnum } from "../ui/humanizeEnum.js";
 import { TaskDetailView } from "./TaskDetailView.js";
 
 afterEach(cleanup);
@@ -145,10 +147,14 @@ describe("TaskDetailView", () => {
     const client = makeClient();
     renderDetail(client);
 
-    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("IMPLEMENTING"));
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Implementing"));
 
-    expect(screen.getByText("v1 - superseded")).toBeTruthy();
-    expect(screen.getByText("v2 - approved")).toBeTruthy();
+    const revisionsSection = screen.getByRole("region", { name: "Specification revisions" });
+    const revisionList = revisionsSection.querySelector(".task-detail__side-list") as HTMLElement;
+    expect(within(revisionList).getByText("v1")).toBeTruthy();
+    expect(within(revisionList).getByText("Superseded")).toBeTruthy();
+    expect(within(revisionList).getByText("v2")).toBeTruthy();
+    expect(within(revisionList).getByText("Approved")).toBeTruthy();
 
     const executionsSection = screen.getByRole("region", { name: "Executions" });
     expect(within(executionsSection).getByText(/spec attempt 1: COMPLETED/)).toBeTruthy();
@@ -179,21 +185,21 @@ describe("TaskDetailView", () => {
     const liveEvent: TimelineEvent = makeTimelineEvent({
       id: 501,
       type: "issue.created",
-      payload: { issueId: "i2" },
+      payload: { issue_id: "issue-2", title: "New question raised" },
     });
 
     await act(async () => {
       currentSource().emit("issue.created", liveEvent, "501");
     });
 
-    await waitFor(() => expect(screen.getAllByText(/issue\.created:/)).toHaveLength(1));
+    await waitFor(() => expect(screen.getAllByText(/New question raised/)).toHaveLength(1));
 
     // Redelivered (e.g. after a reconnect catch-up overlaps it): still one item.
     await act(async () => {
       currentSource().emit("issue.created", liveEvent, "501");
     });
 
-    expect(screen.getAllByText(/issue\.created:/)).toHaveLength(1);
+    expect(screen.getAllByText(/New question raised/)).toHaveLength(1);
   });
 
   it("collapses agent.message.delta rows into one item, replaced by the final agent.message text (AC4)", async () => {
@@ -217,7 +223,8 @@ describe("TaskDetailView", () => {
       );
     });
 
-    await waitFor(() => expect(screen.getByText(/Hello \.\.\./)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Hello")).toBeTruthy());
+    expect(screen.getByTestId("message-in-progress")).toBeTruthy();
 
     await act(async () => {
       currentSource().emit(
@@ -228,7 +235,7 @@ describe("TaskDetailView", () => {
     });
 
     await waitFor(() => expect(screen.getByText("Hello!")).toBeTruthy());
-    expect(screen.queryByText(/Hello \.\.\./)).toBeNull();
+    expect(screen.queryByTestId("message-in-progress")).toBeNull();
   });
 
   it("hides items outside the selected filter families (AC5)", async () => {
@@ -290,7 +297,7 @@ describe("TaskDetailView", () => {
     const client = makeClient({ getTask: vi.fn().mockResolvedValue(aggregate), retryTask });
     renderDetail(client);
 
-    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("NEEDS_HUMAN"));
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Needs human"));
     expect((screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement).disabled).toBe(false);
 
     await act(async () => {
@@ -385,14 +392,22 @@ describe("TaskDetailView", () => {
 
     await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
 
-    const liveEvent = makeTimelineEvent({ id: 50, type: "issue.created", payload: { issueId: "i-live" } });
+    const liveEvent = makeTimelineEvent({
+      id: 50,
+      type: "issue.created",
+      payload: { issue_id: "issue-live", title: "i-live" },
+    });
     await act(async () => {
       currentSource().emit("issue.created", liveEvent, "50");
     });
 
     await waitFor(() => expect(screen.queryByText(/i-live/)).toBeTruthy());
 
-    const backlogEvent = makeTimelineEvent({ id: 10, type: "issue.created", payload: { issueId: "i-backlog" } });
+    const backlogEvent = makeTimelineEvent({
+      id: 10,
+      type: "issue.created",
+      payload: { issue_id: "issue-backlog", title: "i-backlog" },
+    });
     await act(async () => {
       resolveTimeline({ events: [backlogEvent], nextAfter: 10 });
     });
@@ -452,7 +467,7 @@ describe("TaskDetailView", () => {
       id: 900,
       taskId: "task-a",
       type: "issue.created",
-      payload: { issueId: "only-in-a" },
+      payload: { issue_id: "issue-only-a", title: "only-in-a" },
     });
     await act(async () => {
       sourceA.emit("issue.created", liveEventA, "900");
@@ -474,5 +489,169 @@ describe("TaskDetailView", () => {
     const compareFrom = screen.getByLabelText("Compare from") as HTMLSelectElement;
     const optionLabels = Array.from(compareFrom.options).map((option) => option.textContent);
     expect(optionLabels).toEqual(["v5", "v6"]);
+  });
+
+  it("never renders a raw JSON payload outside a collapsed <details> block, across every EXECUTION_EVENT_TYPES value (AC1)", async () => {
+    const events = makeEveryEventTypeTimeline(EXECUTION_EVENT_TYPES);
+    const client = makeClient({
+      getTimeline: vi.fn().mockResolvedValue({ events, nextAfter: events.length }),
+    });
+    renderDetail(client);
+
+    await waitFor(() =>
+      expect(within(screen.getByTestId("timeline")).getAllByTestId("timeline-item")).toHaveLength(events.length),
+    );
+
+    const items = within(screen.getByTestId("timeline")).getAllByTestId("timeline-item");
+    for (const item of items) {
+      const clone = item.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll("details").forEach((details) => details.remove());
+      expect(clone.textContent).not.toMatch(/[{}]/);
+    }
+  });
+
+  it("shows a tool call's name read from payload.tool when payload.name is absent (AC2)", async () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        executionId: "exec-impl-1",
+        type: "agent.tool_call",
+        payload: { tool: "propose_spec", input: { version: 1 } },
+      }),
+    ];
+    const client = makeClient({ getTimeline: vi.fn().mockResolvedValue({ events, nextAfter: 1 }) });
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByText("propose_spec")).toBeTruthy());
+  });
+
+  it("renders agent.message markdown as real list and code elements, not raw text (AC3)", async () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        executionId: "exec-impl-1",
+        type: "agent.message",
+        payload: { text: "- one\n- two\n\nUse `formatUsd()` here." },
+      }),
+    ];
+    const client = makeClient({ getTimeline: vi.fn().mockResolvedValue({ events, nextAfter: 1 }) });
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    expect(screen.getByText("one").closest("li")).toBeTruthy();
+    expect(screen.getByText("formatUsd()").tagName).toBe("CODE");
+  });
+
+  it("disables Cancel for DONE and CANCELLED, and enables it for IMPLEMENTING (AC4)", async () => {
+    for (const state of ["DONE", "CANCELLED"] as const) {
+      const aggregate = makeTaskAggregate({ task: { ...makeTaskAggregate().task, state } });
+      const client = makeClient({ getTask: vi.fn().mockResolvedValue(aggregate) });
+      const { unmount } = renderDetail(client);
+
+      await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe(humanizeEnum(state)));
+      expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+      unmount();
+    }
+
+    const client = makeClient();
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Implementing"));
+    expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("shows the task state exactly once in the header, via the StateBadge only (T3)", async () => {
+    const client = makeClient();
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Implementing"));
+
+    // The raw uppercase enum value ("IMPLEMENTING") must not appear anywhere
+    // else in the header alongside the badge's humanized label.
+    expect(screen.queryByText("IMPLEMENTING")).toBeNull();
+    expect(within(screen.getByTestId("task-state")).getAllByText("Implementing")).toHaveLength(1);
+  });
+
+  it("renders the filter toggle checkboxes with accessible names, each queryable by role and label (T2)", async () => {
+    const client = makeClient({ getTimeline: vi.fn().mockResolvedValue(emptyPage()) });
+    renderDetail(client);
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    for (const name of ["All", "State", "Agent", "Issues", "Review", "PR & CI"]) {
+      expect(screen.getByRole("checkbox", { name })).toBeTruthy();
+    }
+  });
+
+  it("keeps the compare-revisions diff inside a closed-by-default <details> element (T4)", async () => {
+    const client = makeClient();
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("spec-diff")).toBeTruthy());
+
+    const summary = screen.getByText("Compare revisions");
+    const details = summary.closest("details") as HTMLDetailsElement;
+    expect(details).toBeTruthy();
+    expect(details.open).toBe(false);
+    expect(details.contains(screen.getByTestId("spec-diff"))).toBe(true);
+
+    await act(async () => {
+      fireEvent.click(summary);
+    });
+
+    expect(details.open).toBe(true);
+  });
+
+  it("renders a collapsed agent.tool_call summary as an inline disclosure, not a bordered container (T6)", async () => {
+    const events = [
+      makeTimelineEvent({
+        id: 1,
+        executionId: "exec-impl-1",
+        type: "agent.tool_call",
+        payload: { tool: "propose_spec", input: { version: 1 } },
+      }),
+    ];
+    const client = makeClient({ getTimeline: vi.fn().mockResolvedValue({ events, nextAfter: 1 }) });
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByText("propose_spec")).toBeTruthy());
+    const details = screen.getByText("propose_spec").closest("details") as HTMLDetailsElement;
+    expect(details).toBeTruthy();
+    expect(details.open).toBe(false);
+    expect(details.className).toBe("timeline-item__disclosure");
+    expect(details.className).not.toMatch(/\bcard\b/);
+  });
+
+  it("shows a short one-word type label, with the full event type in its title (T7)", async () => {
+    const events = makeEveryEventTypeTimeline(["execution.assigned", "task.state_changed", "worktree.prepared"]);
+    const client = makeClient({ getTimeline: vi.fn().mockResolvedValue({ events, nextAfter: events.length }) });
+    renderDetail(client);
+
+    await waitFor(() =>
+      expect(within(screen.getByTestId("timeline")).getAllByTestId("timeline-item")).toHaveLength(3),
+    );
+    const timeline = screen.getByTestId("timeline");
+
+    const executionLabel = within(timeline).getByText("Execution");
+    expect(executionLabel.getAttribute("title")).toBe("Execution assigned");
+
+    const stateLabel = within(timeline).getByText("State");
+    expect(stateLabel.getAttribute("title")).toBe("Task state changed");
+
+    const worktreeLabel = within(timeline).getByText("Worktree");
+    expect(worktreeLabel.getAttribute("title")).toBe("Worktree prepared");
+  });
+
+  it("shows 'Approved' with the approver's id only in the row's title, plus the approved revision's version (T8)", async () => {
+    const client = makeClient();
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByRole("region", { name: "Approvals" })).toBeTruthy());
+    const approvalsSection = screen.getByRole("region", { name: "Approvals" });
+    await waitFor(() => expect(within(approvalsSection).getByText(/approved/i)).toBeTruthy());
+
+    expect(screen.queryByText("user-1")).toBeNull();
+    const row = within(approvalsSection).getByText(/approved/i).closest("li") as HTMLLIElement;
+    expect(row.getAttribute("title")).toBe("user-1");
   });
 });

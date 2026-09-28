@@ -312,6 +312,77 @@ export function makeTimelineEvent(overrides: Partial<TimelineEvent>): TimelineEv
 }
 
 /**
+ * A representative payload for every `EXECUTION_EVENT_TYPES` value
+ * (packages/core/src/events.ts), shaped like the real payload each event's
+ * producer writes (`apps/worker/src/agent-tools/tools/raise_issue.ts`,
+ * `apps/api/src/routes/issues.ts`, `packages/db/src/transition.ts`, etc.).
+ * Used by AC1: no timeline row may render any of these as an inline JSON
+ * string outside a collapsed `<details>`.
+ */
+const EVERY_EVENT_TYPE_PAYLOAD: Record<string, unknown> = {
+  "execution.queued": {},
+  "execution.assigned": { from: "QUEUED", to: "ASSIGNED", trigger: "execution.assigned" },
+  "execution.started": { from: "ASSIGNED", to: "RUNNING", trigger: "execution.started" },
+  "execution.resumed": { from: "WAITING_FOR_USER", to: "RUNNING", trigger: "execution.resumed" },
+  "execution.heartbeat": {},
+  "execution.waiting": { from: "RUNNING", to: "WAITING_FOR_USER", trigger: "execution.waiting" },
+  "execution.completed": { from: "RUNNING", to: "COMPLETED", trigger: "execution.completed" },
+  "execution.failed": { from: "RUNNING", to: "FAILED", trigger: "execution.failed" },
+  "execution.cancelled": { from: "RUNNING", to: "CANCELLED", trigger: "execution.cancelled" },
+  "worktree.prepared": { branch: "tsk-70", worktree_path: "/work/task-1" },
+  "worktree.evicted": { execution_id: "exec-impl-1" },
+  "agent.message.delta": { text: "Hel" },
+  "agent.message": { text: "Hello **world**\n\n- item one\n- item two\n\nSee `formatUsd()`." },
+  "agent.tool_call": { name: "propose_spec", input: { version: 1 }, ok: true },
+  "agent.note": { note: "internal note" },
+  "spec.proposed": { version: 1, revision_id: "rev-1" },
+  "spec.review_requested": { revision_id: "rev-1" },
+  "spec.approved": { version: 2, revision_id: "rev-2" },
+  "spec.sent_back": { revision_id: "rev-1" },
+  "spec.revised": { version: 3, revision_id: "rev-3" },
+  "issue.created": { issue_id: "issue-1", title: "Which pagination style?", blocking: true },
+  "issue.message": { issue_id: "issue-1" },
+  "issue.resolved": { issue_id: "issue-1", kind: "clarification", blocking: true },
+  "review.started": { round: 1 },
+  "review.result": { round: 1, verdict: "findings", findings_count: 1 },
+  "pull_request.created": { number: 42, url: "https://github.com/goopter/tsk-repo/pull/42" },
+  "ci.started": {},
+  "ci.failed": { round: 1, checks: ["lint"] },
+  "ci.passed": {},
+  "pull_request.merged": {},
+  "pull_request.closed": {},
+  "task.state_changed": { from: "READY", to: "IMPLEMENTING", trigger: "task.claimed" },
+  "usage.recorded": {
+    model: "claude-sonnet-5",
+    input_tokens: 100,
+    cached_input_tokens: 10,
+    output_tokens: 50,
+    cost_usd: 0.5,
+    round: null,
+  },
+};
+
+/**
+ * One `TimelineEvent` per `EXECUTION_EVENT_TYPES` value, ascending id and
+ * time, for AC1's "every listed event type" coverage test.
+ */
+export function makeEveryEventTypeTimeline(eventTypes: readonly string[]): TimelineEvent[] {
+  return eventTypes.map((type, index) =>
+    makeTimelineEvent({
+      id: index + 1,
+      // A distinct executionId per event, not a shared one: `agent.message.delta`
+      // and `agent.message` intentionally collapse into a single item when they
+      // share an executionId (design.md §14), which would undercount this
+      // fixture's "one event, one row" coverage below.
+      executionId: type.startsWith("execution.") || type.startsWith("agent.") ? `exec-${index}` : null,
+      type,
+      payload: EVERY_EVENT_TYPE_PAYLOAD[type] ?? {},
+      createdAt: new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString(),
+    }),
+  );
+}
+
+/**
  * A fully-typed `SpecApiClient` double (a `BoardApiClient` plus the
  * GOT.42 issue detail methods and the GOT.38 spec builder methods) with
  * every method a no-op `vi.fn()`, so a test only has to override the

@@ -80,24 +80,24 @@ export function CostBreakdown({ taskId, request }: CostBreakdownProps) {
   }
 
   return (
-    <div data-testid="cost-breakdown">
+    <div data-testid="cost-breakdown" className="task-detail__side-list">
       {breakdown.executions.map((execution) => (
-        <div key={execution.executionId}>
+        <div key={execution.executionId} className="task-detail__cost-execution">
           <p>
             {execution.role} attempt {execution.attempt} total: {formatCostUsd(execution.total.costUsd)}
-            {execution.estimated && <span> (estimated)</span>}
+            {execution.estimated && <span className="badge badge--neutral"> (estimated)</span>}
           </p>
-          <ul>
+          <ul className="task-detail__side-list">
             {execution.usage.map((row) => (
               <li key={row.id}>
                 {usageLabel(row)}: {formatMaybeCost(row.costUsd)}
-                {row.estimated && <span> (estimated)</span>}
+                {row.estimated && <span className="badge badge--neutral"> (estimated)</span>}
               </li>
             ))}
           </ul>
         </div>
       ))}
-      <p>Task total: {formatCostUsd(breakdown.total.costUsd)}</p>
+      <p className="task-detail__cost-total">Task total: {formatCostUsd(breakdown.total.costUsd)}</p>
     </div>
   );
 }

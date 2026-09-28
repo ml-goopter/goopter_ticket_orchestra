@@ -1,0 +1,264 @@
+/*
+ * Task detail (design.md §14 Task detail): timeline rows and the side
+ * panel's cards. Classes here are additive to `../styles/components.css`
+ * (`.page`, `.page-header`, `.main-sidebar`, `.card`, `.toolbar`, `.badge`)
+ * -- nothing below duplicates a rule already defined there.
+ */
+
+.task-detail__cost {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+/* Side panel: sticky on wide screens, stacked below the timeline once
+ * `.main-sidebar` itself switches to a column layout (<900px). */
+.task-detail .main-sidebar__aside {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  position: sticky;
+  top: var(--space-5);
+  max-height: calc(100vh - var(--space-8));
+  overflow-y: auto;
+}
+
+@media (max-width: 900px) {
+  .task-detail .main-sidebar__aside {
+    position: static;
+    max-height: none;
+    overflow-y: visible;
+  }
+}
+
+.task-detail__card-title {
+  margin: 0 0 var(--space-3);
+}
+
+.task-detail__side-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.task-detail__side-list li {
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-2);
+}
+
+.task-detail__side-list li:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.task-detail__side-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.task-detail__side-meta {
+  color: var(--color-text-faint);
+  font-size: var(--font-size-xs);
+}
+
+.task-detail__cost-execution {
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.task-detail__cost-execution:first-child {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+.task-detail__cost-total {
+  font-weight: 700;
+  margin-top: var(--space-3);
+}
+
+/* --------------------------------------------------------------------
+ * Timeline (T1 fix): a compact one-liner per row -- type label, summary,
+ * time right-aligned, all on one flex row inside a single ruled list (a
+ * left rail), not a ~90px bordered card per row with the label on its own
+ * line. A row with genuinely multi-line content (an `agent.message`, an
+ * expanded `agent.tool_call`) grows past one line; every other row stays
+ * close to `--space-8` (32px) tall.
+ * ------------------------------------------------------------------ */
+.timeline {
+  margin: 0;
+  padding: 0 0 0 var(--space-3);
+  list-style: none;
+  border-left: 2px solid var(--color-border);
+}
+
+.timeline-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  min-height: var(--space-8);
+}
+
+.timeline-item:last-child {
+  border-bottom: none;
+}
+
+.timeline-item__label {
+  flex: 0 0 90px;
+  color: var(--color-text-faint);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.timeline-item__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--font-size-base);
+}
+
+.timeline-item > time {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--color-text-faint);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.timeline-item__body pre {
+  background: var(--color-surface-sunken);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  overflow-x: auto;
+  font-size: var(--font-size-xs);
+}
+
+.timeline-item__in-progress {
+  color: var(--color-text-faint);
+}
+
+/* T6 fix: a collapsed tool-call/generic `<details>` row must stay a plain
+ * inline disclosure (small marker, no box) so it reads as one line;
+ * `base.css`'s global `details { border; padding; background }` rule
+ * (bordered ~52px box even collapsed) is overridden here, scoped to this
+ * class rather than touched in base.css. The expanded `<pre>` body keeps
+ * its own border/background from `.timeline-item__body pre` above. */
+.timeline-item__disclosure {
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.timeline-item__disclosure > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-weight: 400;
+  list-style: none;
+}
+
+.timeline-item__disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.timeline-item__disclosure > summary::before {
+  content: "▸";
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+}
+
+.timeline-item__disclosure[open] > summary::before {
+  content: "▾";
+}
+
+.timeline-item__disclosure[open] > summary {
+  margin-bottom: var(--space-1);
+}
+
+.timeline-item__tool-error {
+  color: var(--color-danger);
+  margin: var(--space-1) 0 0;
+}
+
+.timeline-item__transition {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.timeline-item__mono,
+.task-detail__mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+/* --------------------------------------------------------------------
+ * Filter toolbar (T2 fix): compact toggle chips with small checkboxes,
+ * not full-width 34px text-input-height boxes inside a bordered fieldset.
+ * `base.css`'s `input, select, textarea { height: 34px; width: 100% }`
+ * rule targets every `<input>` including checkboxes, so it is overridden
+ * here, scoped to this view's toolbar.
+ * ------------------------------------------------------------------ */
+.task-detail fieldset.toolbar {
+  border: none;
+  padding: 0;
+  margin: 0 0 var(--space-4);
+}
+
+.task-detail .toolbar legend {
+  padding: 0;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.task-detail .toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  width: auto;
+  margin-bottom: 0;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  background: var(--color-surface);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.task-detail .toolbar input[type="checkbox"] {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  margin: 0;
+}
+
+/* --------------------------------------------------------------------
+ * Spec revisions (T4 fix): version, status badge and time on one line;
+ * the compare-revisions diff collapsed by default and scrolling
+ * horizontally inside its own box instead of overflowing the side panel.
+ * ------------------------------------------------------------------ */
+.task-detail__revision-diff {
+  margin-top: var(--space-3);
+}
+
+.task-detail__revision-diff pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
