@@ -1,7 +1,13 @@
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { ConfigError, loadConfig, redactConfig } from "./config.js";
+import {
+  ConfigError,
+  DEFAULT_AGENT_IMAGE,
+  loadConfig,
+  redactConfig,
+} from "./config.js";
 
 const DATABASE_URL = "postgres://orchestra:orchestra@localhost:5432/orchestra";
 
@@ -132,6 +138,84 @@ describe("loadConfig (design.md §15.3)", () => {
 
   it("rejects an unknown LOG_LEVEL by name", () => {
     expect(() => loadConfig(env({ LOG_LEVEL: "chatty" }))).toThrow(/LOG_LEVEL/);
+  });
+});
+
+describe("agent container settings (design.md §9.9, §15.3)", () => {
+  const rootVersion = (
+    JSON.parse(
+      readFileSync(new URL("../../../package.json", import.meta.url), "utf8"),
+    ) as { version: string }
+  ).version;
+
+  it("defaults the image to orchestra/agent:<root package.json version>, as build.sh tags it", () => {
+    expect(rootVersion).toMatch(/^\d+\.\d+\.\d+/);
+    expect(loadConfig(env()).agentContainerImage).toBe(`orchestra/agent:${rootVersion}`);
+    expect(DEFAULT_AGENT_IMAGE).toBe(`orchestra/agent:${rootVersion}`);
+  });
+
+  it("treats a blank AGENT_CONTAINER_IMAGE as unset", () => {
+    expect(loadConfig(env({ AGENT_CONTAINER_IMAGE: "  " })).agentContainerImage).toBe(
+      `orchestra/agent:${rootVersion}`,
+    );
+  });
+
+  it("defaults AGENT_CONTAINER_CPUS to 2 and AGENT_CONTAINER_MEMORY to 4g", () => {
+    const config = loadConfig(env());
+    expect(config.agentContainerCpus).toBe(2);
+    expect(config.agentContainerMemory).toBe("4g");
+  });
+
+  it("reads explicit container overrides", () => {
+    const config = loadConfig(
+      env({
+        AGENT_CONTAINER_IMAGE: "registry.local/team/agent-node:1.2",
+        AGENT_CONTAINER_CPUS: "1.5",
+        AGENT_CONTAINER_MEMORY: "512m",
+      }),
+    );
+    expect(config.agentContainerImage).toBe("registry.local/team/agent-node:1.2");
+    expect(config.agentContainerCpus).toBe(1.5);
+    expect(config.agentContainerMemory).toBe("512m");
+  });
+
+  it("accepts plain byte counts and upper-case units for AGENT_CONTAINER_MEMORY", () => {
+    expect(loadConfig(env({ AGENT_CONTAINER_MEMORY: "1073741824" })).agentContainerMemory)
+      .toBe("1073741824");
+    expect(loadConfig(env({ AGENT_CONTAINER_MEMORY: "8G" })).agentContainerMemory).toBe("8G");
+  });
+
+  it.each(["0", "-1", "two", "1e3", "2000"])(
+    "rejects AGENT_CONTAINER_CPUS=%s by name",
+    (value) => {
+      expect(() => loadConfig(env({ AGENT_CONTAINER_CPUS: value })))
+        .toThrow(/AGENT_CONTAINER_CPUS/);
+    },
+  );
+
+  it.each(["0", "4 g", "4gb", "lots", "-4g", "0m"])(
+    "rejects AGENT_CONTAINER_MEMORY=%s by name",
+    (value) => {
+      expect(() => loadConfig(env({ AGENT_CONTAINER_MEMORY: value })))
+        .toThrow(/AGENT_CONTAINER_MEMORY/);
+    },
+  );
+
+  it("rejects an image reference containing whitespace", () => {
+    expect(() => loadConfig(env({ AGENT_CONTAINER_IMAGE: "orchestra/agent 1" })))
+      .toThrow(/AGENT_CONTAINER_IMAGE/);
+  });
+
+  it("never echoes the rejected value", () => {
+    let message = "";
+    try {
+      loadConfig(env({ AGENT_CONTAINER_CPUS: "sk-supersecret", AGENT_CONTAINER_MEMORY: "sk-supersecret" }));
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/AGENT_CONTAINER_CPUS/);
+    expect(message).toMatch(/AGENT_CONTAINER_MEMORY/);
+    expect(message).not.toMatch(/supersecret/);
   });
 });
 

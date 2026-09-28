@@ -695,6 +695,7 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
           {formContent ? (
             <SpecDraftForm
               content={formContent}
+              repositories={projectRepositories}
               highlightedFields={highlightedFields}
               disabled={taskState !== "SPEC_IN_PROGRESS"}
               onChange={setFormContent}
