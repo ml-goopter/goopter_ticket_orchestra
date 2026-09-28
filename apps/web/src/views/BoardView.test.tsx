@@ -112,9 +112,39 @@ describe("BoardView", () => {
 
     const waitingSection = screen.getByRole("region", { name: "Waiting for You" });
     const needsHumanSection = screen.getByRole("region", { name: "Needs Human" });
+    const readySection = screen.getByRole("region", { name: "Ready" });
     expect(waitingSection.getAttribute("data-highlighted")).toBe("true");
     expect(needsHumanSection.getAttribute("data-highlighted")).toBe("true");
-    expect(screen.getByRole("region", { name: "Ready" }).getAttribute("data-highlighted")).toBe("false");
+    expect(readySection.getAttribute("data-highlighted")).toBe("false");
+    expect(waitingSection.className).toContain("kanban__column--highlighted");
+    expect(needsHumanSection.className).toContain("kanban__column--highlighted");
+    expect(readySection.className).not.toContain("kanban__column--highlighted");
+
+    // Compact rail modifier (B1/B3): an empty, non-highlighted column
+    // ("Needs Spec", no cards in this fixture) collapses to a rail --
+    // header only, no "No tasks." line -- but its heading and count are
+    // still in the DOM with their normal text, just rotated by CSS. A
+    // populated column ("Ready") and an empty but highlighted column
+    // ("Waiting for You") are never compact.
+    const needsSpecSection = screen.getByRole("region", { name: "Needs Spec" });
+    expect(needsSpecSection.className).toContain("board-column--compact");
+    expect(within(needsSpecSection).queryByText("No tasks.")).toBeNull();
+    expect(readySection.className).not.toContain("board-column--compact");
+    expect(waitingSection.className).not.toContain("board-column--compact");
+    expect(within(needsSpecSection).getByRole("heading", { level: 2 }).textContent).toBe("Needs Spec");
+    expect(within(needsSpecSection).getByText("0").className).toContain("badge");
+
+    // Highlighted-empty modifier (B3): "Waiting for You" has no cards in
+    // this fixture, so it's narrower than a populated column, but never
+    // compact. "Needs Human" has a card, so it doesn't get that modifier
+    // either, despite also being highlighted.
+    expect(waitingSection.className).toContain("board-column--highlighted-empty");
+    expect(needsHumanSection.className).not.toContain("board-column--highlighted-empty");
+    expect(readySection.className).not.toContain("board-column--highlighted-empty");
+
+    // Column header: name plus a card count badge (AC1).
+    expect(within(needsHumanSection).getByText("1").className).toContain("badge");
+    expect(within(readySection).getByText("1").className).toContain("badge");
 
     expect(within(needsHumanSection).getByRole("link", { name: "BBB-2" })).toBeTruthy();
     expect(within(screen.getByRole("region", { name: "Ready" })).queryByRole("link", { name: "BBB-2" })).toBeNull();
@@ -141,7 +171,9 @@ describe("BoardView", () => {
     const card = screen.getByTestId("board-card");
     const link = within(card).getByRole("link", { name: "ABC-1" });
     expect(link.getAttribute("href")).toBe("/tasks/1");
-    expect(within(card).getByText("Do the thing")).toBeTruthy();
+    const summary = within(card).getByText("Do the thing");
+    expect(summary.getAttribute("title")).toBe("Do the thing");
+    expect(within(card).getByTestId("runtime-badge").className).toContain("badge--neutral");
     expect(within(card).getByTestId("runtime-badge").textContent).toBe("codex");
     expect(within(card).getByTestId("card-age").textContent).toBe("3m");
     expect(within(card).getByTestId("card-cost").textContent).toBe("$12.35");
@@ -233,7 +265,31 @@ describe("BoardView", () => {
     const client = makeClient(() => Promise.resolve([]));
     renderBoard(client);
 
-    await waitFor(() => expect(screen.getAllByText("No tasks.")).toHaveLength(10));
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(10));
+
+    // Every column is empty. The two highlighted columns stay full height
+    // (narrower than a populated column) and show the "No tasks." line;
+    // the other eight, empty and not highlighted, collapse to a rail with
+    // no card area at all (B1/B3).
+    expect(screen.getAllByText("No tasks.")).toHaveLength(2);
+    for (const empty of screen.getAllByText("No tasks.")) {
+      expect(empty.className).toContain("board-empty");
+      expect(empty.tagName).toBe("P");
+    }
+
+    const waitingSection = screen.getByRole("region", { name: "Waiting for You" });
+    const needsHumanSection = screen.getByRole("region", { name: "Needs Human" });
+    const readySection = screen.getByRole("region", { name: "Ready" });
+    expect(waitingSection.className).not.toContain("board-column--compact");
+    expect(needsHumanSection.className).not.toContain("board-column--compact");
+    expect(readySection.className).toContain("board-column--compact");
+    expect(within(readySection).queryByText("No tasks.")).toBeNull();
+    expect(within(readySection).getByRole("heading", { level: 2 }).textContent).toBe("Ready");
+    expect(within(readySection).getByText("0").className).toContain("badge");
+
+    expect(waitingSection.className).toContain("board-column--highlighted-empty");
+    expect(needsHumanSection.className).toContain("board-column--highlighted-empty");
+    expect(readySection.className).not.toContain("board-column--highlighted-empty");
   });
 
   it("renders visible error text when the fetch fails (AC7)", async () => {

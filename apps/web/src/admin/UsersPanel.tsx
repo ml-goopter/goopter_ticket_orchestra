@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import type { AdminApi, AdminUser, CreateUserInput } from "../api/admin.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
+import { Time } from "../ui/Time.js";
 import { describeApiError } from "./format.js";
 import { validateDisplayName, validateUserInput, type FieldErrors } from "./validation.js";
 
@@ -12,12 +13,12 @@ const EMPTY_FORM: CreateUserInput = { email: "", password: "", displayName: "" }
 
 /**
  * Users panel (design.md §13 no self-registration, §14 Admin row, §12.5
- * `/users`, task contract GOT.29): list, a create form, and a display-name
- * edit per row. No disable/re-enable control -- `PatchUserSchema` in
- * `apps/api/src/routes/users.ts` accepts only `display_name` (a prior
- * review round dropped `disabled` from the route), so the disabled state
- * is shown read-only, in case the CLI or a future route sets it (GOT.29
- * descope, coordinator C40).
+ * `/users`, task contract GOT.29; restyled by U5): list, a create form,
+ * and a display-name edit per row. No disable/re-enable control --
+ * `PatchUserSchema` in `apps/api/src/routes/users.ts` accepts only
+ * `display_name` (a prior review round dropped `disabled` from the
+ * route), so the disabled state is shown read-only, in case the CLI or a
+ * future route sets it (GOT.29 descope, coordinator C40).
  */
 export function UsersPanel({ adminApi }: UsersPanelProps) {
   const { begin, isCurrent } = useLatestRequest();
@@ -99,112 +100,156 @@ export function UsersPanel({ adminApi }: UsersPanelProps) {
     <section aria-label="Users">
       <h2>Users</h2>
 
-      {loadError && <p role="alert">{loadError}</p>}
-      {!loadError && users === null && <p>Loading...</p>}
-      {users && users.length === 0 && <p>No users yet.</p>}
-      {users && users.length > 0 && (
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Email</th>
-              <th scope="col">Display name</th>
-              <th scope="col">Created</th>
-              <th scope="col">State</th>
-              <th scope="col">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {users.map((user) =>
-              editingId === user.id ? (
-                <tr key={user.id}>
-                  <td colSpan={5}>
-                    <form aria-label={`Edit ${user.email}`} onSubmit={(event) => void handleSaveEdit(event, user)}>
-                      <label>
-                        Display name
-                        <input value={editDisplayName} onChange={(event) => setEditDisplayName(event.target.value)} />
-                      </label>
-                      {editErrors.displayName && (
-                        <span role="alert" data-testid="edit-error-displayName">
-                          {editErrors.displayName}
-                        </span>
-                      )}
-                      {editError && (
-                        <p role="alert" data-testid="edit-error">
-                          {editError}
-                        </p>
-                      )}
-                      <button type="submit">Save</button>
-                      <button type="button" onClick={cancelEdit}>
-                        Cancel
-                      </button>
-                    </form>
-                  </td>
-                </tr>
-              ) : (
-                <tr key={user.id}>
-                  <td>{user.email}</td>
-                  <td>{user.displayName}</td>
-                  <td>{user.createdAt}</td>
-                  <td>{user.disabledAt ? "Disabled" : "Active"}</td>
-                  <td>
-                    <button type="button" onClick={() => startEdit(user)}>
-                      Edit
-                    </button>
-                  </td>
-                </tr>
-              ),
-            )}
-          </tbody>
-        </table>
-      )}
-
-      <form aria-label="Create user" onSubmit={(event) => void handleCreate(event)}>
-        <h3>Create user</h3>
-        <label>
-          Email
-          <input
-            type="email"
-            value={createForm.email}
-            onChange={(event) => setCreateForm({ ...createForm, email: event.target.value })}
-          />
-        </label>
-        {createErrors.email && (
-          <span role="alert" data-testid="create-error-email">
-            {createErrors.email}
-          </span>
-        )}
-        <label>
-          Display name
-          <input
-            value={createForm.displayName}
-            onChange={(event) => setCreateForm({ ...createForm, displayName: event.target.value })}
-          />
-        </label>
-        {createErrors.displayName && (
-          <span role="alert" data-testid="create-error-displayName">
-            {createErrors.displayName}
-          </span>
-        )}
-        <label>
-          Password
-          <input
-            type="password"
-            value={createForm.password}
-            onChange={(event) => setCreateForm({ ...createForm, password: event.target.value })}
-          />
-        </label>
-        {createErrors.password && (
-          <span role="alert" data-testid="create-error-password">
-            {createErrors.password}
-          </span>
-        )}
-        {createError && (
-          <p role="alert" data-testid="create-error">
-            {createError}
+      <div className="admin-panel__table">
+        {loadError && (
+          <p className="alert alert--error" role="alert">
+            {loadError}
           </p>
         )}
-        <button type="submit">Create user</button>
-      </form>
+        {!loadError && users === null && <p>Loading...</p>}
+        {users && users.length === 0 && (
+          <div className="empty-state">
+            <p>No users yet.</p>
+          </div>
+        )}
+        {users && users.length > 0 && (
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Email</th>
+                <th scope="col">Display name</th>
+                <th scope="col">Created</th>
+                <th scope="col">State</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((user) =>
+                editingId === user.id ? (
+                  <tr key={user.id}>
+                    <td colSpan={5}>
+                      <div className="card">
+                        <h3>Edit user</h3>
+                        <form
+                          aria-label={`Edit ${user.email}`}
+                          className="form-grid"
+                          onSubmit={(event) => void handleSaveEdit(event, user)}
+                        >
+                          <div className="field">
+                            <label>
+                              Display name
+                              <input
+                                value={editDisplayName}
+                                onChange={(event) => setEditDisplayName(event.target.value)}
+                              />
+                            </label>
+                            {editErrors.displayName && (
+                              <span className="field__error" role="alert" data-testid="edit-error-displayName">
+                                {editErrors.displayName}
+                              </span>
+                            )}
+                          </div>
+                          {editError && (
+                            <p className="alert alert--error form-grid__full" role="alert" data-testid="edit-error">
+                              {editError}
+                            </p>
+                          )}
+                          <div className="form-grid__full admin-form__actions">
+                            <button type="submit" className="primary">
+                              Save
+                            </button>
+                            <button type="button" onClick={cancelEdit}>
+                              Cancel
+                            </button>
+                          </div>
+                        </form>
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  <tr key={user.id}>
+                    <td>{user.email}</td>
+                    <td>{user.displayName}</td>
+                    <td>
+                      <Time value={user.createdAt} />
+                    </td>
+                    <td>
+                      <span className={user.disabledAt ? "badge badge--neutral" : "badge badge--success"}>
+                        {user.disabledAt ? "Disabled" : "Active"}
+                      </span>
+                    </td>
+                    <td>
+                      <button type="button" className="admin-table__action" onClick={() => startEdit(user)}>
+                        Edit
+                      </button>
+                    </td>
+                  </tr>
+                ),
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h3>Create user</h3>
+        <form aria-label="Create user" className="form-grid" onSubmit={(event) => void handleCreate(event)}>
+          <div className="field">
+            <label>
+              Email
+              <input
+                type="email"
+                value={createForm.email}
+                onChange={(event) => setCreateForm({ ...createForm, email: event.target.value })}
+              />
+            </label>
+            {createErrors.email && (
+              <span className="field__error" role="alert" data-testid="create-error-email">
+                {createErrors.email}
+              </span>
+            )}
+          </div>
+          <div className="field">
+            <label>
+              Display name
+              <input
+                value={createForm.displayName}
+                onChange={(event) => setCreateForm({ ...createForm, displayName: event.target.value })}
+              />
+            </label>
+            {createErrors.displayName && (
+              <span className="field__error" role="alert" data-testid="create-error-displayName">
+                {createErrors.displayName}
+              </span>
+            )}
+          </div>
+          <div className="field">
+            <label>
+              Password
+              <input
+                type="password"
+                value={createForm.password}
+                onChange={(event) => setCreateForm({ ...createForm, password: event.target.value })}
+              />
+            </label>
+            {createErrors.password && (
+              <span className="field__error" role="alert" data-testid="create-error-password">
+                {createErrors.password}
+              </span>
+            )}
+          </div>
+          {createError && (
+            <p className="alert alert--error form-grid__full" role="alert" data-testid="create-error">
+              {createError}
+            </p>
+          )}
+          <div className="form-grid__full admin-form__actions">
+            <button type="submit" className="primary">
+              Create user
+            </button>
+          </div>
+        </form>
+      </div>
     </section>
   );
 }

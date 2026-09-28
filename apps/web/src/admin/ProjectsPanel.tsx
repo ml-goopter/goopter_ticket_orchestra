@@ -66,107 +66,130 @@ interface ProjectFieldsProps {
 function ProjectFields({ form, onChange, errors, idPrefix }: ProjectFieldsProps) {
   return (
     <>
-      <label>
-        Key
-        <input value={form.key} onChange={(event) => onChange({ ...form, key: event.target.value })} />
-      </label>
-      {errors.key && (
-        <span role="alert" data-testid={`${idPrefix}-error-key`}>
-          {errors.key}
-        </span>
-      )}
-      <label>
-        Name
-        <input value={form.name} onChange={(event) => onChange({ ...form, name: event.target.value })} />
-      </label>
-      {errors.name && (
-        <span role="alert" data-testid={`${idPrefix}-error-name`}>
-          {errors.name}
-        </span>
-      )}
-      <label>
-        Jira JQL
-        <input value={form.jiraJql} onChange={(event) => onChange({ ...form, jiraJql: event.target.value })} />
-      </label>
-      {errors.jiraJql && (
-        <span role="alert" data-testid={`${idPrefix}-error-jiraJql`}>
-          {errors.jiraJql}
-        </span>
-      )}
-      <label>
-        Max infra retries
-        <input
-          type="number"
-          value={form.maxInfraRetries}
-          onChange={(event) => onChange({ ...form, maxInfraRetries: Number(event.target.value) })}
-        />
-      </label>
-      {errors.maxInfraRetries && (
-        <span role="alert" data-testid={`${idPrefix}-error-maxInfraRetries`}>
-          {errors.maxInfraRetries}
-        </span>
-      )}
-      <label>
-        Max protocol retries
-        <input
-          type="number"
-          value={form.maxProtocolRetries}
-          onChange={(event) => onChange({ ...form, maxProtocolRetries: Number(event.target.value) })}
-        />
-      </label>
-      {errors.maxProtocolRetries && (
-        <span role="alert" data-testid={`${idPrefix}-error-maxProtocolRetries`}>
-          {errors.maxProtocolRetries}
-        </span>
-      )}
-      <label>
-        Max CI rounds
-        <input
-          type="number"
-          value={form.maxCiRounds}
-          onChange={(event) => onChange({ ...form, maxCiRounds: Number(event.target.value) })}
-        />
-      </label>
-      {errors.maxCiRounds && (
-        <span role="alert" data-testid={`${idPrefix}-error-maxCiRounds`}>
-          {errors.maxCiRounds}
-        </span>
-      )}
-      <label>
-        Max review rounds
-        <input
-          type="number"
-          value={form.maxReviewRounds}
-          onChange={(event) => onChange({ ...form, maxReviewRounds: Number(event.target.value) })}
-        />
-      </label>
-      {errors.maxReviewRounds && (
-        <span role="alert" data-testid={`${idPrefix}-error-maxReviewRounds`}>
-          {errors.maxReviewRounds}
-        </span>
-      )}
-      <label>
-        Max budget USD
-        <input
-          type="number"
-          value={budgetInputValue(form.maxBudgetUsd)}
-          onChange={(event) => onChange({ ...form, maxBudgetUsd: parseBudgetInput(event.target.value) })}
-        />
-      </label>
-      {errors.maxBudgetUsd && (
-        <span role="alert" data-testid={`${idPrefix}-error-maxBudgetUsd`}>
-          {errors.maxBudgetUsd}
-        </span>
-      )}
+      <div className="field">
+        <label>
+          Key
+          <input value={form.key} onChange={(event) => onChange({ ...form, key: event.target.value })} />
+        </label>
+        {errors.key && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-key`}>
+            {errors.key}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label>
+          Name
+          <input value={form.name} onChange={(event) => onChange({ ...form, name: event.target.value })} />
+        </label>
+        {errors.name && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-name`}>
+            {errors.name}
+          </span>
+        )}
+      </div>
+      <div className="field form-grid__full">
+        <label>
+          Jira JQL
+          <input value={form.jiraJql} onChange={(event) => onChange({ ...form, jiraJql: event.target.value })} />
+        </label>
+        <p className="field__help">The query used to import tickets for this project.</p>
+        {errors.jiraJql && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-jiraJql`}>
+            {errors.jiraJql}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label>
+          Max infra retries
+          <input
+            type="number"
+            value={form.maxInfraRetries}
+            onChange={(event) => onChange({ ...form, maxInfraRetries: Number(event.target.value) })}
+          />
+        </label>
+        <p className="field__help">Non-negative integer.</p>
+        {errors.maxInfraRetries && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxInfraRetries`}>
+            {errors.maxInfraRetries}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label>
+          Max protocol retries
+          <input
+            type="number"
+            value={form.maxProtocolRetries}
+            onChange={(event) => onChange({ ...form, maxProtocolRetries: Number(event.target.value) })}
+          />
+        </label>
+        <p className="field__help">Non-negative integer.</p>
+        {errors.maxProtocolRetries && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxProtocolRetries`}>
+            {errors.maxProtocolRetries}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label>
+          Max CI rounds
+          <input
+            type="number"
+            value={form.maxCiRounds}
+            onChange={(event) => onChange({ ...form, maxCiRounds: Number(event.target.value) })}
+          />
+        </label>
+        <p className="field__help">Non-negative integer.</p>
+        {errors.maxCiRounds && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxCiRounds`}>
+            {errors.maxCiRounds}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label>
+          Max review rounds
+          <input
+            type="number"
+            value={form.maxReviewRounds}
+            onChange={(event) => onChange({ ...form, maxReviewRounds: Number(event.target.value) })}
+          />
+        </label>
+        <p className="field__help">Non-negative integer.</p>
+        {errors.maxReviewRounds && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxReviewRounds`}>
+            {errors.maxReviewRounds}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label>
+          Max budget USD
+          <input
+            type="number"
+            value={budgetInputValue(form.maxBudgetUsd)}
+            onChange={(event) => onChange({ ...form, maxBudgetUsd: parseBudgetInput(event.target.value) })}
+          />
+        </label>
+        <p className="field__help">Leave blank for no cap.</p>
+        {errors.maxBudgetUsd && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxBudgetUsd`}>
+            {errors.maxBudgetUsd}
+          </span>
+        )}
+      </div>
     </>
   );
 }
 
 /**
  * Projects panel (design.md §14 Admin row, §12.5 `/projects`, task
- * contract GOT.29): list plus a create form and a per-row edit form for
- * every field the api accepts, with client-side validation mirroring
- * `apps/api/src/routes/projects.ts` and the api's 400/409 rendered inline.
+ * contract GOT.29; restyled by U5): list plus a create form and a per-row
+ * edit form for every field the api accepts, with client-side validation
+ * mirroring `apps/api/src/routes/projects.ts` and the api's 400/409
+ * rendered inline.
  */
 export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
   const { begin, isCurrent } = useLatestRequest();
@@ -249,75 +272,116 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
     <section aria-label="Projects">
       <h2>Projects</h2>
 
-      {loadError && <p role="alert">{loadError}</p>}
-      {!loadError && projects === null && <p>Loading...</p>}
-      {projects && projects.length === 0 && <p>No projects yet.</p>}
-      {projects && projects.length > 0 && (
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Key</th>
-              <th scope="col">Name</th>
-              <th scope="col">Jira JQL</th>
-              <th scope="col">Infra retries</th>
-              <th scope="col">Protocol retries</th>
-              <th scope="col">CI rounds</th>
-              <th scope="col">Review rounds</th>
-              <th scope="col">Budget USD</th>
-              <th scope="col">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {projects.map((project) =>
-              editingId === project.id && editForm ? (
-                <tr key={project.id}>
-                  <td colSpan={9}>
-                    <form aria-label={`Edit ${project.key}`} onSubmit={(event) => void handleSaveEdit(event, project)}>
-                      <ProjectFields form={editForm} onChange={setEditForm} errors={editErrors} idPrefix="edit" />
-                      {editError && (
-                        <p role="alert" data-testid="edit-error">
-                          {editError}
-                        </p>
-                      )}
-                      <button type="submit">Save</button>
-                      <button type="button" onClick={cancelEdit}>
-                        Cancel
-                      </button>
-                    </form>
-                  </td>
-                </tr>
-              ) : (
-                <tr key={project.id}>
-                  <td>{project.key}</td>
-                  <td>{project.name}</td>
-                  <td>{project.jiraJql}</td>
-                  <td>{project.maxInfraRetries}</td>
-                  <td>{project.maxProtocolRetries}</td>
-                  <td>{project.maxCiRounds}</td>
-                  <td>{project.maxReviewRounds}</td>
-                  <td>{project.maxBudgetUsd ?? "—"}</td>
-                  <td>
-                    <button type="button" onClick={() => startEdit(project)}>
-                      Edit
-                    </button>
-                  </td>
-                </tr>
-              ),
-            )}
-          </tbody>
-        </table>
-      )}
-
-      <form aria-label="Create project" onSubmit={(event) => void handleCreate(event)}>
-        <h3>Create project</h3>
-        <ProjectFields form={createForm} onChange={setCreateForm} errors={createErrors} idPrefix="create" />
-        {createError && (
-          <p role="alert" data-testid="create-error">
-            {createError}
+      <div className="admin-panel__table">
+        {loadError && (
+          <p className="alert alert--error" role="alert">
+            {loadError}
           </p>
         )}
-        <button type="submit">Create project</button>
-      </form>
+        {!loadError && projects === null && <p>Loading...</p>}
+        {projects && projects.length === 0 && (
+          <div className="empty-state">
+            <p>No projects yet.</p>
+          </div>
+        )}
+        {projects && projects.length > 0 && (
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Key</th>
+                <th scope="col">Name</th>
+                <th scope="col">Jira JQL</th>
+                <th scope="col" className="num">
+                  Infra retries
+                </th>
+                <th scope="col" className="num">
+                  Protocol retries
+                </th>
+                <th scope="col" className="num">
+                  CI rounds
+                </th>
+                <th scope="col" className="num">
+                  Review rounds
+                </th>
+                <th scope="col" className="num">
+                  Budget USD
+                </th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {projects.map((project) =>
+                editingId === project.id && editForm ? (
+                  <tr key={project.id}>
+                    <td colSpan={9}>
+                      <div className="card">
+                        <h3>Edit project</h3>
+                        <form
+                          aria-label={`Edit ${project.key}`}
+                          className="form-grid"
+                          onSubmit={(event) => void handleSaveEdit(event, project)}
+                        >
+                          <ProjectFields form={editForm} onChange={setEditForm} errors={editErrors} idPrefix="edit" />
+                          {editError && (
+                            <p className="alert alert--error form-grid__full" role="alert" data-testid="edit-error">
+                              {editError}
+                            </p>
+                          )}
+                          <div className="form-grid__full admin-form__actions">
+                            <button type="submit" className="primary">
+                              Save
+                            </button>
+                            <button type="button" onClick={cancelEdit}>
+                              Cancel
+                            </button>
+                          </div>
+                        </form>
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  <tr key={project.id}>
+                    <td>{project.key}</td>
+                    <td>{project.name}</td>
+                    <td>
+                      <span className="admin-table__mono" title={project.jiraJql}>
+                        {project.jiraJql}
+                      </span>
+                    </td>
+                    <td className="num">{project.maxInfraRetries}</td>
+                    <td className="num">{project.maxProtocolRetries}</td>
+                    <td className="num">{project.maxCiRounds}</td>
+                    <td className="num">{project.maxReviewRounds}</td>
+                    <td className="num">{project.maxBudgetUsd ?? "—"}</td>
+                    <td>
+                      <button type="button" className="admin-table__action" onClick={() => startEdit(project)}>
+                        Edit
+                      </button>
+                    </td>
+                  </tr>
+                ),
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h3>Create project</h3>
+        <form aria-label="Create project" className="form-grid" onSubmit={(event) => void handleCreate(event)}>
+          <ProjectFields form={createForm} onChange={setCreateForm} errors={createErrors} idPrefix="create" />
+          {createError && (
+            <p className="alert alert--error form-grid__full" role="alert" data-testid="create-error">
+              {createError}
+            </p>
+          )}
+          <div className="form-grid__full admin-form__actions">
+            <button type="submit" className="primary">
+              Create project
+            </button>
+          </div>
+        </form>
+      </div>
     </section>
   );
 }
