@@ -36,6 +36,8 @@ function repository(overrides: Partial<Repository> = {}): Repository {
     requiredCapability: null,
     setupCommand: null,
     testCommand: null,
+    agentContainer: false,
+    agentImage: null,
     createdAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   };
@@ -76,7 +78,14 @@ describe("RepositoriesPanel", () => {
 
   it("lists every column", async () => {
     const adminApi = fakeAdminApi({
-      listRepositories: vi.fn().mockResolvedValue([repository({ requiredCapability: "docker", testCommand: "pnpm test" })]),
+      listRepositories: vi.fn().mockResolvedValue([
+        repository({
+          requiredCapability: "docker",
+          testCommand: "pnpm test",
+          agentContainer: true,
+          agentImage: "orchestra/agent:custom",
+        }),
+      ]),
     });
     render(<RepositoriesPanel adminApi={adminApi} />);
 
@@ -84,6 +93,8 @@ describe("RepositoriesPanel", () => {
     expect(screen.getByText("git@example.com:goopter/goopter_odoo_modules.git")).toBeTruthy();
     expect(screen.getByText("docker")).toBeTruthy();
     expect(screen.getByText("pnpm test")).toBeTruthy();
+    expect(screen.getByText("Yes")).toBeTruthy();
+    expect(screen.getByText("orchestra/agent:custom")).toBeTruthy();
   });
 
   it("applies the project filter to the list call", async () => {
@@ -120,6 +131,8 @@ describe("RepositoriesPanel", () => {
     fireEvent.change(within(createForm, "Required capability"), { target: { value: "docker" } });
     fireEvent.change(within(createForm, "Setup command"), { target: { value: "pnpm install" } });
     fireEvent.change(within(createForm, "Test command"), { target: { value: "pnpm test" } });
+    fireEvent.click(within(createForm, "Run agent in a container"));
+    fireEvent.change(within(createForm, "Agent image"), { target: { value: "orchestra/agent:custom" } });
     fireEvent.submit(createForm);
 
     await waitFor(() =>
@@ -134,6 +147,8 @@ describe("RepositoriesPanel", () => {
         requiredCapability: "docker",
         setupCommand: "pnpm install",
         testCommand: "pnpm test",
+        agentContainer: true,
+        agentImage: "orchestra/agent:custom",
       }),
     );
     await waitFor(() => expect(listRepositories).toHaveBeenCalledTimes(2));
@@ -155,6 +170,31 @@ describe("RepositoriesPanel", () => {
     fireEvent.submit(editForm);
 
     await waitFor(() => expect(patchRepository).toHaveBeenCalledWith("repo-1", { defaultBranch: "develop" }));
+    await waitFor(() => expect(listRepositories).toHaveBeenCalledTimes(2));
+  });
+
+  it("edits agent_container and agent_image, showing the current values in the form", async () => {
+    const original = repository({ agentContainer: true, agentImage: "orchestra/agent:custom" });
+    const updated = repository({ agentContainer: false, agentImage: null });
+    const listRepositories = vi.fn().mockResolvedValueOnce([original]).mockResolvedValueOnce([updated]);
+    const patchRepository = vi.fn().mockResolvedValue(updated);
+    const adminApi = fakeAdminApi({ listRepositories, patchRepository });
+    render(<RepositoriesPanel adminApi={adminApi} />);
+
+    await waitFor(() => expect(screen.getByText("goopter_odoo_modules")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    const editForm = screen.getByRole("form", { name: "Edit goopter_odoo_modules" });
+    expect((within(editForm, "Run agent in a container") as HTMLInputElement).checked).toBe(true);
+    expect((within(editForm, "Agent image") as HTMLInputElement).value).toBe("orchestra/agent:custom");
+
+    fireEvent.click(within(editForm, "Run agent in a container"));
+    fireEvent.change(within(editForm, "Agent image"), { target: { value: "" } });
+    fireEvent.submit(editForm);
+
+    await waitFor(() =>
+      expect(patchRepository).toHaveBeenCalledWith("repo-1", { agentContainer: false, agentImage: null }),
+    );
     await waitFor(() => expect(listRepositories).toHaveBeenCalledTimes(2));
   });
 

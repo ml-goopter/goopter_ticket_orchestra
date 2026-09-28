@@ -1,4 +1,5 @@
 import {
+  boolean,
   integer,
   numeric,
   pgTable,
@@ -47,6 +48,10 @@ export const repositories = pgTable(
     setupCommand: text("setup_command"),
     /** One plain command the review role may run (design.md OI3, C15). */
     testCommand: text("test_command"),
+    /** Run this repository's agent processes in a container (design.md §9.9, D20). */
+    agentContainer: boolean("agent_container").notNull().default(false),
+    /** Image override for container mode, built `FROM orchestra/agent` (§9.9). */
+    agentImage: text("agent_image"),
     createdAt: timestamptz("created_at").notNull().defaultNow(),
   },
   (table) => [unique().on(table.projectId, table.name)],

@@ -23,6 +23,8 @@ function emptyForm(projectId: string): CreateRepositoryInput {
     requiredCapability: null,
     setupCommand: null,
     testCommand: null,
+    agentContainer: false,
+    agentImage: null,
   };
 }
 
@@ -38,6 +40,8 @@ function toFormValues(repository: Repository): CreateRepositoryInput {
     requiredCapability: repository.requiredCapability,
     setupCommand: repository.setupCommand,
     testCommand: repository.testCommand,
+    agentContainer: repository.agentContainer,
+    agentImage: repository.agentImage,
   };
 }
 
@@ -56,6 +60,8 @@ function diffRepository(repository: Repository, form: CreateRepositoryInput): Pa
   if (form.requiredCapability !== repository.requiredCapability) patch.requiredCapability = form.requiredCapability;
   if (form.setupCommand !== repository.setupCommand) patch.setupCommand = form.setupCommand;
   if (form.testCommand !== repository.testCommand) patch.testCommand = form.testCommand;
+  if (form.agentContainer !== repository.agentContainer) patch.agentContainer = form.agentContainer;
+  if (form.agentImage !== repository.agentImage) patch.agentImage = form.agentImage;
   return patch;
 }
 
@@ -205,6 +211,27 @@ function RepositoryFields({ form, onChange, errors, idPrefix, projects }: Reposi
           Optional; must not contain shell metacharacters ( ) * &amp; ; | ` $ &lt; &gt; or a newline.
         </p>
       </div>
+      <div className="field">
+        <label>
+          <input
+            type="checkbox"
+            checked={form.agentContainer}
+            onChange={(event) => onChange({ ...form, agentContainer: event.target.checked })}
+          />
+          Run agent in a container
+        </label>
+        <p className="field__help">design.md §9.9; runs this repository's agent processes in a container.</p>
+      </div>
+      <div className="field">
+        <label>
+          Agent image
+          <input
+            value={nullableInputValue(form.agentImage)}
+            onChange={(event) => onChange({ ...form, agentImage: parseNullableInput(event.target.value) })}
+          />
+        </label>
+        <p className="field__help">Optional; image override for container mode, built `FROM orchestra/agent`.</p>
+      </div>
     </>
   );
 }
@@ -347,6 +374,8 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
                 <th scope="col">Capability</th>
                 <th scope="col">Setup command</th>
                 <th scope="col">Test command</th>
+                <th scope="col">Container</th>
+                <th scope="col">Image</th>
                 <th scope="col">Actions</th>
               </tr>
             </thead>
@@ -354,7 +383,7 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
               {repositories.map((repository) =>
                 editingId === repository.id && editForm ? (
                   <tr key={repository.id}>
-                    <td colSpan={10}>
+                    <td colSpan={12}>
                       <div className="card">
                         <h3>Edit repository</h3>
                         <form
@@ -417,6 +446,8 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
                         "—"
                       )}
                     </td>
+                    <td>{repository.agentContainer ? "Yes" : "No"}</td>
+                    <td>{repository.agentImage ?? "—"}</td>
                     <td>
                       <button type="button" className="admin-table__action" onClick={() => startEdit(repository)}>
                         Edit

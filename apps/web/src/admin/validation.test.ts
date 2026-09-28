@@ -23,6 +23,8 @@ const VALID_REPOSITORY = {
   requiredCapability: null,
   setupCommand: null,
   testCommand: null,
+  agentContainer: false,
+  agentImage: null,
 };
 
 const VALID_USER = {

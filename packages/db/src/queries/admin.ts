@@ -144,6 +144,10 @@ export interface InsertRepositoryInput {
   setupCommand: string | null;
   /** design.md OI3 (C15). Omitted means null. */
   testCommand?: string | null;
+  /** design.md §9.9, D20. Omitted means the column default (`false`). */
+  agentContainer?: boolean;
+  /** design.md §9.9. Omitted means null. */
+  agentImage?: string | null;
 }
 
 /**

@@ -43,6 +43,8 @@ const EXPECTED_TABLES: Record<string, string[]> = {
     "required_capability",
     "setup_command",
     "test_command",
+    "agent_container",
+    "agent_image",
     "created_at",
   ],
   tasks: [

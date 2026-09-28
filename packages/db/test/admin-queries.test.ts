@@ -179,6 +179,53 @@ describe("insertRepository / listRepositories / getRepositoryById (AC6)", () => 
       updateRepository(h.db, other.id, { name: "existing" }),
     ).rejects.toBeInstanceOf(UniqueViolationError);
   });
+
+  it("defaults agent_container to false and agent_image to null when omitted (C6, D20)", async () => {
+    const project = await insertProject(h.db, projectInput("ADMR4"));
+    const repo = await insertRepository(h.db, {
+      projectId: project.id,
+      name: "no-container",
+      gitUrl: "git@example.com:goopter/no-container.git",
+      defaultBranch: "main",
+      defaultRuntime: "claude",
+      defaultModel: null,
+      maxConcurrentWorktrees: 1,
+      requiredCapability: null,
+      setupCommand: null,
+    });
+    expect(repo.agentContainer).toBe(false);
+    expect(repo.agentImage).toBeNull();
+  });
+
+  it("stores explicit agent_container / agent_image and patches them (C6, D20)", async () => {
+    const project = await insertProject(h.db, projectInput("ADMR5"));
+    const repo = await insertRepository(h.db, {
+      projectId: project.id,
+      name: "with-container",
+      gitUrl: "git@example.com:goopter/with-container.git",
+      defaultBranch: "main",
+      defaultRuntime: "claude",
+      defaultModel: null,
+      maxConcurrentWorktrees: 1,
+      requiredCapability: null,
+      setupCommand: null,
+      agentContainer: true,
+      agentImage: "orchestra/agent:custom",
+    });
+    expect(repo.agentContainer).toBe(true);
+    expect(repo.agentImage).toBe("orchestra/agent:custom");
+
+    const fetched = await getRepositoryById(h.db, repo.id);
+    expect(fetched?.agentContainer).toBe(true);
+    expect(fetched?.agentImage).toBe("orchestra/agent:custom");
+
+    const updated = await updateRepository(h.db, repo.id, {
+      agentContainer: false,
+      agentImage: null,
+    });
+    expect(updated?.agentContainer).toBe(false);
+    expect(updated?.agentImage).toBeNull();
+  });
 });
 
 describe("listWorkersWithSlots (AC4, AC6)", () => {

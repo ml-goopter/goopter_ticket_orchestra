@@ -77,6 +77,8 @@ const CreateRepositorySchema = z
     required_capability: z.string().nullable().optional().default(null),
     setup_command: z.string().nullable().optional().default(null),
     test_command: TestCommandSchema.optional().default(null),
+    agent_container: z.boolean().optional().default(false),
+    agent_image: z.string().nullable().optional().default(null),
   })
   .strict();
 
@@ -97,6 +99,8 @@ const PatchRepositorySchema = z
     required_capability: z.string().nullable(),
     setup_command: z.string().nullable(),
     test_command: TestCommandSchema,
+    agent_container: z.boolean(),
+    agent_image: z.string().nullable(),
   })
   .strict()
   .partial();
@@ -114,6 +118,8 @@ function toResponse(row: RepositoryRow) {
     required_capability: row.requiredCapability,
     setup_command: row.setupCommand,
     test_command: row.testCommand,
+    agent_container: row.agentContainer,
+    agent_image: row.agentImage,
     created_at: row.createdAt,
   };
 }
@@ -172,6 +178,8 @@ export default async function repositoriesRoutes(
         requiredCapability: parsed.data.required_capability,
         setupCommand: parsed.data.setup_command,
         testCommand: parsed.data.test_command,
+        agentContainer: parsed.data.agent_container,
+        agentImage: parsed.data.agent_image,
       });
       reply.code(201);
       return toResponse(row);
@@ -225,6 +233,12 @@ export default async function repositoriesRoutes(
           : {}),
         ...(parsed.data.test_command !== undefined
           ? { testCommand: parsed.data.test_command }
+          : {}),
+        ...(parsed.data.agent_container !== undefined
+          ? { agentContainer: parsed.data.agent_container }
+          : {}),
+        ...(parsed.data.agent_image !== undefined
+          ? { agentImage: parsed.data.agent_image }
           : {}),
       });
       if (!row) throw notFound(request.params.id);
