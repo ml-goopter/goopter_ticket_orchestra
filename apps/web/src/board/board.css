@@ -74,7 +74,7 @@
  * (below) renders the same height either way: badge height (its xs-font
  * line-height plus its own vertical padding) + the gap above the name +
  * this header's own top/bottom padding (`var(--space-2) 0`, counted twice)
- * + three lines of the name at `--font-size-xs`/`--line-height-base`.
+ * + three lines of the name at `--font-size-xs` with the h2 line-height 1.25 (base.css h1-h6 rule).
  */
 .board-column--compact .kanban__column-header {
   flex-direction: column;
@@ -86,7 +86,7 @@
   min-height: calc(
     (var(--font-size-xs) * 1.4 + var(--space-1) * 2) +
     var(--space-2) * 3 +
-    (var(--font-size-xs) * var(--line-height-base) * 3)
+    (var(--font-size-xs) * 1.25 * 3)
   );
 }
 
