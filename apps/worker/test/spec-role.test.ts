@@ -43,6 +43,7 @@ import {
   registerSpecHandlers,
   type Runner,
 } from "../src/runner/index.js";
+import { claimNextTask } from "../src/scheduler/index.js";
 import { createWorktreeSweeperPhase } from "../src/sweeper/index.js";
 import type { TickContext } from "../src/tick.js";
 import { WorktreeManager, type PrepareSpecInput } from "../src/worktrees/index.js";
@@ -1039,5 +1040,73 @@ describe("review round 2 (GOT.37 F5)", () => {
     const row = await execution(id);
     expect(row.state).toBe("COMPLETED");
     expect(row.toolsTokenHash).toBeNull();
+  });
+});
+
+describe("worker slots (GOT.56)", () => {
+  it("a spec session holds a slot only while one of its turns runs", async () => {
+    const s = await seedSpecTask();
+    const h = makeHarness();
+    await db.$client.unsafe("update agent_workers set max_concurrent = 1 where id = $1", [workerId]);
+    const [ready] = await db
+      .insert(tasks)
+      .values({
+        projectId: s.projectId,
+        repositoryId: s.repositoryIds["a-spec"]!,
+        jiraKey: `SPR-R${++seq}`,
+        jiraSummary: "An approved task",
+        jiraPriority: 1,
+        jiraCreatedAt: NOW,
+        jiraSyncedAt: NOW,
+        state: "READY",
+      })
+      .returning({ id: tasks.id });
+    const claim = () => claimNextTask({ db, workerId, runtimes: ["claude"], now: new Date() });
+    const gated = (): { script: Script; release: () => void } => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return {
+        release,
+        script: async function* () {
+          yield { type: "session", sessionId: "sess-spec" };
+          await gate;
+          yield { type: "turn_done", finalText: "" };
+        },
+      };
+    };
+    const inTurn = (id: string) =>
+      waitFor(async () => ((await execution(id)).toolsTokenHash ? true : undefined), {
+        what: "the turn's token",
+      });
+
+    // The first turn holds the only slot.
+    const first = gated();
+    h.adapter.startScript = first.script;
+    await enqueue(s.taskId, "start_spec_session", null);
+    await consume(h.runner);
+    const [created] = await executionsOf(s.taskId);
+    const id = created!.id;
+    await inTurn(id);
+    expect(await claim()).toBeNull();
+    first.release();
+    await idle(h.runner, id);
+    expect(await execution(id)).toMatchObject({ state: "RUNNING", toolsTokenHash: null });
+
+    // A chat turn holds it again.
+    const chat = gated();
+    h.adapter.resumeScripts.push(chat.script);
+    await enqueue(s.taskId, "send_message", id, { text: "Which printers?" });
+    await consume(h.runner);
+    await inTurn(id);
+    expect(await claim()).toBeNull();
+    chat.release();
+    await idle(h.runner, id);
+
+    // Between turns the RUNNING session holds none: the READY task is claimed.
+    expect((await execution(id)).state).toBe("RUNNING");
+    expect((await claim())?.taskId).toBe(ready!.id);
+    expect((await task(ready!.id)).state).toBe("IMPLEMENTING");
   });
 });
