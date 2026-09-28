@@ -146,12 +146,19 @@ export function createConsumeCommandsPhase(
 export interface CancelTarget {
   /** Aborts the live run of `executionId`. False when none runs here. */
   abort(executionId: string): boolean;
+  /**
+   * §9.9 Removal: removes the agent container of an execution that ended
+   * with no live run here. Absent, nothing is removed.
+   */
+  releaseContainer?(executionId: string): Promise<void>;
 }
 
 /**
  * GOT.31 Q8: `cancel` aborts the live session of the command's
  * `execution_id` if this worker runs it, and is a no-op otherwise. The
- * payload is not read. State is the api's to set.
+ * payload is not read. State is the api's to set. With no live session
+ * here it releases the execution's agent container (§9.9); a live one is
+ * removed when its run ends.
  */
 export function registerCancelHandler(
   handlers: CommandHandlers,
@@ -168,6 +175,7 @@ export function registerCancelHandler(
       { commandId: command.id, executionId, aborted },
       aborted ? "cancel aborted live session" : "cancel: no live session here",
     );
+    if (!aborted) await runner.releaseContainer?.(executionId);
     return { outcome: "handled" };
   });
 }

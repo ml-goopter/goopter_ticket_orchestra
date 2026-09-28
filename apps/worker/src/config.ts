@@ -39,6 +39,11 @@ export interface WorkerConfig {
   githubToken?: string;
   anthropicApiKey?: string;
   openaiApiKey?: string;
+  /**
+   * `CLAUDE_CODE_OAUTH_TOKEN`: subscription token from `claude setup-token`,
+   * passed to agent containers as Claude auth (§9.9 Auth, §15.3).
+   */
+  claudeCodeOauthToken?: string;
   logLevel: LogLevel;
   /** `AGENT_CONTAINER_IMAGE`: default image for container mode (§9.9). */
   agentContainerImage: string;
@@ -154,6 +159,7 @@ const schema = z.object({
   GITHUB_TOKEN: optional(),
   ANTHROPIC_API_KEY: optional(),
   OPENAI_API_KEY: optional(),
+  CLAUDE_CODE_OAUTH_TOKEN: optional(),
   LOG_LEVEL: z
     .string()
     .optional()
@@ -225,6 +231,7 @@ export function loadConfig(
     githubToken: e.GITHUB_TOKEN,
     anthropicApiKey: e.ANTHROPIC_API_KEY,
     openaiApiKey: e.OPENAI_API_KEY,
+    claudeCodeOauthToken: e.CLAUDE_CODE_OAUTH_TOKEN,
     logLevel: e.LOG_LEVEL,
     agentContainerImage: e.AGENT_CONTAINER_IMAGE,
     agentContainerCpus: e.AGENT_CONTAINER_CPUS,
@@ -239,6 +246,7 @@ const SECRET_FIELDS = [
   "githubToken",
   "anthropicApiKey",
   "openaiApiKey",
+  "claudeCodeOauthToken",
 ] as const satisfies readonly (keyof WorkerConfig)[];
 
 export type RedactedConfig = Omit<

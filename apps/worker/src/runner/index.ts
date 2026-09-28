@@ -10,6 +10,20 @@ export {
 } from "./commands.js";
 export { registerCiFailureHandler } from "./ci.js";
 export {
+  CLAUDE_CONTAINER_COMMAND,
+  NO_DOCKER_MESSAGE,
+  claudeContainerSpawner,
+  claudeSessionRoot,
+  codexSessionRoot,
+  containerEnv,
+  createContainerAdapter,
+  type ContainerAdapterFactory,
+  type ContainerAdapterOptions,
+  type RunnerContainerCredentials,
+  type RunnerContainerOps,
+  type RunnerContainers,
+} from "./container.js";
+export {
   SPEC_MESSAGE_HEADER,
   SPEC_SENT_BACK_HEADER,
   registerSpecHandlers,

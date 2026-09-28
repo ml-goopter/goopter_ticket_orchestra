@@ -52,6 +52,7 @@ import {
   type TicketContext,
 } from "@orchestra/prompts";
 import { redactToken } from "../agent-tools/invoke.js";
+import { DockerError, containerName } from "../containers/index.js";
 import { renewExecutionLease } from "../agent-tools/lease.js";
 import {
   createLiveExecution,
@@ -75,6 +76,15 @@ import type {
   PushIfAheadInput,
   PushIfAheadResult,
 } from "../worktrees/manager.js";
+import {
+  NO_DOCKER_MESSAGE,
+  agentImageFor,
+  containerEnv,
+  createContainerAdapter,
+  isContainerMode,
+  observeDockerErrors,
+  type RunnerContainers,
+} from "./container.js";
 import { runFailurePolicy } from "./retry.js";
 
 /**
@@ -200,6 +210,14 @@ export interface RunnerDeps {
   testCommandFor?: (ctx: RunnerContext) => string | null;
   timings?: Partial<RunnerTimings>;
   now?: () => Date;
+  /**
+   * Container mode (design.md §9.9, D20): set only on a worker with the
+   * `docker` capability. An execution whose repository has
+   * `agent_container = true` runs every agent process, and `setup_command`,
+   * in its container through these. Without it such an execution fails as
+   * `adapter_error`, retriable, and never runs on the host.
+   */
+  containers?: RunnerContainers;
   /** Test seams; production passes nothing. */
   hooks?: {
     /**
@@ -382,6 +400,13 @@ export interface Runner {
   resume(input: ResumeInput): Promise<{ done: Promise<void> }>;
   /** Aborts the live run of `executionId`. False when none runs here. */
   abort(executionId: string): boolean;
+  /**
+   * §9.9 Removal: removes the agent container of an execution that has
+   * ended and has no live run here, such as one cancelled while waiting for
+   * the user. A no-op without container mode, for another host's
+   * execution, or while the execution is live. Never rejects.
+   */
+  releaseContainer(executionId: string): Promise<void>;
   isLive(executionId: string): boolean;
   /** Aborts every live run and waits up to `timeoutMs` for them to finish. */
   shutdown(timeoutMs?: number): Promise<void>;
@@ -396,8 +421,30 @@ type StopReason =
   /** §9.7 item 4: a runtime that cannot enforce its own budget cap crossed it. */
   | "budget_exceeded";
 
+/** The run's agent container (§9.9), for a container-mode execution. */
+interface ContainerRun {
+  readonly name: string;
+  /** `<workspace_root>/agent-home/<task id>`. */
+  readonly home: string;
+  /** The first `DockerError` a process of this run hit (§9.9 Scheduling). */
+  dockerError: DockerError | null;
+}
+
+/**
+ * Where a run's agent processes run: the host, the execution's container,
+ * or nowhere (`none`: host mode without an adapter; `unavailable`:
+ * container mode on a worker without Docker).
+ */
+type SessionTarget =
+  | { mode: "host"; adapter: AgentAdapter }
+  | { mode: "container"; adapter: AgentAdapter; container: ContainerRun }
+  | { mode: "none" }
+  | { mode: "unavailable" };
+
 class RunState {
   readonly controller = new AbortController();
+  /** Set once the run knows it is container mode; finalize removes it. */
+  container: ContainerRun | null = null;
   stopReason: StopReason | null = null;
   /** Set with a `budget_exceeded` stop: the end_detail `afterTurn` records. */
   stopDetail: string | undefined;
@@ -585,7 +632,29 @@ export function createRunner(deps: RunnerDeps): Runner {
     } catch (err) {
       log.error({ err: errMessage(err) }, "stamping ended_at failed");
     }
+    // §9.9 Removal: while the run is still live here no resume can ensure
+    // the container again, so the removal cannot race one.
+    if (state.container) await removeEndedContainer(id, log);
     if (live.get(id) === state) live.delete(id);
+  }
+
+  /**
+   * §9.9 Removal: removes the execution's container when the execution has
+   * ended (or is gone). A container of an execution that waits for the user,
+   * or of a spec session between turns, stays for the next turn. Logs; never
+   * throws: a container left behind is the orphan pass's (§6.6).
+   */
+  async function removeEndedContainer(executionId: string, log: Logger): Promise<void> {
+    const containers = deps.containers;
+    if (!containers) return;
+    try {
+      const current = await getExecutionState(db, executionId);
+      if (current !== null && !ENDED_STATES.has(current)) return;
+      await containers.manager.remove(executionId);
+      log.info({ state: current }, "agent container removed");
+    } catch (err) {
+      log.warn({ err: errMessage(err) }, "agent container removal failed");
+    }
   }
 
   function track(
@@ -615,6 +684,154 @@ export function createRunner(deps: RunnerDeps): Runner {
     };
     if (deps.githubToken) env.GITHUB_TOKEN = deps.githubToken;
     return env;
+  }
+
+  // ------------------------------------------------ container mode (§9.9)
+
+  /**
+   * Where this execution's agent processes run (§9.9, D20). Host mode for a
+   * repository without `agent_container`, exactly as before. Container mode
+   * builds the runtime's adapter with the container's spawner and session
+   * stores; without the worker's container stack it is `unavailable`.
+   */
+  function targetFor(state: RunState, ctx: RunnerContext): SessionTarget {
+    if (!isContainerMode(ctx)) {
+      const adapter = deps.adapters[ctx.execution.runtime];
+      return adapter ? { mode: "host", adapter } : { mode: "none" };
+    }
+    const containers = deps.containers;
+    if (!containers) return { mode: "unavailable" };
+    const container = (state.container ??= {
+      name: containerName(ctx.execution.id),
+      home: containers.manager.agentHome(ctx.task.id),
+      dockerError: null,
+    });
+    const spawn = observeDockerErrors(containers.manager.spawner(container.name), (err) => {
+      container.dockerError ??= err;
+    });
+    const adapterFor = containers.adapterFor ?? createContainerAdapter;
+    return {
+      mode: "container",
+      adapter: adapterFor(ctx.execution.runtime, { spawn, home: container.home }),
+      container,
+    };
+  }
+
+  /**
+   * A turn's `env`: host mode as `agentEnv`; container mode only the
+   * container-facing `ORCHESTRA_URL` and the turn's token, since the
+   * container's other variables come from `ensure` and `PATH` is the
+   * image's, with its own `orchestra-review` (§9.9 Environment).
+   */
+  function sessionEnv(target: SessionTarget, token: string): Record<string, string> {
+    return target.mode === "container"
+      ? { ORCHESTRA_URL: deps.containers!.toolsUrl(), ORCHESTRA_TOKEN: token }
+      : agentEnv(token);
+  }
+
+  /** A turn's `mcp.url`: the container listener in container mode (§9.9 Network). */
+  function sessionToolsUrl(target: SessionTarget): string {
+    return target.mode === "container" ? deps.containers!.toolsUrl() : deps.toolsUrl();
+  }
+
+  /** `end_detail` of an `adapter_error` with an explicit retry class (§9.5). */
+  const adapterErrorDetail = (message: string, retriable: boolean): string =>
+    JSON.stringify({ message: tail(message), retriable });
+
+  /** §9.9 Scheduling: container mode on a worker without Docker. */
+  async function failNoDocker(ctx: RunnerContext, log: Logger): Promise<void> {
+    log.warn({}, NO_DOCKER_MESSAGE);
+    await endFailed(ctx, "adapter_error", adapterErrorDetail(NO_DOCKER_MESSAGE, true));
+  }
+
+  /**
+   * §9.9 Lifecycle, before the first agent process of a run: ensures the
+   * execution's container at `worktreePath` (the row's recorded path, C33),
+   * then runs `setupCommand`, when given, in it with a timeout. True when
+   * the run may go on; a no-op in host mode.
+   *
+   * A failed ensure removes the container, then fails the execution: a
+   * `DockerError` as `adapter_error`, retriable. A `DockerError` of the setup
+   * exec is the same; a setup that exits non-zero or times out is
+   * `setup_failed`. Holds no row lock: the docker calls can take minutes.
+   */
+  async function prepareContainer(
+    state: RunState,
+    ctx: RunnerContext,
+    target: SessionTarget,
+    worktreePath: string,
+    setupCommand: string | null,
+    log: Logger,
+  ): Promise<boolean> {
+    if (target.mode === "host" || target.mode === "none") return true;
+    if (target.mode === "unavailable") {
+      await failNoDocker(ctx, log);
+      return false;
+    }
+    const containers = deps.containers!;
+    const { manager } = containers;
+    const executionId = ctx.execution.id;
+    try {
+      if (!ctx.repository) throw new Error("task has no repository");
+      await manager.ensure({
+        executionId,
+        taskId: ctx.task.id,
+        repositoryName: ctx.repository.name,
+        role: ctx.execution.role,
+        env: containerEnv(ctx, containers),
+        image: agentImageFor(ctx),
+        worktreePath,
+      });
+    } catch (err) {
+      log.warn({ err: errMessage(err) }, "agent container could not be ensured");
+      try {
+        await manager.remove(executionId);
+      } catch (removeErr) {
+        log.warn({ err: errMessage(removeErr) }, "agent container removal after a failed ensure failed");
+      }
+      await endFailed(
+        ctx,
+        "adapter_error",
+        err instanceof DockerError ? adapterErrorDetail(err.message, true) : tail(errMessage(err)),
+      );
+      return false;
+    }
+    if (state.stopReason !== null) return false;
+    if (!setupCommand) return true;
+
+    const timeoutMs = containers.setupTimeoutMs ?? deps.quietTimeoutMs;
+    let result;
+    try {
+      result = await manager.runShell({
+        container: target.container.name,
+        cwd: worktreePath,
+        command: setupCommand,
+        timeoutMs,
+      });
+    } catch (err) {
+      log.warn({ err: errMessage(err) }, "setup command could not run in the agent container");
+      if (err instanceof DockerError) {
+        await endFailed(ctx, "adapter_error", adapterErrorDetail(err.message, true));
+      } else {
+        await endFailed(ctx, "setup_failed", setupDetail(err));
+      }
+      return false;
+    }
+    if (result.timedOut || result.exitCode !== 0) {
+      const output = result.timedOut
+        ? `${result.tail}\nsetup command timed out after ${timeoutMs} ms`
+        : result.tail;
+      log.warn({ exitCode: result.exitCode, timedOut: result.timedOut }, "setup command failed in the agent container");
+      await endFailed(
+        ctx,
+        "setup_failed",
+        setupDetail(
+          new SetupFailedError(result.exitCode, (result.signal as NodeJS.Signals | null) ?? null, output),
+        ),
+      );
+      return false;
+    }
+    return true;
   }
 
   const modelFor = (ctx: RunnerContext): string | undefined =>
@@ -863,6 +1080,17 @@ export function createRunner(deps: RunnerDeps): Runner {
         if (!finished) {
           void Promise.resolve(iterator.return?.()).catch(() => {});
         }
+      }
+
+      // §9.9 Scheduling: Docker failing under a turn's process is
+      // `adapter_error`, retriable, however the adapter reported the end.
+      const dockerError = state.container?.dockerError;
+      if (
+        dockerError &&
+        (end.kind === "error" || end.kind === "thrown" || end.kind === "exhausted")
+      ) {
+        log.warn({ err: redact(dockerError.message) }, "docker failed during the turn");
+        end = { kind: "error", message: redact(dockerError.message), retriable: true };
       }
 
       if (end.kind === "stopped" && end.reason === "gone") {
@@ -1197,11 +1425,12 @@ export function createRunner(deps: RunnerDeps): Runner {
       );
       return;
     }
+    const target = targetFor(state, ctx);
     const retry = options.retry;
     if (!retry) {
       // Renewal covers worktree preparation too: a slow fetch or
       // setup_command must not let the lease expire (§6.4, §6.5).
-      await withLease(state, ctx, log, true, () => prepareAndRun(state, ctx, log));
+      await withLease(state, ctx, log, true, () => prepareAndRun(state, ctx, target, log));
       return;
     }
     const previous = (await loadRunnerContext(db, retry.previousExecutionId))?.execution ?? null;
@@ -1214,34 +1443,35 @@ export function createRunner(deps: RunnerDeps): Runner {
         : null;
     await withLease(state, ctx, log, true, async () => {
       if (reused) {
-        const session = previous
-          ? await resumableSession(ctx, previous, reused.worktreePath, log)
-          : null;
-        if (session && previous) {
-          await resumeRetry(state, ctx, previous, session, retry, log);
+        const session =
+          previous && (target.mode === "host" || target.mode === "container")
+            ? await resumableSession(target.adapter, previous, reused.worktreePath, log)
+            : null;
+        if (session && previous && (target.mode === "host" || target.mode === "container")) {
+          await resumeRetry(state, ctx, target, previous, session, retry, log);
           return;
         }
-        await prepareAndRun(state, ctx, log, previous, reused, retry.nudge);
+        await prepareAndRun(state, ctx, target, log, previous, reused, retry.nudge);
         return;
       }
-      await prepareAndRun(state, ctx, log, previous, null, retry.nudge);
+      await prepareAndRun(state, ctx, target, log, previous, null, retry.nudge);
     });
   }
 
   /**
    * §9.5 "resume session if canResume": the adapter can resume the failed
    * attempt's session in the worktree this retry took over. Returns the
-   * session and worktree, else null.
+   * session and worktree, else null. In container mode the adapter reads
+   * the session stores under the task's agent home (§9.9 Mounts).
    */
   async function resumableSession(
-    ctx: RunnerContext,
+    adapter: AgentAdapter,
     previous: RunnerContext["execution"],
     worktreePath: string,
     log: Logger,
   ): Promise<{ sessionId: string; worktreePath: string } | null> {
-    const adapter = deps.adapters[ctx.execution.runtime];
     const { sessionId } = previous;
-    if (!adapter || !sessionId) return null;
+    if (!sessionId) return null;
     try {
       return (await adapter.canResume(sessionId, worktreePath))
         ? { sessionId, worktreePath }
@@ -1261,12 +1491,13 @@ export function createRunner(deps: RunnerDeps): Runner {
   async function resumeRetry(
     state: RunState,
     ctx: RunnerContext,
+    target: Extract<SessionTarget, { adapter: AgentAdapter }>,
     previous: RunnerContext["execution"],
     session: { sessionId: string; worktreePath: string },
     retry: RetryStart,
     log: Logger,
   ): Promise<void> {
-    const adapter = deps.adapters[ctx.execution.runtime]!;
+    const { adapter } = target;
     await setExecutionPlacement(db, ctx.execution.id, { workerId, host });
     const started = await db.transaction(async (tx) => {
       await lockTaskForTool(tx, ctx.task.id);
@@ -1285,6 +1516,8 @@ export function createRunner(deps: RunnerDeps): Runner {
       log.info({}, "retry is no longer ASSIGNED, not resuming");
       return;
     }
+    // §9.9: the container is ensured after the move to RUNNING.
+    if (!(await prepareContainer(state, ctx, target, session.worktreePath, null, log))) return;
 
     // The runtime reports session totals, so the baseline is what the
     // failed attempt's session already reported (§9.7).
@@ -1312,8 +1545,8 @@ export function createRunner(deps: RunnerDeps): Runner {
           prompt,
           model: modelFor(ctx),
           allowedTools: "implementation",
-          mcp: { url: deps.toolsUrl(), token },
-          env: agentEnv(token),
+          mcp: { url: sessionToolsUrl(target), token },
+          env: sessionEnv(target, token),
           sessionId: session.sessionId,
           usageBaseline: baseline,
           ...(testCommand ? { testCommand } : {}),
@@ -1367,6 +1600,7 @@ export function createRunner(deps: RunnerDeps): Runner {
   async function prepareAndRun(
     state: RunState,
     ctx: RunnerContext,
+    target: SessionTarget,
     log: Logger,
     retryOf: RunnerContext["execution"] | null = null,
     reuse: { worktreePath: string; branch: string | null } | null = null,
@@ -1374,8 +1608,7 @@ export function createRunner(deps: RunnerDeps): Runner {
   ): Promise<void> {
     await setExecutionPlacement(db, ctx.execution.id, { workerId, host });
 
-    const adapter = deps.adapters[ctx.execution.runtime];
-    if (!adapter) {
+    if (target.mode === "none") {
       await endFailed(
         ctx,
         "adapter_error",
@@ -1383,6 +1616,15 @@ export function createRunner(deps: RunnerDeps): Runner {
       );
       return;
     }
+    // §9.9 Scheduling: never on the host, and no worktree work first.
+    if (target.mode === "unavailable") {
+      await failNoDocker(ctx, log);
+      return;
+    }
+    const { adapter } = target;
+    // §9.9: in container mode setup_command runs in the container, after
+    // the worktree exists and the container is ensured.
+    const containerMode = target.mode === "container";
 
     const testCommand = testCommandFor(ctx);
     let prepared: PreparedWorktree;
@@ -1404,7 +1646,7 @@ export function createRunner(deps: RunnerDeps): Runner {
             name: ctx.repository.name,
             gitUrl: ctx.repository.gitUrl,
             defaultBranch: ctx.repository.defaultBranch,
-            setupCommand: ctx.repository.setupCommand,
+            setupCommand: containerMode ? null : ctx.repository.setupCommand,
           },
           task: {
             id: ctx.task.id,
@@ -1450,6 +1692,13 @@ export function createRunner(deps: RunnerDeps): Runner {
       });
     }
 
+    // §9.9 Lifecycle: after worktree preparation, before the first turn. A
+    // reused worktree (C32) runs no setup, as in host mode.
+    const setupCommand = reuse ? null : ctx.repository?.setupCommand?.trim() || null;
+    if (!(await prepareContainer(state, ctx, target, prepared.worktreePath, setupCommand, log))) {
+      return;
+    }
+
     const noMistakes = await pathExists(
       path.join(prepared.worktreePath, NO_MISTAKES_MARKER),
     );
@@ -1468,8 +1717,8 @@ export function createRunner(deps: RunnerDeps): Runner {
           prompt,
           model: modelFor(ctx),
           allowedTools: "implementation",
-          mcp: { url: deps.toolsUrl(), token },
-          env: agentEnv(token),
+          mcp: { url: sessionToolsUrl(target), token },
+          env: sessionEnv(target, token),
           ...(testCommand ? { testCommand } : {}),
           ...(budgetFor(ctx) !== undefined ? { maxBudgetUsd: budgetFor(ctx) } : {}),
         },
@@ -1525,11 +1774,17 @@ export function createRunner(deps: RunnerDeps): Runner {
       loaded.repository ?? (await resolveSpecRepository(db, loaded.task.id));
     const ctx: RunnerContext = { ...loaded, repository };
 
-    const adapter = deps.adapters[ctx.execution.runtime];
-    if (!adapter) {
+    const target = targetFor(state, ctx);
+    if (target.mode === "none") {
       await endFailed(ctx, "adapter_error", `${ctx.execution.runtime} adapter not available`);
       return;
     }
+    // §9.9 Scheduling: never on the host, and no worktree work first.
+    if (target.mode === "unavailable") {
+      await failNoDocker(ctx, log);
+      return;
+    }
+    const { adapter } = target;
 
     let prepared: PreparedWorktree;
     try {
@@ -1561,6 +1816,9 @@ export function createRunner(deps: RunnerDeps): Runner {
         payload: { worktree_path: prepared.worktreePath, branch: prepared.branch },
       });
     });
+
+    // §9.9 Lifecycle: role spec mounts the worktree and bare clone read-only.
+    if (!(await prepareContainer(state, ctx, target, prepared.worktreePath, null, log))) return;
 
     const draftRow = await getRevisionByStatus(db, ctx.task.id, "draft");
     const draftContent = draftRow ? SpecContentSchema.safeParse(draftRow.content) : null;
@@ -1601,8 +1859,8 @@ export function createRunner(deps: RunnerDeps): Runner {
           prompt,
           model: modelFor(ctx),
           allowedTools: "spec",
-          mcp: { url: deps.toolsUrl(), token },
-          env: agentEnv(token),
+          mcp: { url: sessionToolsUrl(target), token },
+          env: sessionEnv(target, token),
           ...(budgetFor(ctx) !== undefined ? { maxBudgetUsd: budgetFor(ctx) } : {}),
         },
         signal,
@@ -1642,6 +1900,9 @@ export function createRunner(deps: RunnerDeps): Runner {
    * Returns the worktree path. Any failure before the write removes what the
    * recreation left at the recorded path, so the next resume starts clean,
    * then refuses with `WORKTREE_UNAVAILABLE` and writes nothing.
+   *
+   * A container-mode repository (§9.9) runs no setup here: the resume runs
+   * it in the container once its state move has committed.
    */
   async function restoreEvictedWorktree(
     ctx: RunnerContext,
@@ -1656,7 +1917,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         name: ctx.repository.name,
         gitUrl: ctx.repository.gitUrl,
         defaultBranch: ctx.repository.defaultBranch,
-        setupCommand: ctx.repository.setupCommand,
+        setupCommand: isContainerMode(ctx) ? null : ctx.repository.setupCommand,
       };
       if (ctx.execution.role === "spec") {
         prepared = await deps.worktrees.prepareSpec({
@@ -1753,9 +2014,13 @@ export function createRunner(deps: RunnerDeps): Runner {
     const log = logger.child({ executionId });
 
     let ctx: RunnerContext;
-    let adapter: AgentAdapter;
+    let target: SessionTarget;
+    /** Null only for container mode without Docker, which fails before a turn. */
+    let adapter: AgentAdapter | null;
     let sessionId: string;
     let worktreePath: string;
+    /** §9.9: set when this resume recreated an implementation worktree. */
+    let restored = false;
     const baseline: UsageBaseline = {};
     // C21: set when this resume starts a fresh session instead.
     let fresh: FreshSessionReason | null = null;
@@ -1824,9 +2089,11 @@ export function createRunner(deps: RunnerDeps): Runner {
       }
       sessionId = execution.sessionId!;
       worktreePath = execution.worktreePath!;
-      const found = deps.adapters[execution.runtime];
-      if (!found) return refuse("NO_ADAPTER", `${execution.runtime} adapter not available`);
-      adapter = found;
+      target = targetFor(state, ctx);
+      if (target.mode === "none") {
+        return refuse("NO_ADAPTER", `${execution.runtime} adapter not available`);
+      }
+      adapter = target.mode === "unavailable" ? null : target.adapter;
 
       let expectedWorkerId = execution.workerId;
       if (fresh !== null) {
@@ -1853,8 +2120,13 @@ export function createRunner(deps: RunnerDeps): Runner {
 
       if (execution.worktreeEvictedAt !== null) {
         worktreePath = await restoreEvictedWorktree(ctx, worktreePath, refuse, log);
+        restored = true;
       }
-      if (fresh === null && !(await adapter.canResume(sessionId, worktreePath))) {
+      if (
+        fresh === null &&
+        adapter !== null &&
+        !(await adapter.canResume(sessionId, worktreePath))
+      ) {
         if (!canFallBack) refuse("CANNOT_RESUME", "session cannot be resumed");
         freshSpec = freshContext(ctx);
         fresh = "cannot_resume";
@@ -1862,6 +2134,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       // C21: the recorded worktree lives on the dead host, or is gone here.
       if (fresh !== null && !(await pathExists(worktreePath))) {
         worktreePath = await restoreEvictedWorktree(ctx, worktreePath, refuse, log);
+        restored = true;
       }
 
       // C53: `orchestra-review` reads the spec from the worktree's
@@ -2005,6 +2278,16 @@ export function createRunner(deps: RunnerDeps): Runner {
     const role = ctx.execution.role as ToolPolicy;
     const testCommand = testCommandFor(ctx);
     const turnOptions: TurnOptions = { conversationTurn: input.conversationTurn };
+    // §9.9: the container is ensured only after the resume's state move, so a
+    // sweeper eviction decided before it cannot race the ensure. A worktree
+    // this resume recreated gets its setup_command in the container.
+    const setupAfterMove =
+      restored && isContainerMode(ctx) && ctx.execution.role === "implementation"
+        ? ctx.repository?.setupCommand?.trim() || null
+        : null;
+    const cwdForContainer = worktreePath;
+    const containerReady = (): Promise<boolean> =>
+      prepareContainer(state, ctx, target, cwdForContainer, setupAfterMove, log);
     if (fresh !== null) {
       // C21, D5: a new session seeded with the full user prompt, the resume
       // header as its pending prompt.
@@ -2014,6 +2297,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       log.info({ reason: fresh }, "resume starts a fresh session");
       const done = track(state, log, () =>
         withLease(state, ctx, log, false, async () => {
+          if (!(await containerReady())) return;
           const noMistakes = await pathExists(path.join(cwd, NO_MISTAKES_MARKER));
           const prompt = buildPrompt(
             await implementationUserPrompt(ctx, spec, ctx.execution.branch, log),
@@ -2024,15 +2308,15 @@ export function createRunner(deps: RunnerDeps): Runner {
             input.usageKind ?? "resume",
             log,
             (token, signal) =>
-              adapter.start(
+              adapter!.start(
                 {
                   cwd,
                   systemPrompt: systemPromptFor("implementation", { noMistakes }),
                   prompt,
                   model: modelFor(ctx),
                   allowedTools: "implementation",
-                  mcp: { url: deps.toolsUrl(), token },
-                  env: agentEnv(token),
+                  mcp: { url: sessionToolsUrl(target), token },
+                  env: sessionEnv(target, token),
                   ...(testCommand ? { testCommand } : {}),
                   ...(budgetFor(ctx) !== undefined ? { maxBudgetUsd: budgetFor(ctx) } : {}),
                 },
@@ -2046,21 +2330,22 @@ export function createRunner(deps: RunnerDeps): Runner {
     }
     const done = track(state, log, () =>
       // The resume transaction already renewed the lease.
-      withLease(state, ctx, log, false, () =>
-        runSession(
+      withLease(state, ctx, log, false, async () => {
+        if (!(await containerReady())) return;
+        await runSession(
           state,
           ctx,
           input.usageKind ?? "resume",
           log,
           (token, signal) =>
-            adapter.resume(
+            adapter!.resume(
               {
                 cwd: worktreePath,
                 prompt: input.prompt,
                 model: modelFor(ctx),
                 allowedTools: role,
-                mcp: { url: deps.toolsUrl(), token },
-                env: agentEnv(token),
+                mcp: { url: sessionToolsUrl(target), token },
+                env: sessionEnv(target, token),
                 sessionId,
                 usageBaseline: baseline,
                 ...(testCommand ? { testCommand } : {}),
@@ -2069,8 +2354,8 @@ export function createRunner(deps: RunnerDeps): Runner {
               signal,
             ),
           turnOptions,
-        ),
-      ),
+        );
+      }),
     );
     return { done };
   }
@@ -2089,6 +2374,28 @@ export function createRunner(deps: RunnerDeps): Runner {
       if (!state) return false;
       state.stop("cancelled");
       return true;
+    },
+    async releaseContainer(executionId) {
+      const containers = deps.containers;
+      if (!containers || live.has(executionId)) return;
+      const log = logger.child({ executionId });
+      try {
+        const loaded = await loadRunnerContext(db, executionId);
+        if (!loaded || loaded.execution.host !== host) return;
+        // Only states no resume leaves: a COMPLETED execution can resume.
+        if (loaded.execution.state !== "CANCELLED" && loaded.execution.state !== "FAILED") return;
+        const repository =
+          loaded.repository ??
+          (loaded.execution.role === "spec"
+            ? await resolveSpecRepository(db, loaded.task.id)
+            : null);
+        if (!isContainerMode({ ...loaded, repository })) return;
+        if (live.has(executionId)) return;
+        await containers.manager.remove(executionId);
+        log.info({ state: loaded.execution.state }, "agent container removed");
+      } catch (err) {
+        log.warn({ err: errMessage(err) }, "agent container removal failed");
+      }
     },
     isLive: (executionId) => live.has(executionId),
     async shutdown(timeoutMs = DEFAULT_RUNNER_SHUTDOWN_TIMEOUT_MS) {
