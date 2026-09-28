@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,13 +17,15 @@ import {
   CODEX_CONFIG_KEYS,
   CODEX_MCP_TOKEN_ENV,
   CodexAdapter,
-  type CodexChild,
-  type CodexExit,
-  type CodexSpawnFn,
-  type CodexSpawnOptions,
   defaultCodexSessionRoot,
 } from "./codex.js";
 import { codexSandboxFor } from "./policies.js";
+import type {
+  AgentProcess,
+  ProcessExit,
+  ProcessSpawner,
+  ProcessSpawnOptions,
+} from "./spawner.js";
 import type { AgentEvent, ResumeRequest, StartRequest } from "./types.js";
 
 const THREAD_ID = "0199a213-81c0-7800-8aa1-bbab2a035a53";
@@ -60,12 +63,12 @@ const resumeRequest: ResumeRequest = {
 interface SpawnCall {
   command: string;
   args: string[];
-  options: CodexSpawnOptions;
+  options: ProcessSpawnOptions;
   stdin: string | undefined;
 }
 
 interface FakeRun {
-  spawn: CodexSpawnFn;
+  spawn: ProcessSpawner;
   calls: SpawnCall[];
   kills: number;
 }
@@ -78,7 +81,7 @@ interface FakeRun {
 function fakeCodex(
   stdout: string,
   opts: {
-    exit?: CodexExit;
+    exit?: ProcessExit;
     /** One chunk, or several to split a value across reads. */
     stderr?: string | string[];
     hang?: boolean;
@@ -102,8 +105,8 @@ function fakeCodex(
     const killedP = new Promise<void>((resolve) => {
       killed = resolve;
     });
-    let resolveExit!: (exit: CodexExit) => void;
-    const exit = new Promise<CodexExit>((resolve) => {
+    let resolveExit!: (exit: ProcessExit) => void;
+    const exit = new Promise<ProcessExit>((resolve) => {
       resolveExit = resolve;
     });
     void killedP.then(() => resolveExit({ code: null, signal: "SIGKILL" }));
@@ -125,14 +128,16 @@ function fakeCodex(
       for (const chunk of chunks) yield new TextEncoder().encode(chunk);
     }
 
-    const child: CodexChild = {
-      stdin: {
-        end(data: string) {
+    const child: AgentProcess = {
+      stdin: new Writable({
+        decodeStrings: false,
+        write(data: string, _encoding, done) {
           call.stdin = data;
+          done();
         },
-      },
-      stdout: out(),
-      stderr: err(),
+      }),
+      stdout: Readable.from(out()),
+      stderr: Readable.from(err()),
       exit,
       kill() {
         run.kills += 1;
@@ -665,6 +670,35 @@ describe("CodexAdapter abort (design.md §7: cancel is the AbortSignal)", () => 
     controller.abort();
     expect(await pending).toEqual({ done: true, value: undefined });
     expect(fake.kills).toBeGreaterThanOrEqual(1);
+  });
+
+  it("abort calls the shared spawner's kill with no signal, the group SIGKILL", async () => {
+    // One spawner value typed as the shared ProcessSpawner, as a worker would
+    // hand the same spawner to both adapters (design.md §9.9).
+    const fake = fakeCodex(
+      '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}\n',
+      { hang: true },
+    );
+    const killArgs: unknown[][] = [];
+    const spawn: ProcessSpawner = (command, args, options) => {
+      const child = fake.spawn(command, args, options);
+      const kill = child.kill.bind(child);
+      return {
+        ...child,
+        kill: (...signal: unknown[]) => {
+          killArgs.push(signal);
+          kill();
+        },
+      };
+    };
+    const controller = new AbortController();
+    const iterator = iterate(new CodexAdapter({ spawn }).start(startRequest, controller.signal));
+
+    await iterator.next();
+    const pending = iterator.next();
+    controller.abort();
+    expect(await pending).toEqual({ done: true, value: undefined });
+    expect(killArgs).toEqual([[]]);
   });
 
   it("never spawns when the signal is already aborted", async () => {

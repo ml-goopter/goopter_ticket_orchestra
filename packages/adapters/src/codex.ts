@@ -1,9 +1,15 @@
-import { spawn as spawnProcess } from "node:child_process";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { codexSandboxFor, ORCHESTRA_MCP_SERVER } from "./policies.js";
 import { classifyRetriable } from "./retriable.js";
+import {
+  type AgentProcess,
+  type ProcessExit,
+  type ProcessSpawner,
+  type ProcessSpawnOptions,
+  spawnHostProcess,
+} from "./spawner.js";
 import type {
   AgentAdapter,
   AgentEvent,
@@ -43,40 +49,13 @@ export const CODEX_CONFIG_KEYS = {
  */
 export const CODEX_MCP_TOKEN_ENV = "ORCHESTRA_TOKEN";
 
-/** How a spawned Codex process ended. */
-export interface CodexExit {
-  code: number | null;
-  signal: string | null;
-}
-
-export interface CodexSpawnOptions {
-  cwd: string;
-  env: Record<string, string | undefined>;
-}
-
-/**
- * The slice of a child process the adapter uses, so a test can play back
- * recorded JSONL. `kill` must stop the whole process group: Codex runs the
- * agent's commands as its own children.
- */
-export interface CodexChild {
-  stdin: { end(data: string): void };
-  stdout: AsyncIterable<string | Uint8Array>;
-  stderr: AsyncIterable<string | Uint8Array>;
-  /** Settles when the process has exited. Rejects if it never started. */
-  exit: Promise<CodexExit>;
-  kill(): void;
-}
-
-export type CodexSpawnFn = (
-  command: string,
-  args: readonly string[],
-  options: CodexSpawnOptions,
-) => CodexChild;
-
 export interface CodexAdapterOptions {
-  /** Injected process spawner. Defaults to `spawnCodex`. */
-  spawn?: CodexSpawnFn;
+  /**
+   * Injected process spawner (design.md §9.9). Defaults to
+   * `spawnHostProcess`, which runs Codex on the host in its own process
+   * group. `kill` is called with no signal, which stops the whole group.
+   */
+  spawn?: ProcessSpawner;
   /** Binary to run. Defaults to `codex` on PATH (design.md §7.3). */
   command?: string;
   /**
@@ -120,49 +99,17 @@ export function defaultCodexSessionRoot(
   return join(env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions");
 }
 
-/**
- * Spawns Codex in its own process group, so `kill` also reaches the commands
- * it runs, as the worktree runner does for git.
- */
-export const spawnCodex: CodexSpawnFn = (command, args, options) => {
-  const child = spawnProcess(command, [...args], {
-    cwd: options.cwd,
-    env: options.env,
-    stdio: ["pipe", "pipe", "pipe"],
-    detached: true,
-  });
-  // A process that exits before reading its prompt closes stdin (EPIPE).
-  child.stdin.on("error", () => {});
-  const exit = new Promise<CodexExit>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", (code, signal) => resolve({ code, signal }));
-  });
-  return {
-    stdin: child.stdin,
-    stdout: child.stdout,
-    stderr: child.stderr,
-    exit,
-    kill() {
-      try {
-        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
-    },
-  };
-};
-
 export class CodexAdapter implements AgentAdapter {
   readonly runtime = "codex" as const;
 
-  readonly #spawn: CodexSpawnFn;
+  readonly #spawn: ProcessSpawner;
   readonly #command: string;
   readonly #sessionRoot: string;
   readonly #exitGraceMs: number;
   readonly #debug: (reason: string, line: string) => void;
 
   constructor(options: CodexAdapterOptions = {}) {
-    this.#spawn = options.spawn ?? spawnCodex;
+    this.#spawn = options.spawn ?? spawnHostProcess;
     this.#command = options.command ?? DEFAULT_COMMAND;
     this.#sessionRoot = options.sessionRoot ?? defaultCodexSessionRoot();
     this.#exitGraceMs = options.exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
@@ -286,11 +233,11 @@ async function* malformedThreadStream(sessionId: string): AsyncGenerator<AgentEv
 }
 
 interface RunConfig {
-  spawn: CodexSpawnFn;
+  spawn: ProcessSpawner;
   command: string;
   args: string[];
   stdin: string;
-  spawnOptions: CodexSpawnOptions;
+  spawnOptions: ProcessSpawnOptions;
   signal: AbortSignal;
   redact: (text: string) => string;
   model: string;
@@ -309,7 +256,7 @@ interface StreamContext {
   debug: (reason: string, line: string) => void;
 }
 
-type ExitOutcome = CodexExit | { error: unknown };
+type ExitOutcome = ProcessExit | { error: unknown };
 
 const ABORTED = Symbol("aborted");
 
@@ -325,7 +272,7 @@ async function* runCodex(run: RunConfig): AsyncGenerator<AgentEvent> {
   const { signal, redact } = run;
   if (signal.aborted) return;
 
-  let child: CodexChild;
+  let child: AgentProcess;
   try {
     child = run.spawn(run.command, run.args, run.spawnOptions);
   } catch (error) {

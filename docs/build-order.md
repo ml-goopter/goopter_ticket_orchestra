@@ -48,6 +48,8 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | W8 | GOT.47 | worker: issue conversation and resume commands | #46 |
 | fill-in | GOT.50 | worker: project budget cap and Codex usage pricing | #47 |
 | W9 | GOT.48 | E2E: sandbox ticket to merged PR through Claude | direct to main (docs only) |
+| containers | GOT.73 | worker: agent-tools listener reachable from containers (C5) | #56 |
+| containers | GOT.71 | adapters: shared process spawner for Claude and Codex (C3) | #57 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
