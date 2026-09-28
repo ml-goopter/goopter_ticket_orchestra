@@ -10,6 +10,9 @@ import {
   ContainerManager,
   DockerError,
   containerName,
+  dockerExecutionContainers,
+  runDocker,
+  type DockerRunner,
 } from "../src/containers/index.js";
 
 /**
@@ -92,6 +95,8 @@ describe.skipIf(!dockerOk)("agent containers against real Docker (§9.9)", () =>
   const taskId = randomUUID();
   const executionId = randomUUID();
   const specExecutionId = randomUUID();
+  /** Random per run, so a concurrent run on this daemon never shares an owner. */
+  const owner = randomUUID().replaceAll("-", "");
   const created = new Set<string>();
   let tmp: string;
   let root: string;
@@ -125,6 +130,7 @@ describe.skipIf(!dockerOk)("agent containers against real Docker (§9.9)", () =>
       image: IMAGE,
       cpus: 1,
       memory: "512m",
+      owner,
       network,
       hostEnv,
     });
@@ -145,6 +151,7 @@ describe.skipIf(!dockerOk)("agent containers against real Docker (§9.9)", () =>
     expect(c.Config.Labels).toMatchObject({
       "orchestra.execution": executionId,
       "orchestra.task": taskId,
+      "orchestra.owner": owner,
     });
     expect(c.Config.User).toBe(`${process.getuid!()}:${process.getgid!()}`);
     expect(c.Config.Cmd).toEqual(["sleep", "infinity"]);
@@ -332,5 +339,43 @@ describe.skipIf(!dockerOk)("agent containers against real Docker (§9.9)", () =>
 
   it("returns the network's IPv4 gateway", async () => {
     expect(await manager.networkGateway()).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
+  });
+
+  it("lists only containers whose orchestra.owner label is this deployment's (§9.9 Orphans)", async () => {
+    const mine = randomUUID();
+    const theirs = randomUUID();
+    const unowned = randomUUID();
+    const start = (id: string, labels: string[]) => {
+      const name = `orchestra-test-${id}`;
+      created.add(name);
+      docker("run", "-d", "--name", name, "--network", "none", ...labels.flatMap((l) => ["--label", l]), IMAGE);
+      return name;
+    };
+    start(mine, [`orchestra.execution=${mine}`, `orchestra.owner=${owner}`]);
+    start(theirs, [`orchestra.execution=${theirs}`, `orchestra.owner=${randomUUID().replaceAll("-", "")}`]);
+    start(unowned, [`orchestra.execution=${unowned}`]);
+
+    // Capture what the daemon itself returned, so the check is on docker's
+    // label filter and not only on the client-side owner check.
+    let raw = "";
+    const run: DockerRunner = async (args, options) => {
+      const result = await runDocker(args, options);
+      raw += result.stdout;
+      return result;
+    };
+    // This run's own manager containers carry the same owner; look only at the three.
+    const three: string[] = [mine, theirs, unowned];
+    const ours = (ids: string[]) => ids.filter((id) => three.includes(id));
+    const listed = await dockerExecutionContainers({ owner, run }).list();
+
+    expect(ours(listed.map((c) => c.executionId))).toEqual([mine]);
+    expect(listed.find((c) => c.executionId === mine)).toEqual({
+      id: expect.stringMatching(/^[0-9a-f]{64}$/),
+      name: `orchestra-test-${mine}`,
+      executionId: mine,
+      taskId: null,
+      owner,
+    });
+    expect(ours(raw.split("\n").map((line) => line.split("\t")[2] ?? ""))).toEqual([mine]);
   });
 });

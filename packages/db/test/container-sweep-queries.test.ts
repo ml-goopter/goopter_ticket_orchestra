@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  deploymentOwner,
   listContainerExecutions,
   lockContainerExecution,
 } from "../src/queries/index.js";
@@ -49,6 +52,48 @@ async function seed(
     .where(eq(schema.executions.id, executionId));
   return { taskId, executionId };
 }
+
+describe("deploymentOwner (§9.9 Orphans, owner label)", () => {
+  /** A drizzle client on `database` of the same cluster, closed by `end`. */
+  function connect(database?: string) {
+    const url = new URL(h.connectionString);
+    if (database) url.pathname = `/${database}`;
+    const client = postgres(url.toString(), { max: 1 });
+    return { db: drizzle(client, { schema }), end: () => client.end({ timeout: 5 }) };
+  }
+
+  it("is a 32-character hex digest that carries no part of the connection string", async () => {
+    const owner = await deploymentOwner(h.db);
+    expect(owner).toMatch(/^[0-9a-f]{32}$/);
+    const url = new URL(h.connectionString);
+    for (const part of [url.password, url.username, url.hostname, url.port, url.pathname.slice(1)]) {
+      if (part.length >= 3) expect(owner).not.toContain(part);
+    }
+  });
+
+  it("is the same on every call and on a new connection (stable across worker restarts)", async () => {
+    const first = await deploymentOwner(h.db);
+    const again = connect();
+    try {
+      expect(await deploymentOwner(h.db)).toBe(first);
+      expect(await deploymentOwner(again.db)).toBe(first);
+    } finally {
+      await again.end();
+    }
+  });
+
+  it("differs for another database, even in the same cluster", async () => {
+    const name = `owner_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    await h.sql.unsafe(`create database ${name}`);
+    const other = connect(name);
+    try {
+      expect(await deploymentOwner(other.db)).not.toBe(await deploymentOwner(h.db));
+    } finally {
+      await other.end();
+      await h.sql.unsafe(`drop database ${name}`);
+    }
+  });
+});
 
 describe("listContainerExecutions", () => {
   it("returns id, task, state and host for each known execution id", async () => {

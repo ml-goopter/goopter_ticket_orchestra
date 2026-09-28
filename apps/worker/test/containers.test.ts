@@ -15,10 +15,13 @@ import {
   ContainerManager,
   DockerError,
   EXECUTION_LABEL,
+  OWNER_LABEL,
   TASK_LABEL,
   containerName,
   createDockerRunner,
   dockerExecutionContainers,
+  ensureMark,
+  withExecutionContainerLock,
   type DockerResult,
   type DockerRunOptions,
   type DockerRunner,
@@ -33,6 +36,7 @@ import {
 const EXEC = "11111111-2222-4333-8444-555555555555";
 const TASK = "66666666-7777-4888-9999-000000000000";
 const IMAGE = "orchestra/agent:0.0.1";
+const OWNER = "0123456789abcdef0123456789abcdef";
 const SECRET_GH = "ghp_SECRETVALUE_github";
 const SECRET_CLAUDE = "sk-ant-oat-SECRETVALUE_claude";
 const SECRET_TURN = "orchestra-turn-SECRETVALUE";
@@ -155,6 +159,7 @@ function manager(
     image: IMAGE,
     cpus: 2,
     memory: "4g",
+    owner: OWNER,
     run,
     uid: 501,
     gid: 20,
@@ -180,6 +185,7 @@ describe("naming (design.md §9.9 Lifecycle)", () => {
     expect(containerName(EXEC)).toBe(`orchestra-exec-${EXEC}`);
     expect(EXECUTION_LABEL).toBe("orchestra.execution");
     expect(TASK_LABEL).toBe("orchestra.task");
+    expect(OWNER_LABEL).toBe("orchestra.owner");
     expect(AGENT_NETWORK).toBe("orchestra-agents");
   });
 });
@@ -204,6 +210,8 @@ describe("ContainerManager.ensure", () => {
       `orchestra.execution=${EXEC}`,
       "--label",
       `orchestra.task=${TASK}`,
+      "--label",
+      `orchestra.owner=${OWNER}`,
       "--user",
       "501:20",
       "--cpus",
@@ -455,7 +463,7 @@ describe("ContainerManager.ensure", () => {
 
   it("runs as the worker's own uid and gid by default", async () => {
     const docker = fakeDocker(freshHost());
-    const m = new ContainerManager({ workspaceRoot: root, image: IMAGE, cpus: 1.5, memory: "512m", run: docker.run });
+    const m = new ContainerManager({ workspaceRoot: root, image: IMAGE, cpus: 1.5, memory: "512m", owner: OWNER, run: docker.run });
     await m.ensure(ensureInput());
     const args = docker.calls.find((c) => c.args[0] === "run")!.args;
     expect(args[args.indexOf("--user") + 1]).toBe(`${process.getuid!()}:${process.getgid!()}`);
@@ -518,15 +526,20 @@ describe("ContainerManager.networkGateway", () => {
 });
 
 describe("dockerExecutionContainers", () => {
-  it("lists only containers carrying the orchestra.execution label", async () => {
+  it("lists only containers carrying the orchestra.execution label and this deployment's orchestra.owner label", async () => {
     const docker = fakeDocker(() => ({
-      stdout: [`c1\torchestra-exec-${EXEC}\t${EXEC}\t${TASK}`, "c2\tstray\tnot-a-uuid\t", ""].join("\n"),
+      stdout: [
+        `c1\torchestra-exec-${EXEC}\t${EXEC}\t${TASK}\t${OWNER}`,
+        `c2\tstray\tnot-a-uuid\t\t${OWNER}`,
+        "",
+      ].join("\n"),
     }));
-    const ops = dockerExecutionContainers(docker.run);
+    const ops = dockerExecutionContainers({ owner: OWNER, run: docker.run });
 
+    expect(ops.owner).toBe(OWNER);
     expect(await ops.list()).toEqual([
-      { id: "c1", name: `orchestra-exec-${EXEC}`, executionId: EXEC, taskId: TASK },
-      { id: "c2", name: "stray", executionId: "not-a-uuid", taskId: null },
+      { id: "c1", name: `orchestra-exec-${EXEC}`, executionId: EXEC, taskId: TASK, owner: OWNER },
+      { id: "c2", name: "stray", executionId: "not-a-uuid", taskId: null, owner: OWNER },
     ]);
     expect(docker.calls[0]!.args).toEqual([
       "ps",
@@ -534,15 +547,34 @@ describe("dockerExecutionContainers", () => {
       "--no-trunc",
       "--filter",
       "label=orchestra.execution",
+      "--filter",
+      `label=orchestra.owner=${OWNER}`,
       "--format",
-      '{{.ID}}\t{{.Names}}\t{{.Label "orchestra.execution"}}\t{{.Label "orchestra.task"}}',
+      '{{.ID}}\t{{.Names}}\t{{.Label "orchestra.execution"}}\t{{.Label "orchestra.task"}}\t{{.Label "orchestra.owner"}}',
     ]);
     expect(docker.calls[0]!.options.timeoutMs).toBeGreaterThan(0);
   });
 
+  it("drops a listed row whose owner label is absent or another deployment's", async () => {
+    const docker = fakeDocker(() => ({
+      stdout: [
+        `c1\tmine\t${EXEC}\t${TASK}\t${OWNER}`,
+        `c2\ttheirs\t${EXEC}\t${TASK}\tffffffffffffffffffffffffffffffff`,
+        `c3\tnobody\t${EXEC}\t${TASK}\t`,
+      ].join("\n"),
+    }));
+    const listed = await dockerExecutionContainers({ owner: OWNER, run: docker.run }).list();
+    expect(listed.map((c) => c.id)).toEqual(["c1"]);
+  });
+
+  it.each(["", "a b", "a,b", "a=b", "-x", "x\ny"])("rejects owner %j", (owner) => {
+    expect(() => dockerExecutionContainers({ owner, run: fakeDocker().run })).toThrow(TypeError);
+    expect(() => manager(fakeDocker().run, { owner })).toThrow(TypeError);
+  });
+
   it("removes by execution id and by container id, idempotently", async () => {
     const docker = fakeDocker(() => NOT_FOUND);
-    const ops = dockerExecutionContainers(docker.run);
+    const ops = dockerExecutionContainers({ owner: OWNER, run: docker.run });
     await ops.removeForExecution(EXEC);
     await ops.remove("c1");
     expect(docker.calls.map((c) => c.args)).toEqual([
@@ -553,9 +585,97 @@ describe("dockerExecutionContainers", () => {
 
   it("raises DockerError when listing fails", async () => {
     const docker = fakeDocker(() => ({ exitCode: 1, stderr: "Cannot connect to the Docker daemon" }));
-    await expect(dockerExecutionContainers(docker.run).list()).rejects.toMatchObject({
+    await expect(
+      dockerExecutionContainers({ owner: OWNER, run: docker.run }).list(),
+    ).rejects.toMatchObject({
       reason: "unavailable",
     });
+  });
+});
+
+describe("the per-execution container lock and ensure mark (§6.6, §9.9 Recreation)", () => {
+  const exec = (n: number) => `aaaaaaaa-0000-4000-8000-${String(n).padStart(12, "0")}`;
+  let n = 0;
+
+  it("ensure records a new mark on every call, and remove clears it", async () => {
+    const id = exec(++n);
+    const docker = fakeDocker(freshHost());
+    const m = manager(docker.run);
+    expect(ensureMark(id)).toBe(0);
+
+    await m.ensure(ensureInput({ executionId: id }));
+    const first = ensureMark(id);
+    expect(first).toBeGreaterThan(0);
+    await m.ensure(ensureInput({ executionId: id }));
+    expect(ensureMark(id)).toBeGreaterThan(first);
+
+    await m.remove(id);
+    expect(ensureMark(id)).toBe(0);
+  });
+
+  it("remove clears the mark even when docker fails", async () => {
+    const id = exec(++n);
+    const m = manager(fakeDocker(freshHost()).run);
+    await m.ensure(ensureInput({ executionId: id }));
+    const failing = manager(fakeDocker(() => ({ exitCode: 1, stderr: "Error response from daemon: boom" })).run);
+    await expect(failing.remove(id)).rejects.toBeInstanceOf(DockerError);
+    expect(ensureMark(id)).toBe(0);
+  });
+
+  it("ensure waits while a removal holds the execution's lock, then recreates the removed container", async () => {
+    const id = exec(++n);
+    let removed = false;
+    const docker = fakeDocker(
+      freshHost((args) =>
+        args[0] === "container" && args[1] === "inspect" ? (removed ? NOT_FOUND : RUNNING) : undefined,
+      ),
+    );
+    const m = manager(docker.run);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((resolve) => (locked = resolve));
+
+    const removal = withExecutionContainerLock(id, async () => {
+      locked();
+      await held;
+      removed = true;
+    });
+    await isLocked;
+    const ensured = m.ensure(ensureInput({ executionId: id }));
+    for (let i = 0; i < 5; i++) await flush();
+    expect(docker.calls).toEqual([]);
+
+    release();
+    await removal;
+    const handle = await ensured;
+    expect(handle.created).toBe(true);
+    expect(docker.verbs()).toEqual(["container inspect", "network inspect", "run -d"]);
+  });
+
+  it("locks are per execution: another execution's ensure does not wait", async () => {
+    const a = exec(++n);
+    const b = exec(++n);
+    const docker = fakeDocker(freshHost());
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const removal = withExecutionContainerLock(a, () => held);
+    await expect(manager(docker.run).ensure(ensureInput({ executionId: b }))).resolves.toMatchObject({
+      created: true,
+    });
+    release();
+    await removal;
+  });
+
+  it("recreating a stopped container inside ensure does not deadlock on the lock ensure holds", async () => {
+    const id = exec(++n);
+    const docker = fakeDocker(
+      freshHost((args) => (args[0] === "container" && args[1] === "inspect" ? EXITED : undefined)),
+    );
+    await expect(manager(docker.run).ensure(ensureInput({ executionId: id }))).resolves.toMatchObject({
+      created: true,
+    });
+    expect(ensureMark(id)).toBeGreaterThan(0);
   });
 });
 

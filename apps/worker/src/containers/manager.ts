@@ -13,12 +13,30 @@ import {
   runDocker,
   type DockerRunner,
 } from "./docker.js";
+import { forgetEnsure, recordEnsure, withExecutionContainerLock } from "./guard.js";
 import { launchInContainer, createContainerSpawner, type ContainerSpawnerDeps } from "./spawner.js";
 
 /** The bridge network agent containers join (§9.9 Network). */
 export const AGENT_NETWORK = "orchestra-agents";
 export const EXECUTION_LABEL = "orchestra.execution";
 export const TASK_LABEL = "orchestra.task";
+/**
+ * The deployment that created the container: `deploymentOwner()` of its
+ * database (@orchestra/db). The sweeper touches only containers carrying
+ * its own value, so a second stack or a test run on the same Docker daemon
+ * keeps its containers.
+ */
+export const OWNER_LABEL = "orchestra.owner";
+
+/** An owner value safe inside `--label k=v` and `--filter label=k=v`. */
+const OWNER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
+function checkOwner(owner: string): string {
+  if (!OWNER_PATTERN.test(owner)) {
+    throw new TypeError(`container owner ${JSON.stringify(owner)} is not a plain identifier`);
+  }
+  return owner;
+}
 
 /** `docker run` can be slow on a cold daemon; everything else uses the default. */
 const CREATE_TIMEOUT_MS = 120_000;
@@ -43,10 +61,18 @@ export interface LabelledContainer {
   executionId: string;
   /** The `orchestra.task` label, null when absent. */
   taskId: string | null;
+  /** The `orchestra.owner` label, null when absent. */
+  owner: string | null;
 }
 
-/** What the worktree sweeper needs from Docker (§6.6, §9.9 Orphans). */
+/**
+ * What the worktree sweeper needs from Docker (§6.6, §9.9 Orphans). The
+ * removals take no lock: the caller holds `withExecutionContainerLock`.
+ */
 export interface ExecutionContainerOps {
+  /** This deployment's `orchestra.owner` value. */
+  readonly owner: string;
+  /** Containers labelled `orchestra.execution` and `orchestra.owner=<owner>`. */
   list(): Promise<LabelledContainer[]>;
   /** Removes `orchestra-exec-<executionId>`; succeeds when it is already gone. */
   removeForExecution(executionId: string): Promise<void>;
@@ -60,24 +86,55 @@ async function removeContainer(run: DockerRunner, ref: string, timeoutMs: number
   if (result.exitCode !== 0 && !isNotFound(result.stderr)) throw dockerFailure(args, result);
 }
 
-const LIST_FORMAT = `{{.ID}}\t{{.Names}}\t{{.Label "${EXECUTION_LABEL}"}}\t{{.Label "${TASK_LABEL}"}}`;
+const LIST_FORMAT = `{{.ID}}\t{{.Names}}\t{{.Label "${EXECUTION_LABEL}"}}\t{{.Label "${TASK_LABEL}"}}\t{{.Label "${OWNER_LABEL}"}}`;
 
-/** `ExecutionContainerOps` over the docker CLI. */
+export interface DockerExecutionContainersOptions {
+  /** This deployment's `orchestra.owner` value, from `deploymentOwner()`. */
+  owner: string;
+  /** Defaults to the docker CLI. */
+  run?: DockerRunner;
+  timeoutMs?: number;
+}
+
+/**
+ * `ExecutionContainerOps` over the docker CLI. `list` filters on both
+ * labels in the daemon and drops any row whose owner differs anyway.
+ */
 export function dockerExecutionContainers(
-  run: DockerRunner = runDocker,
-  timeoutMs: number = DOCKER_TIMEOUT_MS,
+  options: DockerExecutionContainersOptions,
 ): ExecutionContainerOps {
+  const owner = checkOwner(options.owner);
+  const run = options.run ?? runDocker;
+  const timeoutMs = options.timeoutMs ?? DOCKER_TIMEOUT_MS;
   return {
+    owner,
     async list() {
-      const args = ["ps", "-a", "--no-trunc", "--filter", `label=${EXECUTION_LABEL}`, "--format", LIST_FORMAT];
+      const args = [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        `label=${EXECUTION_LABEL}`,
+        "--filter",
+        `label=${OWNER_LABEL}=${owner}`,
+        "--format",
+        LIST_FORMAT,
+      ];
       const { stdout } = checkDocker(args, await run(args, { timeoutMs }));
       return stdout
         .split("\n")
         .filter((line) => line.trim() !== "")
         .map((line) => {
-          const [id = "", name = "", executionId = "", taskId = ""] = line.split("\t");
-          return { id, name, executionId, taskId: taskId === "" ? null : taskId };
-        });
+          const [id = "", name = "", executionId = "", taskId = "", label = ""] = line.split("\t");
+          return {
+            id,
+            name,
+            executionId,
+            taskId: taskId === "" ? null : taskId,
+            owner: label === "" ? null : label,
+          };
+        })
+        .filter((c) => c.owner === owner);
     },
     removeForExecution: (executionId) => removeContainer(run, containerName(executionId), timeoutMs),
     remove: (ref) => removeContainer(run, ref, timeoutMs),
@@ -93,6 +150,8 @@ export interface ContainerManagerOptions {
   cpus: number;
   /** `AGENT_CONTAINER_MEMORY`. */
   memory: string;
+  /** The `orchestra.owner` label value: `deploymentOwner()` of the worker's database. */
+  owner: string;
   /** Defaults to the docker CLI. Tests inject a fake. */
   run?: DockerRunner;
   /** Starts docker exec clients. Defaults to `spawnHostProcess`. */
@@ -179,6 +238,7 @@ export class ContainerManager {
   readonly #image: string;
   readonly #cpus: number;
   readonly #memory: string;
+  readonly #owner: string;
   readonly #run: DockerRunner;
   readonly #spawnClient: ProcessSpawner;
   readonly #binary: string;
@@ -195,6 +255,7 @@ export class ContainerManager {
     this.#image = options.image;
     this.#cpus = options.cpus;
     this.#memory = options.memory;
+    this.#owner = checkOwner(options.owner);
     this.#binary = options.binary ?? "docker";
     this.#hostEnv = options.hostEnv;
     this.#run =
@@ -205,7 +266,11 @@ export class ContainerManager {
     this.#network = options.network ?? AGENT_NETWORK;
     this.#timeoutMs = options.timeoutMs ?? DOCKER_TIMEOUT_MS;
     this.#logger = options.logger;
-    this.#ops = dockerExecutionContainers(this.#run, this.#timeoutMs);
+    this.#ops = dockerExecutionContainers({
+      owner: this.#owner,
+      run: this.#run,
+      timeoutMs: this.#timeoutMs,
+    });
   }
 
   /**
@@ -213,6 +278,12 @@ export class ContainerManager {
    * missing one is created, and a stopped or paused one is removed and
    * recreated, from this call's inputs: no state lives only in the
    * container, so a resume after a worker restart gets the same mounts.
+   *
+   * Runs under the execution's container lock and records a new ensure
+   * mark (see `guard.ts`), so a sweeper removal that decided before this
+   * call leaves the container alone, and one in progress finishes first.
+   * Never call it holding a database row lock: its docker calls can take
+   * minutes.
    */
   async ensure(input: EnsureContainerInput): Promise<AgentContainer> {
     const name = containerName(input.executionId);
@@ -230,10 +301,24 @@ export class ContainerManager {
     }
     await fs.mkdir(home, { recursive: true, mode: 0o700 });
     const handle = { name, executionId: input.executionId, taskId: input.taskId, worktreePath, home };
+    return withExecutionContainerLock(input.executionId, async () => {
+      recordEnsure(input.executionId);
+      return this.#ensureLocked(input, handle, repoPath);
+    });
+  }
+
+  async #ensureLocked(
+    input: EnsureContainerInput,
+    handle: Omit<AgentContainer, "created">,
+    repoPath: string,
+  ): Promise<AgentContainer> {
+    const { name, worktreePath, home } = handle;
+    const names = Object.keys(input.env);
 
     const state = await this.#inspect(name);
     if (state && isUsable(state)) return { ...handle, created: false };
-    if (state) await this.remove(input.executionId);
+    // Already under the lock: the raw removal, not `this.remove`.
+    if (state) await this.#ops.removeForExecution(input.executionId);
 
     await this.ensureNetwork();
     const readonly = input.role === "spec" ? ",readonly" : "";
@@ -247,6 +332,8 @@ export class ContainerManager {
       `${EXECUTION_LABEL}=${input.executionId}`,
       "--label",
       `${TASK_LABEL}=${input.taskId}`,
+      "--label",
+      `${OWNER_LABEL}=${this.#owner}`,
       "--user",
       `${this.#uid}:${this.#gid}`,
       "--cpus",
@@ -281,9 +368,19 @@ export class ContainerManager {
     return { ...handle, created: true };
   }
 
-  /** Removes the execution's container. Succeeds when it is already gone. */
+  /**
+   * Removes the execution's container under its container lock and clears
+   * its ensure mark, even when docker fails (a container left behind is the
+   * orphan pass's). Succeeds when it is already gone.
+   */
   remove(executionId: string): Promise<void> {
-    return this.#ops.removeForExecution(executionId);
+    return withExecutionContainerLock(executionId, async () => {
+      try {
+        await this.#ops.removeForExecution(executionId);
+      } finally {
+        forgetEnsure(executionId);
+      }
+    });
   }
 
   /** Creates the bridge network when it does not exist. */

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   and,
   asc,
@@ -507,6 +508,29 @@ export async function restoreEvictedWorktree(
       worktreeEvictedAt: null,
     })
     .where(eq(executions.id, executionId));
+}
+
+/**
+ * The value of the `orchestra.owner` label on the agent containers this
+ * deployment creates (design.md §9.9 "Orphans"): the first 32 hex digits of
+ * `sha256("<system_identifier>/<current_database()>")`. `system_identifier`
+ * is the random id `initdb` gives each Postgres cluster and the database
+ * name tells databases in one cluster apart, so two stacks, or a test run,
+ * on the same Docker daemon get different owners even when their
+ * connection strings look alike. Both are fixed for the life of the
+ * database, so the value survives worker restarts. It holds no credential
+ * or host name, only a digest of two non-secret identifiers.
+ */
+export async function deploymentOwner(db: DbOrTx): Promise<string> {
+  const rows = await db.execute<{ system_identifier: string; database: string }>(
+    sql`select system_identifier::text as system_identifier, current_database() as database from pg_control_system()`,
+  );
+  const row = rows[0];
+  if (!row) throw new Error("pg_control_system() returned no row");
+  return createHash("sha256")
+    .update(`${row.system_identifier}/${row.database}`)
+    .digest("hex")
+    .slice(0, 32);
 }
 
 /**
