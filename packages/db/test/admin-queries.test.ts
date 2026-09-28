@@ -15,6 +15,7 @@ import {
   updateRepository,
 } from "../src/queries/index.js";
 import * as schema from "../src/schema/index.js";
+import type { DbOrTx } from "../src/transition.js";
 import {
   seedExecution,
   seedFixtures,
@@ -62,7 +63,7 @@ function repoInput(projectId: string, name: string) {
 
 /** Inserts one task row with fields not covered by `seedTask`'s fixtures shape. */
 async function insertTaskRow(
-  db: TestDb["db"],
+  db: DbOrTx,
   input: {
     projectId: string;
     repositoryId: string | null;
@@ -381,63 +382,57 @@ describe("deleteRepository (GOT.52)", () => {
     expect(await getRepositoryById(h.db, fixtures.repositoryId)).not.toBeNull();
   });
 
-  it("is race-safe: a task insert cannot land on a repository this call is deleting (AC4)", async () => {
+  it("is race-safe: deleteRepository blocks behind an uncommitted referencing task insert, then sees it and blocks instead of deleting (AC4, F3)", async () => {
     const project = await insertProject(h.db, projectInput("DELR3"));
     const repo = await insertRepository(h.db, repoInput(project.id, "delr3-repo"));
 
-    let lockAcquired!: () => void;
-    const lockAcquiredPromise = new Promise<void>((resolve) => {
-      lockAcquired = resolve;
+    let taskInserted!: () => void;
+    const taskInsertedPromise = new Promise<void>((resolve) => {
+      taskInserted = resolve;
     });
-    let releaseDelete!: () => void;
-    const releaseDeletePromise = new Promise<void>((resolve) => {
-      releaseDelete = resolve;
-    });
-
-    const deletePromise = h.db.transaction(async (tx) => {
-      await tx
-        .select({ id: schema.repositories.id })
-        .from(schema.repositories)
-        .where(eq(schema.repositories.id, repo.id))
-        .for("update");
-      lockAcquired();
-      await releaseDeletePromise;
-      await tx
-        .delete(schema.repositories)
-        .where(eq(schema.repositories.id, repo.id));
+    let releaseInsertTx!: () => void;
+    const releaseInsertTxPromise = new Promise<void>((resolve) => {
+      releaseInsertTx = resolve;
     });
 
-    await lockAcquiredPromise;
-
-    let insertSettled = false;
-    const insertPromise = insertTaskRow(h.db, {
-      projectId: project.id,
-      repositoryId: repo.id,
-      jiraKey: "DELR3-1",
-    })
-      .then(() => {
-        insertSettled = true;
-      })
-      .catch((err) => {
-        insertSettled = true;
-        throw err;
+    // The insert's FK check takes a FOR KEY SHARE lock on the repository row
+    // and holds it for the life of this transaction, uncommitted.
+    const insertTxPromise = h.db.transaction(async (tx) => {
+      await insertTaskRow(tx, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "DELR3-1",
       });
+      taskInserted();
+      await releaseInsertTxPromise;
+    });
+    // Attached immediately so a rejection here (e.g. this transaction fails
+    // for an unrelated reason before `releaseInsertTx` is even called) can
+    // never surface as an unhandled rejection during the window below; the
+    // `await insertTxPromise` further down still observes the same outcome.
+    insertTxPromise.catch(() => {});
 
-    // The insert takes a FOR KEY SHARE lock on the repository row for its FK
-    // check, which conflicts with the delete transaction's FOR UPDATE: it
-    // must still be pending while that transaction holds the lock.
+    await taskInsertedPromise;
+
+    let deleteSettled = false;
+    const deletePromise = deleteRepository(h.db, repo.id).then((result) => {
+      deleteSettled = true;
+      return result;
+    });
+    deletePromise.catch(() => {});
+
+    // deleteRepository's own `SELECT ... FOR UPDATE` on the repository row
+    // conflicts with the insert transaction's FOR KEY SHARE lock: it must
+    // still be pending while that transaction holds the lock uncommitted.
     await sleep(200);
-    expect(insertSettled).toBe(false);
+    expect(deleteSettled).toBe(false);
 
-    releaseDelete();
-    await deletePromise;
+    releaseInsertTx();
+    await insertTxPromise;
 
-    await expect(insertPromise).rejects.toThrow();
-    const orphan = await h.db
-      .select()
-      .from(schema.tasks)
-      .where(eq(schema.tasks.jiraKey, "DELR3-1"));
-    expect(orphan).toHaveLength(0);
+    const result = await deletePromise;
+    expect(result).toEqual({ status: "blocked", taskCount: 1 });
+    expect(await getRepositoryById(h.db, repo.id)).not.toBeNull();
   });
 });
 
