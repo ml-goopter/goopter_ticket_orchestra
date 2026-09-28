@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { Readable } from "node:stream";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type {
   Options,
@@ -71,6 +72,9 @@ const UNKNOWN_ERROR = "unknown adapter error";
 /** Replacement for the execution token in anything the adapter emits. */
 const REDACTED = "[redacted]";
 
+/** Bytes of stderr kept for a crash message (matches codex.ts). */
+const STDERR_TAIL_BYTES = 4096;
+
 /**
  * Session ids are SDK-minted uuids. Anything else is rejected before it
  * reaches `join`, so `canResume` cannot be walked out of its root.
@@ -102,21 +106,25 @@ export class ClaudeAdapter implements AgentAdapter {
 
   readonly #query: ClaudeQueryFn;
   readonly #sessionRoot: string;
-  readonly #spawnProcess: SdkSpawnFn | undefined;
+  readonly #spawn: ProcessSpawner | undefined;
 
   constructor(options: ClaudeAdapterOptions = {}) {
     this.#query = options.query ?? sdkQuery;
     this.#sessionRoot = options.sessionRoot ?? defaultSessionRoot();
-    this.#spawnProcess =
-      options.spawn === undefined ? undefined : sdkSpawnFor(options.spawn);
+    this.#spawn = options.spawn;
   }
 
   start(req: StartRequest, signal: AbortSignal): AsyncIterable<AgentEvent> {
     const redact = redactorFor(req.mcp.token);
+    const stderrTail = this.#spawn
+      ? new StderrTail(STDERR_TAIL_BYTES, redact)
+      : undefined;
     let options: Options;
     try {
       options = { ...baseOptions(req), systemPrompt: req.systemPrompt };
-      if (this.#spawnProcess) options.spawnClaudeCodeProcess = this.#spawnProcess;
+      if (this.#spawn) {
+        options.spawnClaudeCodeProcess = sdkSpawnFor(this.#spawn, stderrTail!);
+      }
     } catch (error) {
       if (error instanceof InvalidTestCommandError) {
         return invalidTestCommandStream(error, redact);
@@ -130,23 +138,28 @@ export class ClaudeAdapter implements AgentAdapter {
       signal,
       // A fresh session has no earlier turns, so the runtime's cumulative
       // totals are already this session's totals.
-      { redact },
+      { redact, stderrTail },
     );
   }
 
   resume(req: ResumeRequest, signal: AbortSignal): AsyncIterable<AgentEvent> {
     const redact = redactorFor(req.mcp.token);
+    const stderrTail = this.#spawn
+      ? new StderrTail(STDERR_TAIL_BYTES, redact)
+      : undefined;
     let options: Options;
     try {
       options = { ...baseOptions(req), resume: req.sessionId };
-      if (this.#spawnProcess) options.spawnClaudeCodeProcess = this.#spawnProcess;
+      if (this.#spawn) {
+        options.spawnClaudeCodeProcess = sdkSpawnFor(this.#spawn, stderrTail!);
+      }
     } catch (error) {
       if (error instanceof InvalidTestCommandError) {
         return invalidTestCommandStream(error, redact);
       }
       throw error;
     }
-    const run: RunConfig = { redact };
+    const run: RunConfig = { redact, stderrTail };
     if (req.usageBaseline) run.usageBaseline = req.usageBaseline;
     return runQuery(this.#query, req.prompt, options, signal, run);
   }
@@ -193,9 +206,11 @@ type SdkSpawnFn = (options: SpawnOptions) => SpawnedProcess;
 /**
  * Adapts a `ProcessSpawner` to the SDK's `spawnClaudeCodeProcess` hook. The
  * SDK passes the CLI command, args, cwd and env; a missing cwd falls back to
- * the current directory, as a host spawn would.
+ * the current directory, as a host spawn would. `tail` collects a bounded,
+ * redacted copy of the process's stderr so a crash the SDK throws without its
+ * own diagnostic text still carries one (F1, design.md §7, §9.5).
  */
-function sdkSpawnFor(spawn: ProcessSpawner): SdkSpawnFn {
+function sdkSpawnFor(spawn: ProcessSpawner, tail: StderrTail): SdkSpawnFn {
   return (options) =>
     toSpawnedProcess(
       spawn(options.command, options.args, {
@@ -203,7 +218,52 @@ function sdkSpawnFor(spawn: ProcessSpawner): SdkSpawnFn {
         env: options.env,
       }),
       options.signal,
+      tail,
     );
+}
+
+/**
+ * Keeps the last `limit` characters of a spawned process's stderr, for a
+ * crash message the SDK throws with no diagnostic text of its own (F1: with a
+ * custom spawner, the SDK never reads stderr itself). Mirrors codex.ts's
+ * `TailCollector` — same byte budget, same order of operations.
+ *
+ * Redacts before it truncates. Truncating first can cut the token at the
+ * boundary and leave a fragment the whole-string redaction no longer
+ * matches; redacting the full accumulated text first means a token split
+ * across chunks is caught once its second half arrives, and any surviving
+ * token can only be a prefix at the tail truncation never reaches.
+ */
+class StderrTail {
+  #text = "";
+  readonly #limit: number;
+  readonly #redact: (text: string) => string;
+  readonly #decoder = new TextDecoder();
+
+  constructor(limit: number, redact: (text: string) => string) {
+    this.#limit = limit;
+    this.#redact = redact;
+  }
+
+  /**
+   * Attaches to `stream` and keeps draining it for as long as the process
+   * lives, so a stderr pipe nobody else reads cannot stall the CLI.
+   */
+  drain(stream: Readable): void {
+    stream.on("error", () => {
+      // A broken stderr pipe only loses crash detail.
+    });
+    stream.on("data", (chunk: Buffer | string) => {
+      const text =
+        typeof chunk === "string" ? chunk : this.#decoder.decode(chunk, { stream: true });
+      this.#text = this.#redact(this.#text + text).slice(-this.#limit);
+    });
+    stream.resume();
+  }
+
+  text(): string {
+    return this.#text;
+  }
 }
 
 type ExitListener = (code: number | null, signal: NodeJS.Signals | null) => void;
@@ -223,6 +283,7 @@ type ErrorListener = (error: Error) => void;
 function toSpawnedProcess(
   child: AgentProcess,
   signal: AbortSignal,
+  tail: StderrTail,
 ): SpawnedProcess {
   const events = new EventEmitter();
   let exited = false;
@@ -241,9 +302,9 @@ function toSpawnedProcess(
   };
 
   // The SDK reads stderr only from a process it spawned itself. Draining it
-  // keeps a full pipe from stalling the CLI.
-  child.stderr.on("error", () => {});
-  child.stderr.resume();
+  // keeps a full pipe from stalling the CLI, and `tail` keeps a bounded,
+  // redacted copy for the error event if the SDK throws without one.
+  tail.drain(child.stderr);
 
   void child.exit.then(
     (outcome) => {
@@ -362,6 +423,12 @@ interface RunConfig {
   redact: (text: string) => string;
   /** Usage already reported for a resumed session (design.md §9.7). */
   usageBaseline?: UsageBaseline;
+  /**
+   * Bounded, redacted tail of the spawned process's stderr (F1). Only set
+   * when a custom `ProcessSpawner` is in use; the SDK's own host-spawned CLI
+   * already reports its own stderr in the thrown error.
+   */
+  stderrTail?: StderrTail;
 }
 
 /**
@@ -410,7 +477,12 @@ async function* runQuery(
     // An abort unwinds the SDK by throwing. That is the cancel path, not a
     // failure, so the iterator just ends.
     if (signal.aborted || controller.signal.aborted) return;
-    const message = run.redact(errorText(error));
+    const base = run.redact(errorText(error));
+    // With a custom spawner the SDK attaches no stderr tail of its own to an
+    // exit error (F1), so the crash cause — an auth or quota message on
+    // stderr — would otherwise never reach `classifyRetriable`.
+    const detail = run.stderrTail?.text().trim();
+    const message = detail ? `${base}: ${detail}` : base;
     yield { type: "error", message, retriable: classifyRetriable(message) };
   } finally {
     signal.removeEventListener("abort", onAbort);

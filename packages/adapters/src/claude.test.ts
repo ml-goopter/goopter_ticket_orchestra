@@ -23,6 +23,7 @@ import {
   encodeProjectDir,
 } from "./claude.js";
 import { allowedToolsFor, builtinToolsFor } from "./policies.js";
+import { classifyRetriable } from "./retriable.js";
 import type {
   AgentProcess,
   ProcessExit,
@@ -1592,5 +1593,116 @@ describe("ClaudeAdapter process spawner (design.md §9.9)", () => {
       expect(stderr.readableFlowing).toBe(true);
       expect(stderr.readableLength).toBe(0);
     });
+  });
+});
+
+// --- stderr tail on a spawner crash (F1, design.md §7.1, §9.5) -------------
+
+/**
+ * Scripts a query that spawns through the SDK's hook, writes `stderrText` to
+ * the spawned process's stderr, exits it non-zero, then throws `thrown` —
+ * the shape of a real crash: with a custom spawner the SDK's own thrown exit
+ * error carries no stderr text of its own (F1).
+ */
+function crashingSpawnerQuery(
+  spawner: ReturnType<typeof recordingSpawner>,
+  stderrText: string,
+  thrown: string,
+): Fake {
+  return fakeQuery(async function* (_self, call) {
+    const hook = call.options?.spawnClaudeCodeProcess;
+    if (!hook) throw new Error("no spawner installed");
+    hook(sdkSpawnOptions(call.options?.abortController?.signal));
+    const child = spawner.children[0]!.process.stderr as PassThrough;
+    child.write(stderrText);
+    await tick();
+    spawner.children[0]!.exit({ code: 1, signal: null });
+    await tick();
+    throw new Error(thrown);
+  });
+}
+
+describe("ClaudeAdapter stderr tail on a spawner crash (F1, design.md §7.1, §9.5)", () => {
+  it("includes the spawned process's stderr in the thrown error and reclassifies it via classifyRetriable", async () => {
+    const spawner = recordingSpawner();
+    // The thrown SDK error alone ("exited with code 1") matches no terminal
+    // pattern, so without the stderr tail this would wrongly retry a
+    // terminal auth failure.
+    const fake = crashingSpawnerQuery(
+      spawner,
+      "authentication_failed: invalid api key\n",
+      "Claude Code process exited with code 1",
+    );
+    const adapter = new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn });
+
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+
+    expect(events).toHaveLength(1);
+    const error = events[0] as { type: string; message: string; retriable: boolean };
+    expect(error.type).toBe("error");
+    expect(error.message).toContain("Claude Code process exited with code 1");
+    expect(error.message).toContain("authentication_failed: invalid api key");
+    expect(error.retriable).toBe(classifyRetriable(error.message));
+    expect(error.retriable).toBe(false);
+  });
+
+  it("redacts the execution token out of the stderr tail", async () => {
+    const spawner = recordingSpawner();
+    const fake = crashingSpawnerQuery(
+      spawner,
+      `fatal: request failed, Authorization: Bearer ${TOKEN}\n`,
+      "Claude Code process exited with code 1",
+    );
+    const adapter = new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn });
+
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+
+    expect(JSON.stringify(events)).not.toContain(TOKEN);
+    const error = events[0] as { message: string };
+    expect(error.message).toContain("[redacted]");
+  });
+
+  it("keeps only the last 4096 characters of a long stderr stream", async () => {
+    const spawner = recordingSpawner();
+    const filler = "x".repeat(5000);
+    const fake = crashingSpawnerQuery(
+      spawner,
+      `${filler}TAIL-MARKER`,
+      "Claude Code process exited with code 1",
+    );
+    const adapter = new ClaudeAdapter({ query: fake.fn, spawn: spawner.spawn });
+
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+
+    const error = events[0] as { message: string };
+    expect(error.message).toContain("TAIL-MARKER");
+    const detail = error.message.split("Claude Code process exited with code 1: ")[1]!;
+    expect(detail.length).toBeLessThanOrEqual(4096);
+  });
+
+  it("does not append a stderr tail when no spawner is configured", async () => {
+    // eslint-disable-next-line require-yield
+    const fake = fakeQuery(async function* () {
+      throw new Error("Claude Code process exited with code 1");
+    });
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+
+    expect(events).toEqual([
+      {
+        type: "error",
+        message: "Claude Code process exited with code 1",
+        retriable: true,
+      },
+    ]);
   });
 });
