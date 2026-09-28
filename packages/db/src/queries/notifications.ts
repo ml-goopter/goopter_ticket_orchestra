@@ -66,3 +66,27 @@ export async function markNotificationRead(
   }
   return row;
 }
+
+/**
+ * Sets `read_at = now` on every unread `ready_for_merge` notification on
+ * `taskId`, broadcast rows (`user_id` null) included. Called from the same
+ * transaction that transitions the task to `DONE` on a merge (GOT.U6): once
+ * the PR is merged, "ready for merge" is no longer actionable. Other kinds,
+ * other tasks, and already-read rows are untouched.
+ */
+export async function clearReadyForMergeNotifications(
+  tx: Tx,
+  taskId: string,
+  now: Date,
+): Promise<void> {
+  await tx
+    .update(notifications)
+    .set({ readAt: now })
+    .where(
+      and(
+        eq(notifications.taskId, taskId),
+        eq(notifications.kind, "ready_for_merge"),
+        isNull(notifications.readAt),
+      ),
+    );
+}

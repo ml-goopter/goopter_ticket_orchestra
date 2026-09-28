@@ -499,6 +499,11 @@ describe("F3 regression: stale head sha guard covers the passed and merged paths
       merged_at: "2026-09-25T09:00:00.000Z",
       head_sha: "sha-merged-stale",
     });
+    // U6 (AC3): a stale merge must mark nothing, including notifications.
+    const [readyUnread] = await db
+      .insert(notifications)
+      .values({ taskId: s.taskId, kind: "ready_for_merge", title: "ready" })
+      .returning({ id: notifications.id });
     // Same race, on the merged path: someone pushed a new commit to the same
     // open PR (which the outer poller loop had already listed with the old
     // sha) between the GitHub fetch and the lock.
@@ -528,6 +533,9 @@ describe("F3 regression: stale head sha guard covers the passed and merged paths
     expect(pr.state).toBe("open");
     expect(pr.headSha).toBe("sha-merged-stale-newer");
     expect(pr.lastPolledAt.toISOString()).toBe(polledAt.toISOString());
+    // U6 (AC3): the stale merge marked nothing, including the notification.
+    const notes = await notificationsFor(s.taskId);
+    expect(notes.find((n) => n.id === readyUnread!.id)!.readAt).toBeNull();
   });
 });
 
@@ -566,6 +574,35 @@ describe("AC4: merged", () => {
     });
     const client = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
 
+    // U6: an earlier CI-passed poll already left an unread ready_for_merge
+    // notification on this task; also seed an already-read one, a
+    // ready_for_merge on a different task, and an issue_raised on the same
+    // task, to prove the merge's transaction clears only the stale kind on
+    // this task without touching the others.
+    const [readyUnread] = await db
+      .insert(notifications)
+      .values({ taskId: s.taskId, kind: "ready_for_merge", title: "ready 1" })
+      .returning({ id: notifications.id });
+    const alreadyReadAt = new Date("2026-09-20T00:00:00.000Z");
+    const [readyAlreadyRead] = await db
+      .insert(notifications)
+      .values({
+        taskId: s.taskId,
+        kind: "ready_for_merge",
+        title: "ready 0",
+        readAt: alreadyReadAt,
+      })
+      .returning({ id: notifications.id });
+    const [blocking] = await db
+      .insert(notifications)
+      .values({ taskId: s.taskId, kind: "issue_raised", title: "blocked" })
+      .returning({ id: notifications.id });
+    const otherTask = await seedOpenPullRequest({ taskState: "READY_FOR_MERGE", headSha: "sha-5b" });
+    const [readyOtherTask] = await db
+      .insert(notifications)
+      .values({ taskId: otherTask.taskId, kind: "ready_for_merge", title: "ready elsewhere" })
+      .returning({ id: notifications.id });
+
     // F6 regression: a merged poll updates last_polled_at too.
     const polledAt = new Date(NOW.getTime() + 60_000);
     await run(client, () => polledAt);
@@ -576,6 +613,19 @@ describe("AC4: merged", () => {
     expect(pr.mergedAt?.toISOString()).toBe("2026-09-25T09:00:00.000Z");
     expect(await eventsOf(s.taskId, "pull_request.merged")).toHaveLength(1);
     expect(pr.lastPolledAt.toISOString()).toBe(polledAt.toISOString());
+
+    // U6: the stale ready_for_merge notification is now read, in the same
+    // transaction as the DONE move; everything else is untouched.
+    const notes = await notificationsFor(s.taskId);
+    expect(notes.find((n) => n.id === readyUnread!.id)!.readAt?.toISOString()).toBe(
+      polledAt.toISOString(),
+    );
+    expect(notes.find((n) => n.id === readyAlreadyRead!.id)!.readAt?.toISOString()).toBe(
+      alreadyReadAt.toISOString(),
+    );
+    expect(notes.find((n) => n.id === blocking!.id)!.readAt).toBeNull();
+    const otherNotes = await notificationsFor(otherTask.taskId);
+    expect(otherNotes.find((n) => n.id === readyOtherTask!.id)!.readAt).toBeNull();
   });
 
   it("CI_RUNNING -> ci.passed then DONE in one transaction", async () => {
@@ -588,6 +638,16 @@ describe("AC4: merged", () => {
       head_sha: "sha-6",
     });
     const client = createGitHubClient({ token: "t", fetchImpl: gh.fetchImpl });
+
+    // U6: no ready_for_merge notification is created on the CI_RUNNING path
+    // (only the ci.passed -> READY_FOR_MERGE branch of markPullRequestCi
+    // does that, and this poll never takes it — it goes straight to DONE via
+    // markPullRequestMerged, C34). Seed one anyway, as if left over from an
+    // earlier poll, to prove the clear runs in this transaction too.
+    const [readyUnread] = await db
+      .insert(notifications)
+      .values({ taskId: s.taskId, kind: "ready_for_merge", title: "ready" })
+      .returning({ id: notifications.id });
 
     await run(client);
 
@@ -602,6 +662,11 @@ describe("AC4: merged", () => {
     // F4 regression (C51): the READY_FOR_MERGE state_changed event is marked
     // so the Jira write-back selector skips announcing "CI passed" for it.
     expect(stateChanges[0]!.payload).toMatchObject({ via: "merged_externally" });
+
+    const notes = await notificationsFor(s.taskId);
+    expect(notes.find((n) => n.id === readyUnread!.id)!.readAt?.toISOString()).toBe(
+      NOW.toISOString(),
+    );
   });
 });
 
