@@ -4,6 +4,7 @@ import {
   listDependencies,
   lockDependencyGraph,
   lockTaskForPromotion,
+  repositories,
   specificationRevisions,
   transition,
 } from "@orchestra/db";
@@ -66,6 +67,21 @@ async function newTask(
   const key = nextKey();
   const id = await seedTask(h.db, fx, { jiraKey: key, state, ...extra });
   return { id, key };
+}
+
+/** Inserts a repository under `fx`'s project that isn't shared with other tests. */
+async function newRepo(name: string): Promise<string> {
+  const [row] = await h.db
+    .insert(repositories)
+    .values({
+      projectId: fx.projectId,
+      name,
+      gitUrl: `git@example.com:goopter/${name}.git`,
+      defaultBranch: "main",
+      defaultRuntime: "claude",
+    })
+    .returning({ id: repositories.id });
+  return row!.id;
 }
 
 function content(overrides: Partial<SpecContent> = {}): SpecContent {
@@ -997,6 +1013,79 @@ describe("concurrency (P10)", () => {
     await holder;
     expect((await approving).statusCode).toBe(200);
     expect((await taskRow(waiting.id)).state).toBe("SPEC_APPROVED");
+  });
+
+  // GOT.52 F2: a repository delete committing between approve's repository
+  // lookup and its write of `tasks.repository_id` used to surface as an
+  // uncaught FK violation (23503), a 500. `findProjectRepositoryByName` now
+  // locks the row it resolves, the same lock `deleteRepository` takes, so
+  // the two serialise instead. Each test below holds one side's transaction
+  // open on that lock to force the interleaving deterministically.
+  it("repository delete blocks behind an approval holding the repository lock, then sees the task and returns 409 (never 500)", async () => {
+    const repoId = await newRepo("race-approve-wins-repo");
+    const { id: taskId } = await newTask("SPEC_REVIEW");
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = h.sql.begin(async (sql) => {
+      // Mirrors findProjectRepositoryByName's locked read.
+      await sql`select id from repositories where id = ${repoId} for update`;
+      await held;
+      // Mirrors approve's write: the task now references the locked repository.
+      await sql`update tasks set repository_id = ${repoId} where id = ${taskId}`;
+    });
+
+    const deleting = app.inject({
+      method: "DELETE",
+      url: `/api/repositories/${repoId}`,
+      headers: { cookie },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(
+      await h.sql`select id from repositories where id = ${repoId}`,
+    ).toHaveLength(1);
+
+    release();
+    await holder;
+
+    const res = await deleting;
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({
+      error: { code: "REFERENCED_BY_TASKS", task_count: 1 },
+    });
+    expect(
+      await h.sql`select id from repositories where id = ${repoId}`,
+    ).toHaveLength(1);
+  });
+
+  it("approval blocks behind a repository delete holding the repository lock, then sees it gone and returns 422 (never 500)", async () => {
+    const repoId = await newRepo("race-delete-wins-repo");
+    const { id: taskId } = await newTask("SPEC_REVIEW", { withRepository: false });
+    await seedRevision(taskId, 1, "draft", content({ repository: "race-delete-wins-repo" }));
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = h.sql.begin(async (sql) => {
+      await sql`select id from repositories where id = ${repoId} for update`;
+      await held;
+      await sql`delete from repositories where id = ${repoId}`;
+    });
+
+    const approving = post(`/api/tasks/${taskId}/spec/approve`);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect((await taskRow(taskId)).state).toBe("SPEC_REVIEW");
+
+    release();
+    await holder;
+
+    const res = await approving;
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe("SPEC_INVALID");
+    expect(res.json().error.message).toContain("does not resolve");
   });
 });
 

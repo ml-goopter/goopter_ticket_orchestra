@@ -1,6 +1,7 @@
 import { RuntimeSchema } from "@orchestra/core";
 import {
   UniqueViolationError,
+  deleteRepository,
   getProjectById,
   getRepositoryById,
   insertRepository,
@@ -136,6 +137,14 @@ function conflict(): AppError {
   );
 }
 
+/** design.md §12.5. Not applied to GET/PATCH above; only DELETE needs it here (GOT.52). */
+function parseId(id: string): string {
+  if (!isUuid(id)) {
+    throw new AppError(400, "VALIDATION_ERROR", "id must be a uuid");
+  }
+  return id;
+}
+
 /** Admin routes for `repositories` (design.md §12.5, §4.2). */
 export default async function repositoriesRoutes(
   app: FastifyInstance,
@@ -247,5 +256,27 @@ export default async function repositoriesRoutes(
       if (err instanceof UniqueViolationError) throw conflict();
       throw err;
     }
+  });
+
+  /**
+   * Tracker GOT.52 O1: deletes only when no task references this
+   * repository; otherwise 409 with the reason and referencing task count,
+   * nothing deleted.
+   */
+  app.delete<{ Params: { id: string } }>("/:id", async (request, reply) => {
+    const id = parseId(request.params.id);
+    const result = await deleteRepository(app.db, id);
+    if (result.status === "not_found") throw notFound(id);
+    if (result.status === "blocked") {
+      reply.code(409);
+      return {
+        error: {
+          code: "REFERENCED_BY_TASKS",
+          message: `Cannot delete: ${result.taskCount} task(s) reference this repository.`,
+          task_count: result.taskCount,
+        },
+      };
+    }
+    reply.code(204);
   });
 }

@@ -204,13 +204,24 @@ export interface ProjectRepository {
   defaultRuntime: Runtime;
 }
 
-/** The repository named `name` within `projectId` (unique on `(project_id, name)`), or `null`. */
+/**
+ * The repository named `name` within `projectId` (unique on `(project_id,
+ * name)`), or `null`. Locks the row `FOR UPDATE` (GOT.52 F2): approval later
+ * writes this id onto the task's `repository_id` FK in the same transaction,
+ * so the lookup takes the same `FOR UPDATE` `deleteRepository` takes before
+ * it counts referencing tasks. That serialises the two: whichever
+ * transaction's lookup/delete lands first blocks the other until it commits
+ * or rolls back, so a delete can never commit between this read and
+ * approval's write (which would otherwise surface as an uncaught FK
+ * violation, 23503, mapped to a 500). Callers must hold `tx` open across
+ * that later write for the lock to do anything.
+ */
 export async function findProjectRepositoryByName(
-  db: DbOrTx,
+  tx: Tx,
   projectId: string,
   name: string,
 ): Promise<ProjectRepository | null> {
-  const [row] = await db
+  const [row] = await tx
     .select({
       id: repositories.id,
       name: repositories.name,
@@ -220,7 +231,8 @@ export async function findProjectRepositoryByName(
     .where(
       and(eq(repositories.projectId, projectId), eq(repositories.name, name)),
     )
-    .limit(1);
+    .limit(1)
+    .for("update");
   return row ?? null;
 }
 
