@@ -24,7 +24,21 @@ export interface JiraSearchIssue {
   /** Priority `id` parsed as an integer; see `parseJiraPriority` for the sentinel. */
   priority: number;
   createdAt: Date;
+  /**
+   * `fields.status.statusCategory.key` (`new`, `indeterminate`, `done`), or
+   * null when Jira omits it (GOT.77). Only `done` means closed.
+   */
+  statusCategory: string | null;
 }
+
+/** A single ticket's status, as returned by `getIssueStatus` (GOT.77). */
+export interface JiraIssueStatus {
+  /** Same meaning as `JiraSearchIssue.statusCategory`. */
+  statusCategory: string | null;
+}
+
+/** Jira's status category key for a closed ticket (GOT.77). */
+export const JIRA_DONE_STATUS_CATEGORY = "done";
 
 /** `tasks.jira_priority` is Postgres `int4`; nothing stored may exceed this. */
 const INT4_MAX = 2_147_483_647;
@@ -78,8 +92,11 @@ export const DEFAULT_JIRA_REQUEST_TIMEOUT_MS = 30_000;
 export interface JiraClient {
   /** Pages through every result of `jql`, in order (design.md §11.1, E1). */
   search(jql: string): Promise<JiraSearchIssue[]>;
-  /** True on 200, false on 404. Throws `JiraApiError` on any other status. */
-  issueExists(key: string): Promise<boolean>;
+  /**
+   * The ticket's status category on 200, null on 404 (design.md §11.1 E3,
+   * GOT.77). Throws `JiraApiError` on any other status.
+   */
+  getIssueStatus(key: string): Promise<JiraIssueStatus | null>;
   /** Full ticket content, ADF fields rendered to plain text (design.md §9.2, Q3). */
   getIssue(key: string): Promise<TicketContext>;
   /**
@@ -90,8 +107,8 @@ export interface JiraClient {
   addComment(key: string, bodyText: string): Promise<void>;
 }
 
-const SEARCH_FIELDS = "summary,priority,created";
-const EXISTS_FIELDS = "summary";
+const SEARCH_FIELDS = "summary,priority,created,status";
+const STATUS_FIELDS = "status";
 const ISSUE_FIELDS = "summary,description,comment";
 const DEFAULT_PAGE_SIZE = 100;
 
@@ -101,7 +118,21 @@ interface JiraSearchApiIssue {
     summary: string;
     priority?: { id?: string | number | null } | null;
     created: string;
+    status?: JiraApiStatus | null;
   };
+}
+
+interface JiraApiStatus {
+  statusCategory?: { key?: string | null } | null;
+}
+
+interface JiraIssueStatusApiResponse {
+  fields?: { status?: JiraApiStatus | null } | null;
+}
+
+function parseStatusCategory(status: JiraApiStatus | null | undefined): string | null {
+  const key = status?.statusCategory?.key;
+  return typeof key === "string" && key !== "" ? key : null;
 }
 
 interface JiraSearchApiResponse {
@@ -194,6 +225,7 @@ export function createJiraClient(config: JiraClientConfig): JiraClient {
             summary: issue.fields.summary,
             priority: parseJiraPriority(issue.fields.priority?.id),
             createdAt: new Date(issue.fields.created),
+            statusCategory: parseStatusCategory(issue.fields.status),
           });
         }
 
@@ -213,19 +245,20 @@ export function createJiraClient(config: JiraClientConfig): JiraClient {
       return issues;
     },
 
-    async issueExists(key) {
+    async getIssueStatus(key) {
       const res = await request(
         `/rest/api/3/issue/${encodeURIComponent(key)}`,
-        { fields: EXISTS_FIELDS },
+        { fields: STATUS_FIELDS },
       );
-      if (res.status === 404) return false;
+      if (res.status === 404) return null;
       if (!res.ok) {
         throw new JiraApiError(
           res.status,
           `Jira issue lookup for ${key} failed with status ${res.status}`,
         );
       }
-      return true;
+      const body = (await res.json()) as JiraIssueStatusApiResponse;
+      return { statusCategory: parseStatusCategory(body.fields?.status) };
     },
 
     async getIssue(key) {

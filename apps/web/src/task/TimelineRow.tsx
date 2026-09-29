@@ -14,6 +14,55 @@ export interface TimelineRowProps {
 }
 
 /**
+ * Cap on the pretty-printed JSON shown for a tool call's input or an
+ * unknown event's raw payload (GOT.65). Both come from event producers
+ * outside this app's control and can be arbitrarily large; without a cap,
+ * expanding a `<details>` disclosure containing one can render and lay out
+ * a multi-megabyte `<pre>` block, visibly slowing (or freezing) the tab.
+ * A few thousand characters is enough to show useful context while keeping
+ * the DOM node small.
+ */
+const JSON_PREVIEW_LIMIT = 4000;
+
+/**
+ * Pretty-prints `value` the same way `JSON.stringify(value, null, 2)` always
+ * has, capped at `JSON_PREVIEW_LIMIT` characters (GOT.65, AC1: never an
+ * unbounded JSON string). A payload at or under the cap renders identically
+ * to before; over the cap, the text is cut at the limit and the caller
+ * shows `omittedChars` in a truncation notice.
+ */
+function previewJson(value: unknown): { text: string; omittedChars: number } {
+  const full = JSON.stringify(value, null, 2);
+  if (full.length <= JSON_PREVIEW_LIMIT) {
+    return { text: full, omittedChars: 0 };
+  }
+  // Cutting at JSON_PREVIEW_LIMIT can land between the two UTF-16 code units
+  // of an astral character (e.g. an emoji), leaving a lone high surrogate at
+  // the end of the preview. Pull the cut back one code unit in that case so
+  // the preview never ends mid-pair.
+  let cut = JSON_PREVIEW_LIMIT;
+  const lastCode = full.charCodeAt(cut - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    cut -= 1;
+  }
+  return { text: full.slice(0, cut), omittedChars: full.length - cut };
+}
+
+function JsonPreview({ value }: { value: unknown }) {
+  const { text, omittedChars } = previewJson(value);
+  return (
+    <>
+      <pre>{text}</pre>
+      {omittedChars > 0 && (
+        <p className="timeline-item__truncated" data-testid="json-truncated-notice">
+          Truncated — {formatNumber(omittedChars)} more character{omittedChars === 1 ? "" : "s"} not shown.
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
  * One timeline row (design.md §14 Task detail, task contract C): a compact
  * one-liner -- type label, one-line human summary, relative `Time`
  * right-aligned, all on one flex row (T1 fix: was a ~90px bordered card per
@@ -59,7 +108,7 @@ function TimelineRowBody({ item, taskId }: TimelineRowProps) {
       return (
         <details className="timeline-item__disclosure">
           <summary>{item.toolName}</summary>
-          <pre>{JSON.stringify(item.toolInput, null, 2)}</pre>
+          <JsonPreview value={item.toolInput} />
           {item.toolOk === false && (
             <p className="timeline-item__tool-error" role="alert">
               {item.toolError ?? "Tool call failed."}
@@ -158,7 +207,7 @@ function TimelineRowBody({ item, taskId }: TimelineRowProps) {
       return (
         <details className="timeline-item__disclosure">
           <summary>Details</summary>
-          <pre>{JSON.stringify(item.payload, null, 2)}</pre>
+          <JsonPreview value={item.payload} />
         </details>
       );
   }

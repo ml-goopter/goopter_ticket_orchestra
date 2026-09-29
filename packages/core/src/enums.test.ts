@@ -97,6 +97,7 @@ const EXPECTED = {
     "needs_human",
     "ready_for_merge",
     "execution_failed",
+    "jira_out_of_scope",
   ],
   actor_kind: ["user", "worker", "agent", "system"],
   revision_status: ["draft", "approved", "superseded"],

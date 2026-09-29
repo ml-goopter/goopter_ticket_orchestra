@@ -350,6 +350,51 @@ describe("listWorkersWithSlots (AC4, AC6)", () => {
     expect(row).toBeDefined();
     expect(row?.freeSlots).toBe(0);
   });
+
+  it("does not count an idle spec session (RUNNING, no token) as a used slot, but does count one mid-turn (GOT.82)", async () => {
+    const fixtures = await seedFixtures(h.db, "ADMW3");
+    const taskId = await seedTask(h.db, fixtures, {
+      jiraKey: "ADMW3-1",
+      state: "NEEDS_SPEC",
+    });
+
+    const now = new Date("2026-01-01T00:01:30Z");
+    const [worker] = await h.db
+      .insert(schema.agentWorkers)
+      .values({
+        host: "admq-worker-3",
+        capabilities: ["node"],
+        maxConcurrent: 2,
+        workspaceRoot: "/srv/orchestra",
+        lastHeartbeatAt: new Date("2026-01-01T00:00:00Z"),
+        startedAt: new Date("2026-01-01T00:00:00Z"),
+      })
+      .returning({ id: schema.agentWorkers.id });
+
+    const idleSpecId = await seedExecution(h.db, taskId, {
+      role: "spec",
+      state: "RUNNING",
+    });
+    const midTurnSpecId = await seedExecution(h.db, taskId, {
+      role: "spec",
+      state: "RUNNING",
+      attempt: 2,
+    });
+    await h.db
+      .update(schema.executions)
+      .set({ host: "admq-worker-3" })
+      .where(inArray(schema.executions.id, [idleSpecId, midTurnSpecId]));
+    await h.db
+      .update(schema.executions)
+      .set({ toolsTokenHash: "admw3-mid-turn-token" })
+      .where(eq(schema.executions.id, midTurnSpecId));
+
+    const rows = await listWorkersWithSlots(h.db, now);
+    const row = rows.find((r) => r.id === worker!.id);
+    expect(row).toBeDefined();
+    // Only the mid-turn spec session holds a slot: max_concurrent (2) - 1.
+    expect(row?.freeSlots).toBe(1);
+  });
 });
 
 describe("deleteRepository (GOT.52)", () => {
