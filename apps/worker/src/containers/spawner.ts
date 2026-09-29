@@ -46,12 +46,20 @@ function signalName(signal: NodeJS.Signals): string {
 }
 
 /**
- * The variables of one spawn that go into the container: those whose name
- * the worker's own environment does not define (for example the turn's
- * `ORCHESTRA_TOKEN`, or a variable the agent SDK adds). Adapters build a
- * spawn's env from the whole worker environment, so a name the worker
- * defines is never forwarded here; long-lived credentials enter the
- * container only through `ContainerManager.ensure`'s env (§9.9).
+ * The turn's own variables (§9.9 Environment), set by the runner on every
+ * spawn. They go into the container even when the worker's environment
+ * defines the same name, whose value the turn's replaces (C4 F2).
+ */
+const TURN_ENV_NAMES: ReadonlySet<string> = new Set(["ORCHESTRA_TOKEN", "ORCHESTRA_URL"]);
+
+/**
+ * The variables of one spawn that go into the container: the turn's
+ * `ORCHESTRA_TOKEN` and `ORCHESTRA_URL` always, and otherwise those whose
+ * name the worker's own environment does not define (for example a
+ * variable the agent SDK adds). Adapters build a spawn's env from the whole
+ * worker environment, so any other name the worker defines is never
+ * forwarded here; long-lived credentials enter the container only through
+ * `ContainerManager.ensure`'s env (§9.9).
  */
 function perSpawnEnv(
   env: Record<string, string | undefined>,
@@ -60,7 +68,7 @@ function perSpawnEnv(
   const forwarded: Record<string, string> = {};
   for (const [name, value] of Object.entries(env)) {
     if (value === undefined || !isForwardableEnvName(name)) continue;
-    if (Object.prototype.hasOwnProperty.call(hostEnv, name)) continue;
+    if (!TURN_ENV_NAMES.has(name) && Object.prototype.hasOwnProperty.call(hostEnv, name)) continue;
     forwarded[name] = value;
   }
   return forwarded;

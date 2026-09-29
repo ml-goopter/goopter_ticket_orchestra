@@ -274,6 +274,14 @@ export class ContainerManager {
   }
 
   /**
+   * `<root>/agent-home/<taskId>`, the container's `$HOME` that `ensure`
+   * mounts (§9.9 Mounts). The runner reads session stores under it.
+   */
+  agentHome(taskId: string): string {
+    return path.join(this.#root, "agent-home", taskId);
+  }
+
+  /**
    * Returns the execution's container, running. A running one is reused. A
    * missing one is created, and a stopped or paused one is removed and
    * recreated, from this call's inputs: no state lives only in the

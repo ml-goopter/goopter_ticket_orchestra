@@ -2,13 +2,19 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClaudeAdapter, CodexAdapter } from "@orchestra/adapters";
-import { createDb, type Db } from "@orchestra/db";
+import { createDb, deploymentOwner, type Db } from "@orchestra/db";
 import {
   DEFAULT_AGENT_TOOLS_HOST,
   createAgentToolsServer,
   createExecutionRegistry,
 } from "./agent-tools/index.js";
 import { ConfigError, loadConfig, redactConfig } from "./config.js";
+import {
+  detectDockerCapability,
+  startDockerStack,
+  workerCapabilities,
+  type DockerStack,
+} from "./containers/index.js";
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   startHeartbeat,
@@ -21,6 +27,7 @@ import { loadPricing, PricingFileError } from "./pricing/index.js";
 import { registerWorker } from "./registration.js";
 import {
   createCommandHandlers,
+  createContainerAdapter,
   createIssueMessageHandler,
   createRunner,
   registerCancelHandler,
@@ -78,9 +85,22 @@ async function main(): Promise<void> {
   const logger = createLogger({ level: config.logLevel, host: config.host });
   const db = createDb(config.databaseUrl);
 
+  // design.md §9.9 Scheduling: the `docker` capability when `docker info`
+  // succeeds and the configured image is present. Without it the worker
+  // never touches Docker again.
+  const docker = await detectDockerCapability({ image: config.agentContainerImage });
+  if (docker.available) {
+    logger.info({ image: config.agentContainerImage }, "docker available, container mode enabled");
+  } else {
+    logger.info({ reason: docker.reason }, "docker not available, container mode disabled");
+  }
+
   let workerId: string;
   try {
-    workerId = await registerWorker(db, config);
+    workerId = await registerWorker(db, {
+      ...config,
+      capabilities: workerCapabilities(config.capabilities, docker.available),
+    });
   } catch (err) {
     logger.error(
       { err: err instanceof Error ? err.message : String(err) },
@@ -133,6 +153,33 @@ async function main(): Promise<void> {
     );
     await closeDb(db).catch(() => {});
     process.exit(1);
+  }
+
+  // design.md §9.9: only a docker-capable worker builds the container stack:
+  // one deployment owner for the manager and the sweeper's cleanup, and the
+  // agent-tools container listener. If that fails the worker runs host mode
+  // only and re-registers without the capability.
+  let dockerStack: DockerStack | undefined;
+  if (docker.available) {
+    try {
+      const owner = await deploymentOwner(db);
+      dockerStack = await startDockerStack({
+        config,
+        owner,
+        toolsServer,
+        logger: log.child({ component: "containers" }),
+      });
+      log.info({ containerToolsUrl: dockerStack.toolsUrl() }, "agent container stack ready");
+    } catch (err) {
+      log.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "agent container stack failed to start; container mode disabled",
+      );
+      await registerWorker(db, {
+        ...config,
+        capabilities: workerCapabilities(config.capabilities, false),
+      });
+    }
   }
 
   const stopHeartbeat = startHeartbeat(db, workerId, { logger: log });
@@ -197,6 +244,25 @@ async function main(): Promise<void> {
     ...(jira ? { fetchTicket: (key: string) => jira.getIssue(key) } : {}),
     ...(config.githubToken ? { githubToken: config.githubToken } : {}),
     quietTimeoutMs: config.agentQuietTimeoutMs,
+    ...(dockerStack
+      ? {
+          containers: {
+            manager: dockerStack.manager,
+            toolsUrl: dockerStack.toolsUrl,
+            credentials: {
+              githubToken: config.githubToken,
+              claudeCodeOauthToken: config.claudeCodeOauthToken,
+              anthropicApiKey: config.anthropicApiKey,
+              openaiApiKey: config.openaiApiKey,
+            },
+            adapterFor: (runtime, options) =>
+              createContainerAdapter(runtime, options, {
+                codexDebug: (reason, line) =>
+                  log.debug({ component: "codex-adapter", reason, line }, "ignored codex output"),
+              }),
+          },
+        }
+      : {}),
   });
   const commands = createCommandHandlers();
   registerCancelHandler(commands, runner);
@@ -221,7 +287,13 @@ async function main(): Promise<void> {
         onClaimed: runner.onClaimed,
         commands,
       },
-      { worktrees },
+      // §6.6, §9.9 Orphans: container cleanup only on a docker-capable worker,
+      // never of an execution the runner is running here (C4 F1).
+      {
+        worktrees,
+        isLive: runner.isLive,
+        ...(dockerStack ? { containers: dockerStack.executionContainers } : {}),
+      },
     ),
     logger: log,
     intervalMs: DEFAULT_TICK_INTERVAL_MS,

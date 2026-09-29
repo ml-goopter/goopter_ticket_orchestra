@@ -77,6 +77,15 @@ describe("loadConfig (design.md §15.3)", () => {
     expect(config.githubToken).toBeUndefined();
     expect(config.anthropicApiKey).toBeUndefined();
     expect(config.openaiApiKey).toBeUndefined();
+    expect(config.claudeCodeOauthToken).toBeUndefined();
+  });
+
+  it("reads CLAUDE_CODE_OAUTH_TOKEN for agent containers (§9.9, §15.3)", () => {
+    expect(
+      loadConfig(env({ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat-1" })).claudeCodeOauthToken,
+    ).toBe("sk-ant-oat-1");
+    expect(loadConfig(env({ CLAUDE_CODE_OAUTH_TOKEN: "  " })).claudeCodeOauthToken)
+      .toBeUndefined();
   });
 
   it("parses WORKER_CAPABILITIES 'node, odoo' into a trimmed list", () => {
@@ -228,11 +237,13 @@ describe("redactConfig", () => {
           JIRA_API_TOKEN: "jira_supersecret",
           ANTHROPIC_API_KEY: "sk-ant-supersecret",
           OPENAI_API_KEY: "sk-supersecret",
+          CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat-supersecret",
         }),
       ),
     );
 
     expect(JSON.stringify(redacted)).not.toMatch(/supersecret/);
+    expect(redacted.credentialsPresent).toContain("claudeCodeOauthToken");
     expect(JSON.stringify(redacted)).not.toMatch(/orchestra:orchestra/);
     expect(redacted.host).toBe(os.hostname());
     expect(redacted.maxConcurrent).toBe(2);
