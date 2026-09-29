@@ -1,5 +1,5 @@
 import { appendEvent, findRepositoryById, upsertDraftSpecificationRevision } from "@orchestra/db";
-import { defineTool } from "../tool.js";
+import { defineTool, RepositoryLockedError } from "../tool.js";
 
 /**
  * design.md §8: upsert the task's single draft revision and write
@@ -9,7 +9,9 @@ import { defineTool } from "../tool.js";
  * not applied here: a draft may be incomplete (§4.3).
  *
  * GOT.80 D2: once the task's repository is locked, a proposed spec naming a
- * different one is refused. An empty `repository` makes no claim either way.
+ * different one is refused with `RepositoryLockedError`, mapped by
+ * `invoke.ts` to the `REPOSITORY_LOCKED` tool error code rather than
+ * `INTERNAL`. An empty `repository` makes no claim either way.
  */
 export const proposeSpec = defineTool({
   name: "propose_spec",
@@ -19,9 +21,7 @@ export const proposeSpec = defineTool({
     if (input.repository !== "" && auth.task.repositoryId !== null) {
       const repository = await findRepositoryById(tx, auth.task.repositoryId);
       if (repository !== null && repository.name !== input.repository) {
-        throw new Error(
-          `propose_spec: repository "${input.repository}" does not match the task's locked repository "${repository.name}"`,
-        );
+        throw new RepositoryLockedError(repository.name);
       }
     }
     const revision = await upsertDraftSpecificationRevision(tx, {

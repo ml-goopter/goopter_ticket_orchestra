@@ -1969,7 +1969,7 @@ describe("propose_spec", () => {
     expect(revisions).toHaveLength(1);
   });
 
-  it("GOT.80 D2: a repository different from the task's locked one is a tool error and writes no revision", async () => {
+  it("GOT.80-fix2 F7: a repository different from the task's locked one is not an INTERNAL error, and writes no revision", async () => {
     const s = await seed({
       role: "spec",
       taskState: "SPEC_IN_PROGRESS",
@@ -1982,7 +1982,8 @@ describe("propose_spec", () => {
       repository: "some-other-repo",
     });
 
-    expect(result).toMatchObject({ isError: true, code: "INTERNAL" });
+    expect(result.isError).toBe(true);
+    expect((result as { code?: string }).code).not.toBe("INTERNAL");
     const after = await snapshot(s);
     // Only the failed call's own agent.tool_call record and lease renewal;
     // no draft revision written (design.md §8: a failed call rolls back its
@@ -1991,6 +1992,23 @@ describe("propose_spec", () => {
       ...before,
       leaseExpiresAt: 0,
     });
+  });
+
+  it("GOT.80-fix2 F7: a repository different from the task's locked one returns REPOSITORY_LOCKED, naming the locked repository", async () => {
+    const s = await seed({
+      role: "spec",
+      taskState: "SPEC_IN_PROGRESS",
+      repositoryName: "orchestra",
+    });
+
+    const result = await call(s.token, "propose_spec", {
+      ...specContent("mismatch"),
+      repository: "some-other-repo",
+    });
+
+    expect(result).toMatchObject({ isError: true, code: "REPOSITORY_LOCKED" });
+    expect((result as { message: string }).message).toMatch(/orchestra/);
+    expect((result as { message: string }).message).toMatch(/locked/i);
   });
 });
 

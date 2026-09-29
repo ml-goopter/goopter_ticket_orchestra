@@ -529,6 +529,57 @@ describe("POST /api/tasks/:id/spec/session (P1)", () => {
       expect(res.statusCode).toBe(200);
       expect((await taskRow(id)).repository_id).toBe(fx.repositoryId);
     });
+
+    // GOT.80-fix2 F6: the legacy-restart branch also reads the repository
+    // with `lockRepositoryById` (~spec.ts:164) before writing
+    // `tasks.repository_id`, the same lock `deleteRepository` takes. Same
+    // race as F1's "delete wins" case above, through this branch instead.
+    it("racing a concurrent repository delete: the delete's lock wins, so the restart sees the repository gone (422, never 500)", async () => {
+      const repoId = await newRepo("race-f2-restart-delete-wins");
+      const { id: taskId } = await newTask("SPEC_IN_PROGRESS", {
+        withRepository: false,
+      });
+      const before = await snapshot(taskId);
+
+      let deleteLocked!: () => void;
+      const deleteLockedPromise = new Promise<void>((resolve) => {
+        deleteLocked = resolve;
+      });
+      let releaseDelete!: () => void;
+      const releaseDeletePromise = new Promise<void>((resolve) => {
+        releaseDelete = resolve;
+      });
+
+      // Mirrors deleteRepository: lock the row, then (nothing references it
+      // yet) delete it, held open uncommitted.
+      const deleteTx = h.sql.begin(async (sql) => {
+        await sql`select id from repositories where id = ${repoId} for update`;
+        deleteLocked();
+        await releaseDeletePromise;
+        await sql`delete from repositories where id = ${repoId}`;
+      });
+      deleteTx.catch(() => {});
+
+      await deleteLockedPromise;
+
+      const restarting = post(`/api/tasks/${taskId}/spec/session`, {
+        repository_id: repoId,
+      });
+
+      // The restart's own `lockRepositoryById` conflicts with the delete
+      // transaction's lock: it must still be pending while that transaction
+      // holds it, so nothing is written yet.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await snapshot(taskId)).toEqual(before);
+
+      releaseDelete();
+      await deleteTx;
+
+      const res = await restarting;
+      expect(res.statusCode).toBe(422);
+      expect(res.json().error.code).toBe("REPOSITORY_NOT_IN_PROJECT");
+      expect(await snapshot(taskId)).toEqual(before);
+    });
   });
 });
 
