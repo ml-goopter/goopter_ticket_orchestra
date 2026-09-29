@@ -52,8 +52,9 @@ export interface PrepareImplementationInput {
   runtime: Runtime;
   /**
    * Start the working branch from `origin/agent/<KEY>-<short>` instead of
-   * `origin/<default_branch>`: resume after eviction, or a retry from a
-   * pushed branch (design.md §6.5, §6.6, §9.1).
+   * `origin/<default_branch>`: resume after eviction, or any new
+   * implementation execution of a task whose branch was pushed (design.md
+   * §6.5, §6.6, §9.1, §9.5).
    */
   resumeFromRemote?: boolean;
   /**

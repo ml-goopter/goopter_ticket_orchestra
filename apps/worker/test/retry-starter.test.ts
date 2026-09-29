@@ -960,6 +960,10 @@ describe("retry start in the runner (C25, C27, AC7, AC8)", () => {
       fallbackToDefaultBranch: true,
     });
     expect(h.adapter.starts[0]!.prompt).toContain("what that attempt pushed");
+    // GOT.94 F1: a retry started from the remote branch keeps its own
+    // header only; the earlier-work header is for new executions.
+    expect(h.adapter.starts[0]!.prompt.startsWith("## Retry of attempt 1")).toBe(true);
+    expect(h.adapter.starts[0]!.prompt).not.toContain("## Earlier work on this branch");
   });
 
   it("a worktree that is gone on this host: fresh start after the push", async () => {
