@@ -1,4 +1,4 @@
-import { deleteSession, findUserByEmail, insertSession } from "@orchestra/db";
+import { deleteSession, findUserByEmail, insertSessionIfEnabled } from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { AppError, AUTH_INVALID_CREDENTIALS, AUTH_REQUIRED } from "../lib/errors.js";
@@ -57,11 +57,17 @@ export default async function authRoutes(
 
       const now = app.now();
       const expiresAt = new Date(now.getTime() + SESSION_TTL_MS);
-      const session = await insertSession(app.db, {
+      // A disable can commit after the read above. The insert re-checks
+      // `disabled_at` under a row lock that serializes with the disable,
+      // so a login racing it ends as the same refusal (GOT.61 F1).
+      const session = await insertSessionIfEnabled(app.db, {
         userId: row.id,
         expiresAt,
         now,
       });
+      if (!session) {
+        throw AUTH_INVALID_CREDENTIALS;
+      }
 
       reply.setCookie(SESSION_COOKIE_NAME, session.id, {
         httpOnly: true,

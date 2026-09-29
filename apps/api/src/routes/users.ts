@@ -127,6 +127,11 @@ export default async function usersRoutes(app: FastifyInstance): Promise<void> {
         "Cannot disable the last enabled user.",
       );
     }
+    if (parsed.data.disabled === true) {
+      // The disable has committed; end the user's open SSE streams now,
+      // since stream auth only runs when a stream opens (GOT.61 F2).
+      app.realtime.closeUserStreams(request.params.id);
+    }
     return toResponse(result.row);
   });
 }

@@ -5,7 +5,9 @@ import {
   repositories,
   sessions,
   tasks,
+  updateAdminUser,
   users,
+  type Db,
 } from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -14,6 +16,7 @@ import {
   createClock,
   seedUser,
   startTestDb,
+  waitForLockWaiters,
   type Clock,
   type TestDb,
 } from "./harness.js";
@@ -1245,6 +1248,64 @@ describe("admin routes", () => {
       expect(meWithOldCookieRes.statusCode).toBe(401);
     });
 
+    it("a login past password verification when a disable commits is refused and leaves no session (GOT.61 F1)", async () => {
+      const app = await withAuthedApp();
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/users",
+        headers: { cookie },
+        payload: {
+          email: "login-race@example.com",
+          password: "a very long password",
+          display_name: "Login Race",
+        },
+      });
+      const targetId: string = createRes.json().id;
+
+      let disabled!: () => void;
+      const disabledPromise = new Promise<void>((resolve) => (disabled = resolve));
+      let release!: () => void;
+      const releasePromise = new Promise<void>((resolve) => (release = resolve));
+
+      // The real disable, held open uncommitted: `updateAdminUser` runs in
+      // a savepoint of this outer transaction, so its row locks stay held
+      // until the barrier releases the outer commit.
+      const disableTx = testDb.db.transaction(async (tx) => {
+        const result = await updateAdminUser(
+          tx as unknown as Db,
+          targetId,
+          { disabled: true },
+          clock.now(),
+        );
+        expect(result.status).toBe("ok");
+        disabled();
+        await releasePromise;
+      });
+      disableTx.catch(() => {});
+      await disabledPromise;
+
+      // The login reads the still-enabled row, verifies the password, and
+      // reaches its session insert while the disable is uncommitted.
+      const login = app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "login-race@example.com", password: "a very long password" },
+      });
+      await waitForLockWaiters(testDb, 1);
+
+      release();
+      await disableTx;
+      const loginRes = await login;
+
+      expect(loginRes.statusCode).toBe(401);
+      expect(loginRes.json().error.code).toBe("INVALID_CREDENTIALS");
+      expect(loginRes.headers["set-cookie"]).toBeUndefined();
+      const remaining = await testDb.sql<{ count: number }[]>`
+        select count(*)::int as count from sessions where user_id = ${targetId}
+      `;
+      expect(remaining[0]!.count).toBe(0);
+    });
+
     it("disabling an already-disabled user is a no-op: disabled_at is unchanged", async () => {
       const app = await withAuthedApp();
       const createRes = await app.inject({
@@ -1361,32 +1422,46 @@ describe("admin routes", () => {
       const idA = meARes.json().id;
       const idB = meBRes.json().id;
 
-      const [resAtoB, resBtoA] = await Promise.all([
-        app.inject({
-          method: "PATCH",
-          url: `/api/users/${idB}`,
-          headers: { cookie: cookieA },
-          payload: { disabled: true },
-        }),
-        app.inject({
-          method: "PATCH",
-          url: `/api/users/${idA}`,
-          headers: { cookie: cookieB },
-          payload: { disabled: true },
-        }),
-      ]);
+      // Barrier: hold `FOR SHARE` on both rows from a separate connection
+      // before either request starts. Both requests then pass auth and
+      // block inside their disable transaction -- with the `FOR UPDATE`,
+      // on the enabled-rows select before deciding; without it, only on
+      // the final `UPDATE users`, after both have already decided -- so
+      // releasing the barrier starts a genuine race either way.
+      let locked!: () => void;
+      const lockedPromise = new Promise<void>((resolve) => (locked = resolve));
+      let release!: () => void;
+      const releasePromise = new Promise<void>((resolve) => (release = resolve));
+      const blocker = testDb.sql.begin(async (tx) => {
+        await tx`select 1 from users where id in (${idA}, ${idB}) for share`;
+        locked();
+        await releasePromise;
+      });
+      blocker.catch(() => {});
+      await lockedPromise;
 
-      // Exactly one side wins (200). The other is refused -- as 409
-      // LAST_ENABLED_USER if its own auth check ran before the winner's
-      // disable committed, or as 401 if the winner's disable deleted its
-      // session first (both are correct: the two racing callers are
-      // exactly the two enabled users, so the loser either sees the
-      // invariant refusal directly or discovers its own session is gone).
-      // Either way the invariant holds: never both, never neither.
-      // (Not a status-code sort: 200 always sorts before 401/409, so
-      // sorting numerically would put the winner first regardless of
-      // which side actually won -- the winner is identified by its status
-      // instead.)
+      const patchAtoB = app.inject({
+        method: "PATCH",
+        url: `/api/users/${idB}`,
+        headers: { cookie: cookieA },
+        payload: { disabled: true },
+      });
+      const patchBtoA = app.inject({
+        method: "PATCH",
+        url: `/api/users/${idA}`,
+        headers: { cookie: cookieB },
+        payload: { disabled: true },
+      });
+      await waitForLockWaiters(testDb, 2);
+
+      release();
+      await blocker;
+      const [resAtoB, resBtoA] = await Promise.all([patchAtoB, patchBtoA]);
+
+      // Exactly one side wins (200); the other is refused with 409
+      // LAST_ENABLED_USER. Both passed auth before the barrier lifted, so
+      // the loser can only be the invariant refusal. (Not a status-code
+      // sort: the winner is identified by its status instead.)
       const attempts = [
         { res: resAtoB, cookie: cookieA },
         { res: resBtoA, cookie: cookieB },
@@ -1395,10 +1470,8 @@ describe("admin routes", () => {
       const losers = attempts.filter((a) => a.res.statusCode !== 200);
       expect(winners).toHaveLength(1);
       expect(losers).toHaveLength(1);
-      expect([401, 409]).toContain(losers[0]!.res.statusCode);
-      if (losers[0]!.res.statusCode === 409) {
-        expect(losers[0]!.res.json().error.code).toBe("LAST_ENABLED_USER");
-      }
+      expect(losers[0]!.res.statusCode).toBe(409);
+      expect(losers[0]!.res.json().error.code).toBe("LAST_ENABLED_USER");
 
       // `cookie` (the seeded admin's own session) no longer authorizes:
       // disabling the seeded admin earlier in this test deleted it. The

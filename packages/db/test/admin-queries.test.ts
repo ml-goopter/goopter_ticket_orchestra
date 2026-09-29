@@ -15,7 +15,9 @@ import {
   updateAdminUser,
   updateProject,
   updateRepository,
+  type UpdateAdminUserResult,
 } from "../src/queries/index.js";
+import type { Db } from "../src/client.js";
 import * as schema from "../src/schema/index.js";
 import type { DbOrTx } from "../src/transition.js";
 import {
@@ -104,6 +106,23 @@ async function insertTestUser(
     })
     .returning({ id: schema.users.id });
   return row!.id;
+}
+
+/** Backends in this database currently blocked waiting on a lock. */
+async function lockWaiters(): Promise<number> {
+  const [row] = await h.sql<{ count: number }[]>`
+    select count(*)::int as count from pg_stat_activity
+    where wait_event_type = 'Lock' and datname = current_database()
+  `;
+  return row?.count ?? 0;
+}
+
+async function waitFor(check: () => Promise<boolean>, timeoutMs = 10000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() > deadline) throw new Error("waitFor timed out");
+    await sleep(20);
+  }
 }
 
 describe("insertProject / listProjects / getProjectById (AC6)", () => {
@@ -730,13 +749,39 @@ describe("updateAdminUser (GOT.61)", () => {
     const idA = await insertTestUser(h.db, { email: "admu8-a@example.com" });
     const idB = await insertTestUser(h.db, { email: "admu8-b@example.com" });
 
-    const [resultA, resultB] = await Promise.all([
-      updateAdminUser(h.db, idA, { disabled: true }, now),
-      updateAdminUser(h.db, idB, { disabled: true }, now),
-    ]);
+    let firstDecided!: () => void;
+    const firstDecidedPromise = new Promise<void>((resolve) => (firstDecided = resolve));
+    let releaseFirst!: () => void;
+    const releaseFirstPromise = new Promise<void>((resolve) => (releaseFirst = resolve));
 
-    const statuses = [resultA.status, resultB.status].sort();
-    expect(statuses).toEqual(["last_enabled_user", "ok"]);
+    // The first disable runs to completion inside a savepoint of this outer
+    // transaction and is then held open, uncommitted, by the barrier.
+    let resultA: UpdateAdminUserResult | undefined;
+    const firstTx = h.db.transaction(async (tx) => {
+      resultA = await updateAdminUser(tx as unknown as Db, idA, { disabled: true }, now);
+      firstDecided();
+      await releaseFirstPromise;
+    });
+    firstTx.catch(() => {});
+    await firstDecidedPromise;
+    expect(resultA?.status).toBe("ok");
+
+    // The second disable starts while the first is still uncommitted. With
+    // the lock it blocks on the first's locked row; without it, it reads
+    // both rows as enabled, decides, and commits before the first is
+    // released, so both would succeed.
+    let resultB: UpdateAdminUserResult | undefined;
+    const second = updateAdminUser(h.db, idB, { disabled: true }, now).then((r) => {
+      resultB = r;
+    });
+    second.catch(() => {});
+    await waitFor(async () => resultB !== undefined || (await lockWaiters()) >= 1);
+
+    releaseFirst();
+    await firstTx;
+    await second;
+
+    expect(resultB?.status).toBe("last_enabled_user");
 
     const rowA = await getAdminUserById(h.db, idA);
     const rowB = await getAdminUserById(h.db, idB);

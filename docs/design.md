@@ -1110,7 +1110,7 @@ Email and password.
 - No self-registration. First user via `pnpm --filter api users:add <email>`, further users via the admin route.
 - Login creates a `sessions` row and sets a cookie: `HttpOnly`, `Secure`, `SameSite=Lax`, value signed with `SESSION_SECRET`. Idle expiry 30 days, refreshed on each request.
 - Every authenticated user can do everything. Roles are out of scope.
-- A disabled user (`users.disabled_at` set) cannot log in -- `/auth/login` returns the same invalid-credentials response as a wrong password, so a caller cannot tell a disabled account from an unknown one. Every existing session of that user is deleted when it is disabled, and the auth check also rejects `disabled_at IS NOT NULL` live on each request, so a session already in flight stops authorizing on its next request too. Re-enabling clears `disabled_at` but does not restore the deleted sessions.
+- A disabled user (`users.disabled_at` set) cannot log in -- `/auth/login` returns the same invalid-credentials response as a wrong password, so a caller cannot tell a disabled account from an unknown one. Every existing session of that user is deleted when it is disabled, and the auth check also rejects `disabled_at IS NOT NULL` live on each request, so a session already in flight stops authorizing on its next request too. Its open SSE streams are ended as soon as the disable commits, and a login that races the disable creates no session. Re-enabling clears `disabled_at` but does not restore the deleted sessions.
 - Rate limit on `/auth/login`: 10 per minute per IP.
 - Agents never authenticate to the api. They authenticate to agent-tools with the per-execution token.
 

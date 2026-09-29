@@ -21,6 +21,7 @@ export {
   type ListBacklog,
   type LoadAnchor,
   type LoadEvent,
+  type StreamOwner,
 } from "./hub.js";
 
 /** Overrides for tests; production uses the defaults. */

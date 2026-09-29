@@ -3,7 +3,12 @@ import { EventEmitter } from "node:events";
 import http, { type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { ExecutionEventType } from "@orchestra/core";
-import { LISTEN_APPLICATION_NAME, appendEvent } from "@orchestra/db";
+import {
+  LISTEN_APPLICATION_NAME,
+  appendEvent,
+  updateAdminUser,
+  type Db,
+} from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
@@ -23,9 +28,11 @@ import {
   seedFixtures,
   seedSession,
   seedTask,
+  seedUser,
   sessionCookieHeader,
   startTestDb,
   testConfig,
+  waitForLockWaiters,
 } from "./harness.js";
 
 const KEEPALIVE_MS = 150;
@@ -756,8 +763,9 @@ describe("auth, validation and cleanup (T7)", () => {
     let opened = (): void => {};
     const server = http.createServer((req, res) => {
       res.on("close", () => {
-        if (req.url === "/task") app.realtime.openTaskStream(res, task, undefined);
-        else app.realtime.openGlobalStream(res);
+        const owner = { userId: fx.userId, sessionId: randomUUID() };
+        if (req.url === "/task") app.realtime.openTaskStream(res, task, undefined, owner);
+        else app.realtime.openGlobalStream(res, owner);
         counts.push(app.realtime.subscriberCount());
         opened();
       });
@@ -1192,6 +1200,101 @@ class FakeResponse extends EventEmitter {
     return this as unknown as ServerResponse;
   }
 }
+
+describe("disabling a user ends their streams (GOT.61 F2)", () => {
+  let userSeq = 0;
+  /** A fresh enabled user with one live session; returns its id and cookie. */
+  async function seedUserWithSession(
+    lastSeenAt?: Date,
+  ): Promise<{ id: string; cookie: string }> {
+    userSeq += 1;
+    const user = await seedUser(h.db, {
+      email: `stream-user-${userSeq}@example.com`,
+      password: "a very long password",
+    });
+    const sessionId = await seedSession(h.db, {
+      userId: user.id,
+      expiresAt: new Date(clock.now().getTime() + 1000 * 60 * 60),
+      ...(lastSeenAt ? { lastSeenAt } : {}),
+    });
+    return { id: user.id, cookie: sessionCookieHeader(sessionId) };
+  }
+
+  it("a disable ends every open stream of that user and leaves other users' streams open", async () => {
+    const target = await seedUserWithSession();
+    const admin = await seedUserWithSession();
+    const task = await newTask();
+
+    const targetTask = await openStream(`/api/tasks/${task}/stream`, { cookie: target.cookie });
+    const targetGlobal = await openStream(`/api/stream`, { cookie: target.cookie });
+    const adminGlobal = await openStream(`/api/stream`, { cookie: admin.cookie });
+    try {
+      expect([targetTask.status, targetGlobal.status, adminGlobal.status]).toEqual([200, 200, 200]);
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/users/${target.id}`,
+        headers: { cookie: admin.cookie },
+        payload: { disabled: true },
+      });
+      expect(res.statusCode).toBe(200);
+
+      await waitFor(() => targetTask.ended && targetGlobal.ended);
+
+      // The other user's stream stays open and keeps receiving.
+      const keepalivesBefore = adminGlobal.comments.length;
+      await sleep(KEEPALIVE_MS * 2);
+      expect(adminGlobal.ended).toBe(false);
+      expect(adminGlobal.comments.length).toBeGreaterThan(keepalivesBefore);
+    } finally {
+      targetTask.close();
+      targetGlobal.close();
+      adminGlobal.close();
+    }
+  });
+
+  it("a stream whose auth passed before a disable committed is ended once it opens", async () => {
+    // Stale `last_seen_at` makes the auth preHandler write `touchSession`
+    // after it has read the session as valid; that write then blocks on
+    // the uncommitted disable's delete of the same session row. The
+    // disable is applied straight to the db, so no close-on-disable runs
+    // for this stream: only the check after the stream opens can end it.
+    const target = await seedUserWithSession(
+      new Date(clock.now().getTime() - 1000 * 60 * 5),
+    );
+
+    let disabled!: () => void;
+    const disabledPromise = new Promise<void>((resolve) => (disabled = resolve));
+    let release!: () => void;
+    const releasePromise = new Promise<void>((resolve) => (release = resolve));
+    const disableTx = h.db.transaction(async (tx) => {
+      const result = await updateAdminUser(
+        tx as unknown as Db,
+        target.id,
+        { disabled: true },
+        clock.now(),
+      );
+      expect(result.status).toBe("ok");
+      disabled();
+      await releasePromise;
+    });
+    disableTx.catch(() => {});
+    await disabledPromise;
+
+    const streamPromise = openStream(`/api/stream`, { cookie: target.cookie });
+    await waitForLockWaiters(h, 1);
+    release();
+    await disableTx;
+
+    const client = await streamPromise;
+    try {
+      expect(client.status).toBe(200);
+      await waitFor(() => client.ended);
+    } finally {
+      client.close();
+    }
+  });
+});
 
 describe("shutdown (T8/H8)", () => {
   it("F4: a stream request still awaiting when close() starts ends at once and close() resolves", async () => {
