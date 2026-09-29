@@ -274,6 +274,15 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
           createdBy: actor.id!,
           now: app.now(),
         });
+        // GOT.57 D1: the user's side of the chat turn, so the spec chat pane
+        // can render it -- distinct from `issue.message` and never carried
+        // on `agent.message`.
+        await appendEvent(tx, {
+          taskId: id,
+          executionId,
+          type: "spec.message",
+          payload: { text: body.data.text, author_user_id: actor.id },
+        });
         return { commandId: command.id, executionId };
       });
     } catch (err) {

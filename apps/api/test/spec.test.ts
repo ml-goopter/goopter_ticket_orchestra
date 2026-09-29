@@ -178,6 +178,12 @@ async function eventTypes(taskId: string): Promise<string[]> {
   return rows.map((r) => r.type);
 }
 
+async function eventRows(taskId: string) {
+  return h.sql<
+    { type: string; execution_id: string | null; payload: Record<string, unknown> }[]
+  >`select type, execution_id, payload from execution_events where task_id = ${taskId} order by id`;
+}
+
 async function auditTriggers(entityId: string): Promise<string[]> {
   const rows = await h.sql<{ trigger: string }[]>`
     select trigger from audit_events where entity_id = ${entityId} order by id`;
@@ -607,6 +613,31 @@ describe("POST /api/tasks/:id/spec/messages (P2)", () => {
     },
   );
 
+  // GOT.57 AC1: the user's side of the chat turn is recorded as a
+  // `spec.message` execution event, in the same transaction as the
+  // `send_message` command, attached to the live spec execution.
+  it.each(["RUNNING", "WAITING_FOR_USER"] as const)(
+    "writes one spec.message event with the text and author, attached to the %s spec execution",
+    async (execState) => {
+      const { id } = await newTask("SPEC_IN_PROGRESS");
+      const execId = await seedExecution(h.db, id, {
+        role: "spec",
+        state: execState,
+      });
+      const res = await post(`/api/tasks/${id}/spec/messages`, {
+        text: "please add a risk",
+      });
+      expect(res.statusCode).toBe(200);
+      expect(await eventRows(id)).toEqual([
+        {
+          type: "spec.message",
+          execution_id: execId,
+          payload: { text: "please add a risk", author_user_id: fx.userId },
+        },
+      ]);
+    },
+  );
+
   it("returns 409 without a live spec execution and writes nothing", async () => {
     const { id } = await newTask("SPEC_IN_PROGRESS");
     await seedExecution(h.db, id, { role: "spec", state: "COMPLETED" });
@@ -616,14 +647,16 @@ describe("POST /api/tasks/:id/spec/messages (P2)", () => {
     expect(res.statusCode).toBe(409);
     expect(res.json().error.code).toBe("NO_LIVE_SPEC_EXECUTION");
     expect(await snapshot(id)).toEqual(before);
+    expect(await eventTypes(id)).toHaveLength(0);
   });
 
-  it("returns 400 for an empty or missing text", async () => {
+  it("returns 400 for an empty or missing text and writes no command or event", async () => {
     const { id } = await newTask("SPEC_IN_PROGRESS");
     await seedExecution(h.db, id, { role: "spec", state: "RUNNING" });
     expect((await post(`/api/tasks/${id}/spec/messages`, { text: "" })).statusCode).toBe(400);
     expect((await post(`/api/tasks/${id}/spec/messages`, {})).statusCode).toBe(400);
     expect(await commands(id)).toHaveLength(0);
+    expect(await eventTypes(id)).toHaveLength(0);
   });
 });
 

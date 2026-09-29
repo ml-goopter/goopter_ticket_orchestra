@@ -863,7 +863,7 @@ execution.queued  execution.assigned  execution.started  execution.resumed
 execution.heartbeat  execution.waiting  execution.completed  execution.failed
 execution.cancelled  worktree.prepared  worktree.evicted
 agent.message.delta  agent.message  agent.tool_call  agent.note
-spec.proposed  spec.review_requested  spec.approved  spec.sent_back  spec.revised
+spec.proposed  spec.review_requested  spec.approved  spec.sent_back  spec.revised  spec.message
 issue.created  issue.message  issue.resolved
 review.started  review.result
 pull_request.created  ci.started  ci.failed  ci.passed  pull_request.merged  pull_request.closed
@@ -871,6 +871,8 @@ task.state_changed  usage.recorded
 ```
 
 `task.state_changed` is written by `transition()` for every task move, so the timeline can render state changes inline.
+
+`spec.message` records the user's side of a spec chat turn, with payload `{ text, author_user_id }`. The api writes it in the same transaction as the `send_message` command, and the spec builder renders it as the user's bubble.
 
 ### 9.7 Cost capture
 

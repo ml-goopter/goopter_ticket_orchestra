@@ -40,6 +40,26 @@ export interface SpecBuilderViewProps {
 
 type LoadState = "loading" | "loaded" | "not_found" | "error";
 
+/**
+ * One rendered chat pane row (GOT.57): the agent's bubbles/tool chips
+ * (mirroring `TimelineItem`'s `message`/`tool_call` fields, ../task/timelineItems.js,
+ * which this view does not own) plus the user's own `spec.message` bubbles,
+ * merged and ordered by `eventId` in `chatEntries` below.
+ */
+interface ChatEntry {
+  key: string;
+  eventId: number;
+  kind: "agent" | "tool_call" | "user";
+  createdAt: string;
+  text?: string;
+  final?: boolean;
+  toolName?: string;
+}
+
+function asRecord(payload: unknown): Record<string, unknown> {
+  return typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : {};
+}
+
 /** How long a changed field stays visually flagged after `spec.proposed`/`spec.revised` (design.md §14). */
 const HIGHLIGHT_DURATION_MS = 5000;
 
@@ -408,6 +428,45 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
     [events],
   );
 
+  // Interleaves the agent's `chatItems` (built from `events` via
+  // `buildTimelineItems`, which has no `spec.message` handling of its own --
+  // that item shape is shared with `TaskDetailView`'s generic timeline and
+  // isn't specific to this pane, GOT.57) with the user's own `spec.message`
+  // events, read straight off `events`, in event order (AC3).
+  const chatEntries = useMemo<ChatEntry[]>(() => {
+    const agentEntries: ChatEntry[] = chatItems.map((item) =>
+      item.kind === "tool_call"
+        ? {
+            key: item.key,
+            eventId: item.eventId,
+            kind: "tool_call",
+            createdAt: item.createdAt,
+            toolName: item.toolName ?? "tool",
+          }
+        : {
+            key: item.key,
+            eventId: item.eventId,
+            kind: "agent",
+            createdAt: item.createdAt,
+            text: item.text ?? "",
+            final: item.final ?? true,
+          },
+    );
+    const userEntries: ChatEntry[] = events
+      .filter((event) => event.type === "spec.message")
+      .map((event) => {
+        const record = asRecord(event.payload);
+        return {
+          key: `spec-message:${event.id}`,
+          eventId: event.id,
+          kind: "user",
+          createdAt: event.createdAt,
+          text: typeof record.text === "string" ? record.text : "",
+        };
+      });
+    return [...agentEntries, ...userEntries].sort((a, b) => a.eventId - b.eventId);
+  }, [chatItems, events]);
+
   const revisions = useMemo(() => aggregate?.revisions ?? [], [aggregate]);
 
   useEffect(() => {
@@ -729,19 +788,26 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
             )}
           </div>
           <ul className="spec-builder__chat-list" data-testid="spec-chat">
-            {chatItems.map((item) =>
+            {chatEntries.map((item) =>
               item.kind === "tool_call" ? (
                 <li key={item.key} className="spec-builder__tool-line">
                   <span data-testid="tool-chip">{item.toolName}</span>
                 </li>
               ) : (
-                <li key={item.key} className="spec-builder__bubble spec-builder__bubble--agent">
+                <li
+                  key={item.key}
+                  className={
+                    item.kind === "user"
+                      ? "spec-builder__bubble spec-builder__bubble--user"
+                      : "spec-builder__bubble spec-builder__bubble--agent"
+                  }
+                >
                   <div className="spec-builder__bubble-meta">
                     <Time value={item.createdAt} />
                   </div>
                   <div data-testid="chat-message" className="spec-builder__bubble-text">
                     <Markdown>{item.text ?? ""}</Markdown>
-                    {!item.final && " ..."}
+                    {item.kind === "agent" && !item.final && " ..."}
                   </div>
                 </li>
               ),
