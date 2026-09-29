@@ -2,6 +2,7 @@ import { TaskState } from "@orchestra/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   applyJiraScope,
+  getLatestJiraScope,
   jiraScopeAction,
   listNonTerminalJiraTasks,
   type JiraScope,
@@ -212,6 +213,36 @@ describe("applyJiraScope: work under way is signalled, not cancelled", () => {
     expect((await taskRow(taskId))!.state).toBe(TaskState.DONE);
     expect(await notesFor(taskId)).toHaveLength(0);
     expect(await notificationsFor(taskId)).toHaveLength(0);
+  });
+});
+
+describe("getLatestJiraScope (GOT.93)", () => {
+  it("is null when the poller has never recorded a scope", async () => {
+    const key = nextKey();
+    const taskId = await seedTask(h.db, fx, { jiraKey: key, state: TaskState.CANCELLED });
+
+    expect(await getLatestJiraScope(h.db, taskId)).toBeNull();
+  });
+
+  it("is the scope of the most recent jira-poller note, not an earlier one", async () => {
+    const key = nextKey();
+    const taskId = await seedTask(h.db, fx, { jiraKey: key, state: TaskState.CI_RUNNING });
+
+    await apply(taskId, key, "closed");
+    await apply(taskId, key, "in_scope");
+    await apply(taskId, key, "left_jql");
+
+    expect(await getLatestJiraScope(h.db, taskId)).toBe("left_jql");
+  });
+
+  it("is in_scope once the ticket is restored, even after a cancel-worthy close", async () => {
+    const key = nextKey();
+    const taskId = await seedTask(h.db, fx, { jiraKey: key, state: TaskState.CI_RUNNING });
+
+    await apply(taskId, key, "closed");
+    await apply(taskId, key, "in_scope");
+
+    expect(await getLatestJiraScope(h.db, taskId)).toBe("in_scope");
   });
 });
 

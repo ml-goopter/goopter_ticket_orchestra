@@ -1,12 +1,13 @@
 import {
   RuntimeSchema,
+  TaskState,
   TaskStateSchema,
   TransitionError,
   deriveColumn,
-  type TaskState,
 } from "@orchestra/core";
 import {
   ZERO_TASK_COST,
+  getLatestJiraScope,
   getRevisionByStatus,
   getTaskAggregate,
   getTaskCostBreakdown,
@@ -442,6 +443,14 @@ export default async function tasksRoutes(app: FastifyInstance): Promise<void> {
    * second read that could see something new. The choice and the move are
    * genuinely atomic under that lock, not just because nothing "should"
    * write approved_revision_id on a CANCELLED task in between.
+   *
+   * GOT.93, user decision 2026-09-29: before choosing a destination, a
+   * `CANCELLED` task's latest jira-poller recorded scope (`getLatestJiraScope`,
+   * read under the same lock) is checked. `closed` or `left_jql` refuses
+   * with 409 `JIRA_SCOPE_CANCELLED` and leaves the task `CANCELLED` — no
+   * transition, no event — because the poller stops checking a cancelled
+   * task, so nothing would ever notice the ticket coming back in scope. No
+   * note, or a last recorded scope of `in_scope`, reopens exactly as before.
    */
   app.post("/tasks/:id/reopen", async (request) => {
     const id = parseTaskId(request.params);
@@ -453,6 +462,18 @@ export default async function tasksRoutes(app: FastifyInstance): Promise<void> {
         const locked = await lockTaskForSpec(tx, id);
         if (!locked) {
           throw new NotFoundError("task", id);
+        }
+        if (locked.state === TaskState.CANCELLED) {
+          const scope = await getLatestJiraScope(tx, id);
+          if (scope === "closed" || scope === "left_jql") {
+            throw new AppError(
+              409,
+              "JIRA_SCOPE_CANCELLED",
+              scope === "closed"
+                ? "This task's Jira ticket is closed. The Jira poller cancelled the task and it cannot be reopened."
+                : "This task's Jira ticket is outside the project's JQL. The Jira poller cancelled the task and it cannot be reopened.",
+            );
+          }
         }
         const draft = await getRevisionByStatus(tx, id, "draft");
         const trigger =

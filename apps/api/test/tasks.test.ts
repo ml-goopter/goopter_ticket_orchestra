@@ -1008,6 +1008,113 @@ describe("POST /api/tasks/:id/reopen (GOT.55)", () => {
   });
 });
 
+// GOT.93, user decision 2026-09-29: a task the Jira poller cancelled for
+// leaving scope (ticket closed or out of the project's JQL) stays cancelled
+// permanently -- the poller stops checking a cancelled task. Only a task the
+// user cancelled (no poller scope note, or the poller's last recorded scope
+// is in_scope) reopens as before.
+describe("POST /api/tasks/:id/reopen (GOT.93 Jira scope refusal)", () => {
+  async function seedJiraScopeNote(
+    taskId: string,
+    jiraScope: "in_scope" | "closed" | "left_jql",
+  ) {
+    await h.db.transaction((tx) =>
+      appendEvent(tx, {
+        taskId,
+        type: "agent.note",
+        payload: { source: "jira-poller", jiraScope, reason: "test note" },
+      }),
+    );
+  }
+
+  it("refuses with 409 JIRA_SCOPE_CANCELLED when the last recorded scope is closed, and writes no event", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-80",
+      state: "CANCELLED",
+      priority: 80,
+    });
+    await seedJiraScopeNote(taskId, "closed");
+    const before = await listExecutionEventsForTask(h.sql, taskId);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe("JIRA_SCOPE_CANCELLED");
+    expect(res.json().error.message).toMatch(/closed/i);
+
+    const rows = await h.sql<{ state: string }[]>`
+      select state from tasks where id = ${taskId}
+    `;
+    expect(rows[0]?.state).toBe("CANCELLED");
+    const after = await listExecutionEventsForTask(h.sql, taskId);
+    expect(after).toHaveLength(before.length);
+  });
+
+  it("refuses with 409 JIRA_SCOPE_CANCELLED when the last recorded scope is left_jql", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-81",
+      state: "CANCELLED",
+      priority: 81,
+    });
+    await seedJiraScopeNote(taskId, "left_jql");
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe("JIRA_SCOPE_CANCELLED");
+    expect(res.json().error.message).toMatch(/JQL/);
+
+    const rows = await h.sql<{ state: string }[]>`
+      select state from tasks where id = ${taskId}
+    `;
+    expect(rows[0]?.state).toBe("CANCELLED");
+  });
+
+  it("reopens as today when the poller's last recorded scope is in_scope", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-82",
+      state: "CANCELLED",
+      priority: 82,
+    });
+    await seedJiraScopeNote(taskId, "closed");
+    await seedJiraScopeNote(taskId, "in_scope");
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ from: "CANCELLED", to: "NEEDS_SPEC" });
+  });
+
+  it("reopens as today when there is no jira-poller scope note (user-cancelled)", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-83",
+      state: "CANCELLED",
+      priority: 83,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ from: "CANCELLED", to: "NEEDS_SPEC" });
+  });
+});
+
 describe("auth required (AC7)", () => {
   it.each([
     ["GET", "/api/tasks"],
