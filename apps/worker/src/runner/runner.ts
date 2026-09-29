@@ -55,6 +55,7 @@ import {
 import { redactToken } from "../agent-tools/invoke.js";
 import { DockerError, containerName } from "../containers/index.js";
 import { renewExecutionLease } from "../agent-tools/lease.js";
+import { runWithRenewal } from "./lease-loop.js";
 import {
   createLiveExecution,
   type ExecutionRegistry,
@@ -850,7 +851,8 @@ export function createRunner(deps: RunnerDeps): Runner {
    * sessions hold no lease, so only implementation renews. `renewNow` also
    * renews once before `body`. The state-gated helper (carry-forward, PR #17)
    * never renews an execution that is no longer ASSIGNED or RUNNING; that
-   * result aborts the run.
+   * result aborts the run. Returns only once every renewal it started has
+   * settled, so none outlives the run (GOT.78).
    */
   async function withLease(
     state: RunState,
@@ -871,16 +873,15 @@ export function createRunner(deps: RunnerDeps): Runner {
         log.error({ err: errMessage(err) }, "lease renewal failed");
       }
     };
-    const interval = setInterval(() => void renew(), timings.leaseRenewMs);
-    try {
-      if (renewNow) {
-        await renew();
-        if (state.stopReason !== null) return;
-      }
-      await body();
-    } finally {
-      clearInterval(interval);
-    }
+    await runWithRenewal(
+      renew,
+      {
+        intervalMs: timings.leaseRenewMs,
+        renewNow,
+        shouldRun: () => state.stopReason === null,
+      },
+      body,
+    );
   }
 
   // ---------------------------------------------------------- the session
