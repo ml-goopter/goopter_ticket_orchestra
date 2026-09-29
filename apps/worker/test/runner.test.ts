@@ -772,9 +772,11 @@ describe("event loop (design.md §9.3)", () => {
 
       const run = h.runner.start({ executionId: s.executionId, taskId: s.taskId });
 
-      // One reset for the session event, one per text event.
-      await quiet.waitForSchedule(EVENTS + 1);
-      expect(quiet.scheduledCount()).toBe(EVENTS + 1);
+      // One unconditional reset before the event loop starts, plus one per
+      // received event (the session event and each of the EVENTS text
+      // events): EVENTS + 2 in total.
+      await quiet.waitForSchedule(EVENTS + 2);
+      expect(quiet.scheduledCount()).toBe(EVENTS + 2);
       // Every earlier quiet timer was cancelled by the next event's reset,
       // not left running alongside it.
       expect(quiet.liveCount()).toBe(1);
