@@ -185,8 +185,14 @@ export interface SpecApiClient extends IssueApiClient {
    * repositories.
    */
   listProjectRepositories(projectId: string): Promise<AdminRepository[]>;
-  /** `POST /tasks/:id/spec/session` (design.md §12.3), only legal from `NEEDS_SPEC`. */
-  startSpecSession(taskId: string): Promise<TaskTransitionResult>;
+  /**
+   * `POST /tasks/:id/spec/session` `{ repository_id }` (design.md §12.3,
+   * GOT.81 D1-D3), only legal from `NEEDS_SPEC`. The user chooses and
+   * confirms the repository before the session starts; it cannot change
+   * afterwards. 422 `REPOSITORY_REQUIRED`/`REPOSITORY_NOT_IN_PROJECT`, 409
+   * `REPOSITORY_LOCKED` surface as `ApiError`.
+   */
+  startSpecSession(taskId: string, repositoryId: string): Promise<TaskTransitionResult>;
   /** `POST /tasks/:id/spec/messages` `{ text }` (design.md §12.3). */
   postSpecMessage(taskId: string, text: string): Promise<SpecMessageResult>;
   /** `PUT /tasks/:id/spec/draft` `{ content }` (design.md §12.3). */
@@ -322,8 +328,9 @@ export function createApiClient(options: ApiClientOptions = {}): SpecApiClient {
         `/repositories${buildQuery({ project: projectId })}`,
         { schema: z.array(AdminRepositorySchema) },
       ),
-    startSpecSession: (id) =>
+    startSpecSession: (id, repositoryId) =>
       request<TaskTransitionResult>("POST", `/tasks/${id}/spec/session`, {
+        body: { repository_id: repositoryId },
         schema: TaskTransitionResultSchema,
       }),
     postSpecMessage: (id, text) =>

@@ -99,7 +99,11 @@ async function createSpecExecution(
     }
     const repository = await resolveSpecRepository(tx, input.taskId);
     if (!repository) {
-      return { ok: false, reason: "project has no repository", error: true };
+      // F4: GOT.80 D2 locks a repository on the task, not the project, so a
+      // null result here means this task has none set (a legacy task, or
+      // one restarted without ever supplying one) — never that the project
+      // itself lacks repositories.
+      return { ok: false, reason: "task has no repository", error: true };
     }
     const { id } = await insertQueuedExecution(tx, {
       taskId: input.taskId,

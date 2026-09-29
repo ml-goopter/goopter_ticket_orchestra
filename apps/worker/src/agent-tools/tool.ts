@@ -47,3 +47,16 @@ export function defineTool<N extends AgentToolName>(
 ): AgentToolDefinition<N> {
   return def;
 }
+
+/**
+ * Thrown when a tool's input names a repository other than the task's
+ * locked one (design.md GOT.80 D2, §12.3 `REPOSITORY_LOCKED`). `invoke.ts`
+ * maps this to the `REPOSITORY_LOCKED` tool error code, naming the locked
+ * repository, instead of the generic `INTERNAL`.
+ */
+export class RepositoryLockedError extends Error {
+  constructor(readonly repositoryName: string) {
+    super(`The repository is locked to "${repositoryName}" for this task.`);
+    this.name = "RepositoryLockedError";
+  }
+}
