@@ -1,5 +1,5 @@
-import { appendEvent, upsertDraftSpecificationRevision } from "@orchestra/db";
-import { defineTool } from "../tool.js";
+import { appendEvent, findRepositoryById, upsertDraftSpecificationRevision } from "@orchestra/db";
+import { defineTool, RepositoryLockedError } from "../tool.js";
 
 /**
  * design.md §8: upsert the task's single draft revision and write
@@ -7,12 +7,23 @@ import { defineTool } from "../tool.js";
  * against the core schema before this runs, so an invalid spec never
  * reaches the transaction. Approval rules (`validateSpecForApproval`) are
  * not applied here: a draft may be incomplete (§4.3).
+ *
+ * GOT.80 D2: once the task's repository is locked, a proposed spec naming a
+ * different one is refused with `RepositoryLockedError`, mapped by
+ * `invoke.ts` to the `REPOSITORY_LOCKED` tool error code rather than
+ * `INTERNAL`. An empty `repository` makes no claim either way.
  */
 export const proposeSpec = defineTool({
   name: "propose_spec",
   description:
     "Spec sessions only: save the full specification as the task's draft. Each call replaces the previous draft.",
   async run({ tx, auth, now }, input) {
+    if (input.repository !== "" && auth.task.repositoryId !== null) {
+      const repository = await findRepositoryById(tx, auth.task.repositoryId);
+      if (repository !== null && repository.name !== input.repository) {
+        throw new RepositoryLockedError(repository.name);
+      }
+    }
     const revision = await upsertDraftSpecificationRevision(tx, {
       taskId: auth.task.id,
       content: input,

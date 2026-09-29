@@ -27,6 +27,24 @@
 }
 
 /*
+ * Scrollbar-width overflow guard (GOT.64): `100vw` above is, per the CSS
+ * spec, the *full* viewport width -- including the strip a classic,
+ * always-visible vertical scrollbar occupies -- while the page's actual
+ * visible width (and `.board-bleed`'s intended right edge) is the viewport
+ * width *minus* that scrollbar. On a platform with an always-visible
+ * scrollbar (non-macOS: Windows/Linux browsers), `.board-bleed` therefore
+ * ends up `scrollbar-width` wider than the document, giving the whole page
+ * its own horizontal scrollbar. macOS's overlay scrollbar is 0px wide, so
+ * `100vw` already matches the visible width there and this guard changes
+ * nothing (no visual change on macOS). `:has()` scopes the guard to only
+ * take effect while a `.board-bleed` element is actually mounted (the
+ * board view), rather than hiding horizontal overflow on every page.
+ */
+body:has(.board-bleed) {
+  overflow-x: hidden;
+}
+
+/*
  * Column widths and gap (B1/B3, U7): three tiers, narrowest first, each
  * overriding the last via selector specificity (`.board-bleed .kanban__column`
  * beats components.css's single-class `.kanban__column`; adding a second

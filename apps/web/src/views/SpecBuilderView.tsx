@@ -119,6 +119,19 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const [toRevisionId, setToRevisionId] = useState<string | null>(null);
   const [readRevisionId, setReadRevisionId] = useState<string | null>(null);
 
+  // GOT.81 D1-D3: the repository the user has picked in the pre-session
+  // dropdown (empty until chosen), and whether the inline "are you sure"
+  // confirmation is currently shown. Neither is used once the task already
+  // has a repository (`aggregate.repository !== null`): that dropdown is
+  // never offered and the task's own repository is used instead.
+  const [selectedRepositoryId, setSelectedRepositoryId] = useState<string>("");
+  const [confirmingStart, setConfirmingStart] = useState(false);
+  // GOT.81-fix1: guards POST /tasks/:id/spec/session against a double click
+  // on Confirm sending two start requests (the second can 409 after a
+  // successful first start). Also disables Cancel and re-opening the
+  // confirmation via Start while the request is in flight.
+  const [startingSession, setStartingSession] = useState(false);
+
   // Mirrors of `formContent`/`formBaseline` for `applyAggregate` below, which
   // runs at the end of an async fetch and needs the value current at that
   // moment, not the one captured when the enclosing callback was created.
@@ -417,6 +430,18 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
     }
   }, [aggregate, draftRevision, formContent]);
 
+  // GOT.81 D1: a project with exactly one repository preselects it in the
+  // pre-session dropdown -- the user still has to confirm Start. Only runs
+  // while the task has no repository of its own yet (before the session
+  // starts); once it does, this dropdown is never shown.
+  useEffect(() => {
+    if (!aggregate || aggregate.repository !== null) return;
+    if (selectedRepositoryId !== "") return;
+    if (projectRepositories.length === 1) {
+      setSelectedRepositoryId(projectRepositories[0]!.id);
+    }
+  }, [aggregate, projectRepositories, selectedRepositoryId]);
+
   const diffText = useMemo(() => {
     const from = revisions.find((revision) => revision.id === fromRevisionId);
     const to = revisions.find((revision) => revision.id === toRevisionId);
@@ -430,12 +455,22 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   }, [revisions, readRevisionId]);
 
   async function handleStartSession() {
+    // GOT.81-fix1: a request is already in flight, ignore a second click.
+    if (startingSession) return;
+    // GOT.81 D2: the task's own repository (once it has one) always wins;
+    // otherwise the id the user picked and is now confirming.
+    const repositoryId = aggregate?.repository?.id ?? (selectedRepositoryId === "" ? null : selectedRepositoryId);
+    if (repositoryId === null) return;
     setActionError(null);
+    setStartingSession(true);
     try {
-      await apiClient.startSpecSession(id);
+      await apiClient.startSpecSession(id, repositoryId);
+      setConfirmingStart(false);
       await refetch(false);
     } catch (err) {
       setActionError(describeError(err));
+    } finally {
+      setStartingSession(false);
     }
   }
 
@@ -548,6 +583,19 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   // (GOT.37), not a route this button can call.
   const showStartSessionButton = taskState === "NEEDS_SPEC";
 
+  // GOT.81 D1-D3: a task that already has a repository (e.g. re-opening the
+  // page once the session has started) never offers the dropdown -- its own
+  // repository is used. Otherwise the id is whatever the user has chosen so
+  // far (possibly none yet).
+  const taskRepositoryId = aggregate.repository?.id ?? null;
+  const offerRepositoryDropdown = showStartSessionButton && taskRepositoryId === null;
+  const chosenRepositoryId = taskRepositoryId ?? (selectedRepositoryId === "" ? null : selectedRepositoryId);
+  const canStartSession = chosenRepositoryId !== null;
+  const startRepositoryName =
+    (taskRepositoryId !== null
+      ? aggregate.repository?.name
+      : projectRepositories.find((repository) => repository.id === selectedRepositoryId)?.name) ?? "";
+
   const chatDisabledReason: string | null =
     taskState !== "SPEC_IN_PROGRESS"
       ? "The task is not in progress."
@@ -639,9 +687,45 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
           <div className="spec-builder__chat-header">
             <h2>Chat</h2>
             {showStartSessionButton && (
-              <button type="button" onClick={() => void handleStartSession()}>
-                Start spec session
-              </button>
+              <div>
+                {offerRepositoryDropdown && !confirmingStart && (
+                  <label>
+                    Repository
+                    <select
+                      value={selectedRepositoryId}
+                      onChange={(event) => setSelectedRepositoryId(event.target.value)}
+                    >
+                      <option value="">Select a repository...</option>
+                      {projectRepositories.map((repository) => (
+                        <option key={repository.id} value={repository.id}>
+                          {repository.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {confirmingStart ? (
+                  <span role="group" aria-label="Confirm start spec session">
+                    <span>
+                      Start spec session on {startRepositoryName}? The repository can&apos;t be changed afterwards.
+                    </span>
+                    <button type="button" disabled={startingSession} onClick={() => void handleStartSession()}>
+                      Confirm
+                    </button>
+                    <button type="button" disabled={startingSession} onClick={() => setConfirmingStart(false)}>
+                      Cancel
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={!canStartSession || startingSession}
+                    onClick={() => setConfirmingStart(true)}
+                  >
+                    Start spec session
+                  </button>
+                )}
+              </div>
             )}
           </div>
           <ul className="spec-builder__chat-list" data-testid="spec-chat">
@@ -695,7 +779,6 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
           {formContent ? (
             <SpecDraftForm
               content={formContent}
-              repositories={projectRepositories}
               highlightedFields={highlightedFields}
               disabled={taskState !== "SPEC_IN_PROGRESS"}
               onChange={setFormContent}

@@ -60,6 +60,10 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | fixes | GOT.52 | api: delete project and repository | #65 |
 | fixes | GOT.53 | web: delete controls for projects and repositories | #66 |
 | containers | GOT.72 | worker: run agent sessions in containers for opted-in repositories (C4) | #67 |
+| fixes | GOT.82 | worker: revoke stale spec turn tokens on startup; admin slots use holdsCapacity | #68 |
+| fixes | GOT.77 | jira: follow tickets that close or leave the JQL | #69 |
+| fixes | GOT.64, GOT.65 | web: board scrollbar overflow and timeline JSON cap | #70 |
+| fixes | GOT.80, GOT.81 | spec: choose and lock the repository before the session starts | #71 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 

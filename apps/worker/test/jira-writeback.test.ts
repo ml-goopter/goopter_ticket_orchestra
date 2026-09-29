@@ -61,7 +61,7 @@ function configWith(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
 function fakeClient(overrides: Partial<JiraClient> = {}): JiraClient {
   return {
     search: vi.fn(async () => []),
-    issueExists: vi.fn(async () => true),
+    getIssueStatus: vi.fn(async () => ({ statusCategory: "indeterminate" })),
     getIssue: vi.fn(async (key: string) => ({
       key,
       summary: "s",

@@ -167,8 +167,10 @@ interface SeededSpecTask {
 
 /**
  * A SPEC_IN_PROGRESS task. Its project has `repos` (default: b-spec, then
- * a-spec, so name order differs from insert order); the task has none
- * unless `taskRepository` names one (C41).
+ * a-spec, so name order differs from insert order). The task's own
+ * repository is `taskRepository` when given, else the first of `repos`
+ * (GOT.80 D2, D3: a spec session always has a repository once started, and
+ * it is the task's own, never resolved from the project by name).
  */
 async function seedSpecTask(
   options: { repos?: string[]; taskRepository?: string; draft?: SpecContent | null } = {},
@@ -178,8 +180,9 @@ async function seedSpecTask(
     .insert(projects)
     .values({ key: `SPR${n}`, name: `spec ${n}`, jiraJql: `project = SPR${n}` })
     .returning({ id: projects.id });
+  const names = options.repos ?? ["b-spec", "a-spec"];
   const repositoryIds: Record<string, string> = {};
-  for (const name of options.repos ?? ["b-spec", "a-spec"]) {
+  for (const name of names) {
     const [repo] = await db
       .insert(repositories)
       .values({
@@ -193,11 +196,12 @@ async function seedSpecTask(
       .returning({ id: repositories.id });
     repositoryIds[name] = repo!.id;
   }
+  const taskRepository = options.taskRepository ?? names[0];
   const [task] = await db
     .insert(tasks)
     .values({
       projectId: project!.id,
-      repositoryId: options.taskRepository ? repositoryIds[options.taskRepository]! : null,
+      repositoryId: taskRepository ? repositoryIds[taskRepository]! : null,
       jiraKey: `SPR-${n}`,
       jiraSummary: `Receipt language ${n}`,
       jiraPriority: 1,
@@ -456,7 +460,7 @@ async function sendBack(taskId: string): Promise<void> {
 
 describe("spec role end to end (GOT.37)", () => {
   it("start, propose_spec, chat, a live turn, request-review mid-turn, send-back, approval and the sweep", async () => {
-    const s = await seedSpecTask();
+    const s = await seedSpecTask({ taskRepository: "a-spec" });
     const h = makeHarness();
     let during: { state: string; token: string | null } | undefined;
     let proposed: Record<string, unknown> | undefined;
@@ -505,7 +509,7 @@ describe("spec role end to end (GOT.37)", () => {
       "ASSIGNED -(execution.started)-> RUNNING",
     ]);
 
-    // C41: no task repository, so the project's first by name.
+    // GOT.80 D2, D3: the task's own (locked) repository, "a-spec" here.
     expect(h.prepared).toHaveLength(1);
     expect(h.prepared[0]!.input).toMatchObject({
       executionId: id,
@@ -734,7 +738,7 @@ describe("start_spec_session (GOT.37 AC1, AC7)", () => {
     );
   });
 
-  it("skips when the project has no repository, logs at error and writes no notification", async () => {
+  it("skips when the task has no repository, logs at error and writes no notification", async () => {
     const s = await seedSpecTask({ repos: [] });
     const h = makeHarness();
     const startId = await enqueue(s.taskId, "start_spec_session", null);
@@ -750,7 +754,7 @@ describe("start_spec_session (GOT.37 AC1, AC7)", () => {
     expect(records).toContainEqual(
       expect.objectContaining({
         msg: "command skipped",
-        fields: expect.objectContaining({ reason: "project has no repository" }),
+        fields: expect.objectContaining({ reason: "task has no repository" }),
       }),
     );
   });

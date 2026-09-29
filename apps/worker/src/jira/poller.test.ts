@@ -35,8 +35,10 @@ const logger: Logger = {
 
 /**
  * A minimal drizzle-shaped stub: `listJiraProjects` awaits `.from()`
- * directly, `listNonTerminalJiraTasks` chains `.from().where()`. Returning a
- * promise with a `.where()` method satisfies both call sites.
+ * directly, `listNonTerminalJiraTasks` chains `.from().where()` and builds
+ * its latest-scope subquery with `.from().where().orderBy().limit()`.
+ * Returning a promise with a `.where()` method, whose result is a promise
+ * with `.orderBy().limit()`, satisfies every call site.
  */
 function fakeProjectsDb(
   projects: Array<{ id: string; key: string; jiraJql: string }>,
@@ -45,7 +47,10 @@ function fakeProjectsDb(
     select: () => ({
       from: () =>
         Object.assign(Promise.resolve(projects), {
-          where: () => Promise.resolve([]),
+          where: () =>
+            Object.assign(Promise.resolve([]), {
+              orderBy: () => ({ limit: () => Promise.resolve([]) }),
+            }),
         }),
     }),
   };
@@ -62,7 +67,7 @@ afterEach(() => {
 
 describe("startJiraPoller credential gate (design.md §11.1, E4, C7)", () => {
   it("does not start and logs one warning when JIRA_BASE_URL is missing", async () => {
-    const client = { search: vi.fn(), issueExists: vi.fn(), getIssue: vi.fn() } satisfies JiraClient;
+    const client = { search: vi.fn(), getIssueStatus: vi.fn(), getIssue: vi.fn() } satisfies JiraClient;
     const stop = startJiraPoller({
       db: {} as never,
       config: configWith({ jiraBaseUrl: undefined }),
@@ -74,13 +79,13 @@ describe("startJiraPoller credential gate (design.md §11.1, E4, C7)", () => {
     await vi.advanceTimersByTimeAsync(10 * 60_000);
 
     expect(client.search).not.toHaveBeenCalled();
-    expect(client.issueExists).not.toHaveBeenCalled();
+    expect(client.getIssueStatus).not.toHaveBeenCalled();
     expect(records.filter((r) => r.level === "warn")).toHaveLength(1);
     await stop();
   });
 
   it("does not start when JIRA_EMAIL or JIRA_API_TOKEN is missing", async () => {
-    const client = { search: vi.fn(), issueExists: vi.fn(), getIssue: vi.fn() } satisfies JiraClient;
+    const client = { search: vi.fn(), getIssueStatus: vi.fn(), getIssue: vi.fn() } satisfies JiraClient;
     const stopA = startJiraPoller({
       db: {} as never,
       config: configWith({ jiraEmail: undefined }),
@@ -107,7 +112,7 @@ describe("startJiraPoller loop (design.md §11.1, E5)", () => {
   it("polls every project in sequence on a 60s cadence and stops cleanly", async () => {
     const client = {
       search: vi.fn(async () => []),
-      issueExists: vi.fn(),
+      getIssueStatus: vi.fn(),
       getIssue: vi.fn(),
     } satisfies JiraClient;
 
@@ -125,6 +130,7 @@ describe("startJiraPoller loop (design.md §11.1, E5)", () => {
 
     await vi.advanceTimersByTimeAsync(70_000);
     expect(client.search).toHaveBeenCalledTimes(1);
+    expect(records.filter((r) => r.level === "error")).toEqual([]);
 
     await vi.advanceTimersByTimeAsync(70_000);
     expect(client.search).toHaveBeenCalledTimes(2);
@@ -139,7 +145,7 @@ describe("startJiraPoller loop (design.md §11.1, E5)", () => {
       search: vi.fn(async () => {
         throw new Error("network error");
       }),
-      issueExists: vi.fn(),
+      getIssueStatus: vi.fn(),
       getIssue: vi.fn(),
     } satisfies JiraClient;
 
@@ -175,7 +181,7 @@ describe("startJiraPoller loop (design.md §11.1, E5)", () => {
         }
         return [];
       }),
-      issueExists: vi.fn(),
+      getIssueStatus: vi.fn(),
       getIssue: vi.fn(),
     } satisfies JiraClient;
 

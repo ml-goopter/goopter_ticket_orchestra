@@ -194,6 +194,16 @@
   margin: var(--space-1) 0 0;
 }
 
+/* GOT.65: notice shown under a `<pre>` whose JSON was cut at
+ * `JSON_PREVIEW_LIMIT` (TimelineRow.tsx) -- muted and small like other
+ * secondary timeline text, not styled as an error. */
+.timeline-item__truncated {
+  margin: var(--space-1) 0 0;
+  color: var(--color-text-faint);
+  font-size: var(--font-size-xs);
+  font-style: italic;
+}
+
 .timeline-item__transition {
   display: inline-flex;
   align-items: center;
