@@ -586,6 +586,68 @@ describe("TaskDetailView", () => {
     expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it("titles the Cancel button with the disabled reason when disabled and no title when enabled (GOT.66)", async () => {
+    const aggregate = makeTaskAggregate({ task: { ...makeTaskAggregate().task, state: "DONE" } });
+    const client = makeClient({ getTask: vi.fn().mockResolvedValue(aggregate) });
+    const { unmount } = renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Done"));
+    const cancelButton = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    expect(cancelButton.disabled).toBe(true);
+    expect(cancelButton.title).toContain("Cannot cancel a task");
+    unmount();
+
+    const enabledClient = makeClient();
+    renderDetail(enabledClient);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Implementing"));
+    const enabledCancelButton = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    expect(enabledCancelButton.disabled).toBe(false);
+    expect(enabledCancelButton.title).toBe("");
+  });
+
+  it("titles the Retry button with the disabled reason when disabled and no title when enabled (GOT.66)", async () => {
+    const aggregate = makeTaskAggregate({ task: { ...makeTaskAggregate().task, state: "IMPLEMENTING" } });
+    const client = makeClient({ getTask: vi.fn().mockResolvedValue(aggregate) });
+    const { unmount } = renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Implementing"));
+    const retryButton = screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement;
+    expect(retryButton.disabled).toBe(true);
+    expect(retryButton.title).toBe("Retry is only available while the task needs human input.");
+    unmount();
+
+    const enabledAggregate = makeTaskAggregate({ task: { ...makeTaskAggregate().task, state: "NEEDS_HUMAN" } });
+    const enabledClient = makeClient({ getTask: vi.fn().mockResolvedValue(enabledAggregate) });
+    renderDetail(enabledClient);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Needs human"));
+    const enabledRetryButton = screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement;
+    expect(enabledRetryButton.disabled).toBe(false);
+    expect(enabledRetryButton.title).toBe("");
+  });
+
+  it("titles the Reopen button with the disabled reason when disabled and no title when enabled (GOT.66)", async () => {
+    const aggregate = makeTaskAggregate({ task: { ...makeTaskAggregate().task, state: "IMPLEMENTING" } });
+    const client = makeClient({ getTask: vi.fn().mockResolvedValue(aggregate) });
+    const { unmount } = renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Implementing"));
+    const reopenButton = screen.getByRole("button", { name: "Reopen" }) as HTMLButtonElement;
+    expect(reopenButton.disabled).toBe(true);
+    expect(reopenButton.title).toContain("Cannot reopen a task");
+    unmount();
+
+    const enabledAggregate = makeTaskAggregate({ task: { ...makeTaskAggregate().task, state: "CANCELLED" } });
+    const enabledClient = makeClient({ getTask: vi.fn().mockResolvedValue(enabledAggregate) });
+    renderDetail(enabledClient);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Cancelled"));
+    const enabledReopenButton = screen.getByRole("button", { name: "Reopen" }) as HTMLButtonElement;
+    expect(enabledReopenButton.disabled).toBe(false);
+    expect(enabledReopenButton.title).toBe("");
+  });
+
   it("shows the task state exactly once in the header, via the StateBadge only (T3)", async () => {
     const client = makeClient();
     renderDetail(client);
