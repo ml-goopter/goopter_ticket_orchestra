@@ -761,11 +761,11 @@ A blocking `raise_issue` does not kill the session. It sets a flag. When the ada
 Start of an implementation execution:
 
 1. `git -C repos/X.git fetch --prune`
-2. `git -C repos/X.git worktree add work/<id> -B agent/<KEY>-<short> <start point>`, where the start point is `origin/agent/<KEY>-<short>` when the remote has that branch, else `origin/<default_branch>` (§9.5).
+2. `git -C repos/X.git worktree add work/<id> -B agent/<KEY>-<short> <start point>`, with the start point from §9.5.
 3. Run `repositories.setup_command` if set. Failure is an infrastructure failure.
 4. Write `.orchestra/context.json` into the worktree with task, spec, decisions, and the review command. Git-ignored via `.git/info/exclude`.
 
-Resume after eviction: same, but the branch is created from `origin/agent/<KEY>-<short>`.
+Resume after eviction: same steps, at the execution's recorded worktree path.
 
 Spec executions use a read-only worktree of the default branch under `work/<id>` too, removed when the spec is approved.
 
@@ -807,6 +807,8 @@ Resume prompts prepend one of:
 - `## Specification revised to version N` with a unified diff of the rendered spec, and an instruction to reconcile work already done
 - `## CI failed on <sha>` with failing check names, log excerpts up to 200 lines each, and round count
 - `## Message from the user` for conversation turns on an open issue
+
+The start prompt of a new execution with no `retry_of` whose branch started from `origin/agent/<KEY>-<short>` (§9.5) prepends `## Earlier work on this branch`: the branch already holds commits from earlier executions of this task, possibly made against an earlier spec revision, and the agent reviews them against the current specification and reconciles before continuing.
 
 ### 9.3 Runner loop
 
@@ -856,7 +858,7 @@ CI and review round limits are enforced at the transition (5.3), not here.
 
 `NEEDS_HUMAN` has two user actions: retry, which creates a fresh execution from `READY` with a fresh worktree, or cancel.
 
-Start point of a fresh implementation worktree: every implementation execution that prepares a new worktree (a retry started fresh, a human retry from `NEEDS_HUMAN`, the first execution after a reopen, any claim from `READY`) creates `agent/<KEY>-<short>` from `origin/agent/<KEY>-<short>` when the remote has that branch, else from `origin/<default_branch>`. The branch name depends only on the task, so the new execution keeps the commits earlier executions pushed and its own push is a fast-forward. The worker never force-pushes.
+Start point of an implementation worktree: every implementation execution that prepares a new worktree (a retry started fresh, a human retry from `NEEDS_HUMAN`, the first execution after a reopen, any claim from `READY`), and the recreation of an evicted worktree (§9.1), creates `agent/<KEY>-<short>` from `origin/agent/<KEY>-<short>` when the remote has that branch, else from `origin/<default_branch>`. The branch name depends only on the task, so the new execution keeps the commits earlier executions pushed and its own push is a fast-forward. The worker never force-pushes.
 
 ### 9.6 Event types
 

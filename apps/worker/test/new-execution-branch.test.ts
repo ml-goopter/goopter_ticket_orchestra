@@ -14,6 +14,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { createExecutionRegistry } from "../src/agent-tools/index.js";
 import type { Logger } from "../src/logger.js";
 import { createRunner, type Runner } from "../src/runner/index.js";
+import { EARLIER_WORK_HEADER } from "../src/runner/runner.js";
 import { claimNextTask } from "../src/scheduler/index.js";
 import { WorktreeManager } from "../src/worktrees/index.js";
 import { SEED_SPEC, seedWorkerRow, startTestDb, type TestDb } from "./harness.js";
@@ -229,6 +230,14 @@ async function moveTask(taskId: string, ...triggers: Trigger[]): Promise<void> {
   }
 }
 
+/** The `worktree.prepared` payloads written for `executionId`. */
+async function preparedPayloads(executionId: string): Promise<unknown[]> {
+  const events = await db.query.executionEvents.findMany({
+    where: (e, { and, eq }) => and(eq(e.executionId, executionId), eq(e.type, "worktree.prepared")),
+  });
+  return events.map((e) => e.payload);
+}
+
 const remoteTip = (branch: string): string =>
   git(remote, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`);
 
@@ -239,11 +248,11 @@ const remoteTip = (branch: string): string =>
 async function firstExecutionPushes(manager: WorktreeManager, taskId: string) {
   const first = await claim();
   expect(first.taskId).toBe(taskId);
-  let pushed: { head: string; branch: string } | undefined;
+  let pushed: { head: string; branch: string; prompt: string } | undefined;
   const runner = makeRunner(manager, async (req) => {
     const head = await commit(req.cwd, "first.txt");
     git(req.cwd, "push", "-q", "origin", "HEAD");
-    pushed = { head, branch: git(req.cwd, "branch", "--show-current") };
+    pushed = { head, branch: git(req.cwd, "branch", "--show-current"), prompt: req.prompt };
     await completeExecution(first.executionId);
   });
   await runner.start(first);
@@ -254,7 +263,7 @@ async function firstExecutionPushes(manager: WorktreeManager, taskId: string) {
 
 interface SecondRun {
   executionId: string;
-  during: { head: string; branch: string; log: string[] };
+  during: { head: string; branch: string; log: string[]; prompt: string };
   push: { ok: boolean; stderr: string };
   head: string;
 }
@@ -268,6 +277,7 @@ async function secondExecutionPushes(manager: WorktreeManager): Promise<SecondRu
       head: git(req.cwd, "rev-parse", "HEAD"),
       branch: git(req.cwd, "branch", "--show-current"),
       log: git(req.cwd, "log", "--format=%s").split("\n"),
+      prompt: req.prompt,
     };
     const head = await commit(req.cwd, "second.txt");
     // Plain push, as the agent does: never forced (§9.2).
@@ -298,6 +308,17 @@ describe("new implementation execution start point (GOT.94, §6.5, §9.5)", () =
     expect(second.during.log).toContain("first.txt");
     expect(remoteTip(first.branch)).toBe(second.head);
     expect(git(remote, "rev-parse", `${second.head}^`)).toBe(first.head);
+    // F1, F2: the agent is told the branch holds earlier executions' work,
+    // and the timeline shows where the branch started.
+    expect(second.during.prompt.startsWith(`${EARLIER_WORK_HEADER}\n\n## Ticket`)).toBe(true);
+    expect(await preparedPayloads(second.executionId)).toEqual([
+      expect.objectContaining({ branch: first.branch, start_point: "remote_branch" }),
+    ]);
+    // The first execution started from the default branch: no header.
+    expect(first.prompt.startsWith("## Ticket")).toBe(true);
+    expect(await preparedPayloads(first.first.executionId)).toEqual([
+      expect.objectContaining({ start_point: "default_branch" }),
+    ]);
   });
 
   it("a reopened cancelled task on another host starts from the pushed task branch and pushes fast-forward", async () => {
@@ -318,6 +339,10 @@ describe("new implementation execution start point (GOT.94, §6.5, §9.5)", () =
     expect(second.push).toEqual({ ok: true, stderr: "" });
     expect(remoteTip(first.branch)).toBe(second.head);
     expect(git(remote, "rev-parse", `${second.head}^`)).toBe(first.head);
+    expect(second.during.prompt.startsWith(`${EARLIER_WORK_HEADER}\n\n## Ticket`)).toBe(true);
+    expect(await preparedPayloads(second.executionId)).toEqual([
+      expect.objectContaining({ branch: first.branch, start_point: "remote_branch" }),
+    ]);
   });
 
   it("with no remote task branch, starts from the default branch untracked, as a first start does", async () => {
@@ -336,5 +361,11 @@ describe("new implementation execution start point (GOT.94, §6.5, §9.5)", () =
     expect(upstream.ok).toBe(false);
     expect(run.push).toEqual({ ok: true, stderr: "" });
     expect(remoteTip(run.during.branch)).toBe(run.head);
+    // No earlier work: the prompt is the plain start prompt.
+    expect(run.during.prompt.startsWith("## Ticket")).toBe(true);
+    expect(run.during.prompt).not.toContain("## Earlier work on this branch");
+    expect(await preparedPayloads(run.executionId)).toEqual([
+      expect.objectContaining({ branch: run.during.branch, start_point: "default_branch" }),
+    ]);
   });
 });

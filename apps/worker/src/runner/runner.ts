@@ -368,6 +368,17 @@ export function freshRetryHeader(
     : header;
 }
 
+/**
+ * Header put before the start prompt of a new execution without a failed
+ * attempt to name (a human retry, a reopen) whose working branch starts
+ * from the task's remote branch (§9.2, §9.5, GOT.94): that branch holds
+ * earlier executions' work, possibly for an older specification revision.
+ */
+export const EARLIER_WORK_HEADER = [
+  "## Earlier work on this branch",
+  "The working branch already holds commits from earlier executions of this task, possibly made against an earlier revision of the specification. Review them against the current specification and reconcile them before continuing.",
+].join("\n");
+
 export interface Runner {
   /** Scheduler hand-off (§6.3). Never blocks the tick. */
   readonly onClaimed: OnClaimed;
@@ -1595,7 +1606,8 @@ export function createRunner(deps: RunnerDeps): Runner {
    * failed attempt's branch first when it ran on this host (C27). Every
    * prepared worktree, a retry's or a new execution's claimed from READY,
    * starts from the task's remote branch, or from the default branch when
-   * the remote has none (§9.5, GOT.94).
+   * the remote has none (§9.5, GOT.94). A new execution without `retryOf`
+   * that starts from the remote branch gets `EARLIER_WORK_HEADER` (§9.2).
    */
   async function prepareAndRun(
     state: RunState,
@@ -1690,7 +1702,7 @@ export function createRunner(deps: RunnerDeps): Runner {
           payload: {
             worktree_path: prepared.worktreePath,
             branch: prepared.branch,
-            ...(retryOf && prepared.startPoint ? { start_point: prepared.startPoint } : {}),
+            ...(prepared.startPoint ? { start_point: prepared.startPoint } : {}),
           },
         });
       });
@@ -1709,7 +1721,9 @@ export function createRunner(deps: RunnerDeps): Runner {
     const startPrompt = await implementationUserPrompt(ctx, spec, prepared.branch, log);
     const prompt = retryOf
       ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure", reuse !== null, nudge)}\n\n${startPrompt}`
-      : startPrompt;
+      : prepared.startPoint === "remote_branch"
+        ? `${EARLIER_WORK_HEADER}\n\n${startPrompt}`
+        : startPrompt;
 
     if (state.stopReason !== null) return;
     await runSession(state, ctx, "main", log, (token, signal) =>
