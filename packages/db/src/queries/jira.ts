@@ -1,5 +1,6 @@
 import { TaskState } from "@orchestra/core";
-import { and, asc, eq, gt, inArray, max, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, max, notInArray, or, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { appendEvent } from "../events.js";
 import { executionEvents } from "../schema/events.js";
 import { projects } from "../schema/projects.js";
@@ -7,6 +8,7 @@ import { pullRequests } from "../schema/pull_requests.js";
 import { specificationApprovals, tasks } from "../schema/tasks.js";
 import { users } from "../schema/users.js";
 import { transition, type Actor, type DbOrTx, type Tx } from "../transition.js";
+import { insertNotification } from "./agent-tools.js";
 import { listActiveExecutionIds } from "./task-cost.js";
 
 /** One row of `projects`, trimmed to what the Jira poller needs (design.md §11.1). */
@@ -30,18 +32,107 @@ const TERMINAL_TASK_STATES: TaskState[] = [
   TaskState.FAILED,
 ];
 
+/**
+ * Where a task's Jira ticket stands relative to the project (GOT.77, user
+ * decision O1): `closed` is status category Done, `left_jql` is open but no
+ * longer returned by the project's JQL, `in_scope` is neither.
+ */
+export type JiraScope = "in_scope" | "closed" | "left_jql";
+
+const JIRA_SCOPES: readonly JiraScope[] = ["in_scope", "closed", "left_jql"];
+
+/** Tasks whose ticket closing or leaving the JQL cancels them (O1). */
+const JIRA_SPEC_GROUP_STATES: readonly TaskState[] = [
+  TaskState.NEEDS_SPEC,
+  TaskState.SPEC_IN_PROGRESS,
+  TaskState.SPEC_REVIEW,
+  TaskState.SPEC_APPROVED,
+];
+
+/**
+ * What `applyJiraScope` does (GOT.77):
+ * - `cancel`: spec-group task, ticket closed or out of the JQL.
+ * - `signal`: any other non-terminal task, ticket closed or out of the JQL,
+ *   and the last recorded scope differs: one notification plus one note.
+ * - `restore`: that task's ticket is back in scope after a signal: one note,
+ *   no notification, so a later close signals again.
+ * - `none`: everything else, including every DONE/CANCELLED/FAILED task.
+ */
+export type JiraScopeAction = "none" | "cancel" | "signal" | "restore";
+
+/**
+ * The GOT.77 decision table. `lastScope` is the scope recorded by the most
+ * recent `signal`/`restore` note, null when there is none (read as
+ * `in_scope`). Pure, so the poller can skip the transaction for the common
+ * no-op case and `applyJiraScope` can re-decide under the task lock.
+ */
+export function jiraScopeAction(
+  state: TaskState,
+  lastScope: JiraScope | null,
+  scope: JiraScope,
+): JiraScopeAction {
+  if (TERMINAL_TASK_STATES.includes(state)) return "none";
+  if (JIRA_SPEC_GROUP_STATES.includes(state)) {
+    return scope === "in_scope" ? "none" : "cancel";
+  }
+  const last = lastScope ?? "in_scope";
+  if (scope === last) return "none";
+  return scope === "in_scope" ? "restore" : "signal";
+}
+
 export interface NonTerminalJiraTaskRow {
   id: string;
   jiraKey: string;
+  state: TaskState;
+  /** Latest scope recorded by a jira-poller signal/restore note, or null. */
+  jiraScope: JiraScope | null;
 }
 
-/** Non-terminal tasks of one project, candidates for the "still on Jira?" 404 check (E3). */
+// Aliased so the correlated reference to `tasks.id` renders qualified, as
+// in `listAttention`: an unaliased raw subquery resolves a bare `id` against
+// the inner table.
+const jiraScopeEvent = alias(executionEvents, "jira_scope_event");
+
+/**
+ * The latest `jiraScope` recorded on a task's timeline by a jira-poller
+ * `agent.note`, as a scalar subquery correlated on `tasks.id`.
+ */
+function latestJiraScopeSql(db: DbOrTx) {
+  return sql<string | null>`${db
+    .select({ jiraScope: sql`${jiraScopeEvent.payload} ->> 'jiraScope'` })
+    .from(jiraScopeEvent)
+    .where(
+      and(
+        eq(jiraScopeEvent.taskId, tasks.id),
+        eq(jiraScopeEvent.type, "agent.note"),
+        sql`${jiraScopeEvent.payload} ->> 'source' = 'jira-poller'`,
+        sql`${jiraScopeEvent.payload} ->> 'jiraScope' is not null`,
+      ),
+    )
+    .orderBy(desc(jiraScopeEvent.id))
+    .limit(1)}`;
+}
+
+function toJiraScope(value: string | null): JiraScope | null {
+  return JIRA_SCOPES.includes(value as JiraScope) ? (value as JiraScope) : null;
+}
+
+/**
+ * Non-terminal tasks of one project, with their state and last recorded
+ * Jira scope: candidates for the 404 check (E3) and the closed / left-JQL
+ * check (GOT.77).
+ */
 export async function listNonTerminalJiraTasks(
   db: DbOrTx,
   projectId: string,
 ): Promise<NonTerminalJiraTaskRow[]> {
-  return db
-    .select({ id: tasks.id, jiraKey: tasks.jiraKey })
+  const rows = await db
+    .select({
+      id: tasks.id,
+      jiraKey: tasks.jiraKey,
+      state: tasks.state,
+      jiraScope: latestJiraScopeSql(db),
+    })
     .from(tasks)
     .where(
       and(
@@ -49,6 +140,122 @@ export async function listNonTerminalJiraTasks(
         notInArray(tasks.state, TERMINAL_TASK_STATES),
       ),
     );
+  return rows.map((row) => ({ ...row, jiraScope: toJiraScope(row.jiraScope) }));
+}
+
+export interface ApplyJiraScopeInput {
+  taskId: string;
+  jiraKey: string;
+  scope: JiraScope;
+  actor: Actor;
+}
+
+function scopeReason(jiraKey: string, scope: Exclude<JiraScope, "in_scope">): string {
+  return scope === "closed"
+    ? `Jira ticket ${jiraKey} was closed in Jira (status category Done)`
+    : `Jira ticket ${jiraKey} no longer matches the project's JQL`;
+}
+
+/**
+ * Applies one ticket observation to its task (GOT.77, user decision O1).
+ * Locks the task row `FOR UPDATE` first and decides with `jiraScopeAction`
+ * from the locked state and the latest recorded scope, so a task that moved
+ * since the poll read is judged by its current state and two concurrent
+ * polls raise one signal, not two.
+ *
+ * `cancel` mirrors the 404 path (`failJiraTaskNotFound`) and
+ * `POST /tasks/:id/cancel`: task transition, then every active execution
+ * (task row before execution row), then the `agent.note` reason. `signal`
+ * inserts a broadcast `jira_out_of_scope` notification and a note;
+ * `restore` only a note. Every note carries `jiraScope`, which is what the
+ * next call reads as the last recorded scope.
+ */
+export async function applyJiraScope(
+  tx: Tx,
+  input: ApplyJiraScopeInput,
+): Promise<JiraScopeAction> {
+  const [row] = await tx
+    .select({ state: tasks.state })
+    .from(tasks)
+    .where(eq(tasks.id, input.taskId))
+    .for("update");
+  if (!row) return "none";
+
+  const [last] = await tx
+    .select({ jiraScope: latestJiraScopeSql(tx) })
+    .from(tasks)
+    .where(eq(tasks.id, input.taskId));
+  const action = jiraScopeAction(
+    row.state,
+    toJiraScope(last?.jiraScope ?? null),
+    input.scope,
+  );
+
+  if (action === "none") return action;
+
+  if (action === "cancel") {
+    const scope = input.scope as Exclude<JiraScope, "in_scope">;
+    await transition(tx, {
+      entity: "task",
+      id: input.taskId,
+      trigger: "task.cancelled",
+      actor: input.actor,
+    });
+    const activeExecutionIds = await listActiveExecutionIds(tx, input.taskId);
+    for (const executionId of activeExecutionIds) {
+      await transition(tx, {
+        entity: "execution",
+        id: executionId,
+        trigger: "execution.cancelled",
+        actor: input.actor,
+      });
+    }
+    await appendEvent(tx, {
+      taskId: input.taskId,
+      executionId: null,
+      type: "agent.note",
+      payload: {
+        source: "jira-poller",
+        jiraScope: scope,
+        reason: `${scopeReason(input.jiraKey, scope)}; task cancelled`,
+      },
+    });
+    return action;
+  }
+
+  if (action === "signal") {
+    const scope = input.scope as Exclude<JiraScope, "in_scope">;
+    const what = scope === "closed" ? "was closed in Jira" : "left the project's JQL";
+    await appendEvent(tx, {
+      taskId: input.taskId,
+      executionId: null,
+      type: "agent.note",
+      payload: {
+        source: "jira-poller",
+        jiraScope: scope,
+        reason: `${scopeReason(input.jiraKey, scope)} while the task is ${row.state}; not cancelled, a human must decide`,
+      },
+    });
+    await insertNotification(tx, {
+      userId: null,
+      taskId: input.taskId,
+      kind: "jira_out_of_scope",
+      title: `${input.jiraKey} ${what} while work is under way`,
+    });
+    return action;
+  }
+
+  await appendEvent(tx, {
+    taskId: input.taskId,
+    executionId: null,
+    type: "agent.note",
+    payload: {
+      source: "jira-poller",
+      jiraScope: "in_scope",
+      reason: `Jira ticket ${input.jiraKey} is open and matches the project's JQL again`,
+    },
+  });
+  return action;
 }
 
 export interface UpsertJiraTaskInput {

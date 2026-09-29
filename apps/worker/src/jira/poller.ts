@@ -1,15 +1,23 @@
 import {
+  applyJiraScope,
   failJiraTaskNotFound,
+  jiraScopeAction,
   listJiraProjects,
   listNonTerminalJiraTasks,
   upsertJiraTask,
   type Actor,
   type Db,
   type JiraProjectRow,
+  type JiraScope,
 } from "@orchestra/db";
 import type { WorkerConfig } from "../config.js";
 import type { Logger } from "../logger.js";
-import { createJiraClient, type JiraClient } from "./client.js";
+import {
+  JIRA_DONE_STATUS_CATEGORY,
+  createJiraClient,
+  type JiraClient,
+  type JiraSearchIssue,
+} from "./client.js";
 
 /** design.md §11.1, E5: every 60 seconds, up to 10% jitter. */
 export const DEFAULT_JIRA_POLL_INTERVAL_MS = 60_000;
@@ -28,10 +36,14 @@ export interface PollProjectOptions {
 
 /**
  * Polls one project (design.md §11.1). Runs the project's JQL with
- * `ORDER BY created ASC` appended (E1), upserts every result, then checks
- * every non-terminal task whose key the search did not return: a 404 moves
- * it to `FAILED` (E3), anything else — including a transient error on that
- * one lookup — leaves it untouched.
+ * `ORDER BY created ASC` appended (E1) and upserts every result. Then, for
+ * every non-terminal task, works out where its ticket stands (GOT.77, user
+ * decision O1): returned by the search, it is `closed` when its status
+ * category is Done and `in_scope` otherwise; not returned, its status is
+ * looked up, a 404 moves the task to `FAILED` (E3), Done is `closed`, and
+ * anything else is `left_jql`. `applyJiraScope` then cancels a spec-group
+ * task or signals one with work under way. A transient error on that one
+ * lookup leaves the task untouched.
  *
  * A failure fetching the search results itself (network error, non-2xx) is
  * logged and ends this project's poll here; it never touches the database
@@ -64,7 +76,9 @@ export async function pollProject(options: PollProjectOptions): Promise<void> {
     return;
   }
 
-  const seenKeys = new Set(issues.map((issue) => issue.key));
+  const issuesByKey = new Map<string, JiraSearchIssue>(
+    issues.map((issue) => [issue.key, issue]),
+  );
   const syncedAt = now();
 
   for (const issue of issues) {
@@ -98,25 +112,67 @@ export async function pollProject(options: PollProjectOptions): Promise<void> {
   const nonTerminal = await listNonTerminalJiraTasks(db, project.id);
   for (const task of nonTerminal) {
     if (shouldStop()) return;
-    if (seenKeys.has(task.jiraKey)) continue;
 
-    let exists: boolean;
+    let scope: JiraScope;
+    const found = issuesByKey.get(task.jiraKey);
+    if (found) {
+      scope = isDone(found.statusCategory) ? "closed" : "in_scope";
+    } else {
+      let status;
+      try {
+        status = await client.getIssueStatus(task.jiraKey);
+      } catch (err) {
+        logger.warn(
+          {
+            projectId: project.id,
+            jiraKey: task.jiraKey,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "jira status check failed; task left untouched",
+        );
+        continue;
+      }
+
+      if (status === null) {
+        await failNotFound(task);
+        continue;
+      }
+      scope = isDone(status.statusCategory) ? "closed" : "left_jql";
+    }
+
+    // Cheap pre-check on the listed state; `applyJiraScope` re-decides
+    // under the task lock, so a stale read here only costs a no-op.
+    if (jiraScopeAction(task.state, task.jiraScope, scope) === "none") continue;
+
     try {
-      exists = await client.issueExists(task.jiraKey);
+      const action = await db.transaction((tx) =>
+        applyJiraScope(tx, {
+          taskId: task.id,
+          jiraKey: task.jiraKey,
+          scope,
+          actor,
+        }),
+      );
+      if (action !== "none") {
+        logger.info(
+          { projectId: project.id, jiraKey: task.jiraKey, taskId: task.id, scope, action },
+          "jira ticket scope change applied",
+        );
+      }
     } catch (err) {
-      logger.warn(
+      logger.error(
         {
           projectId: project.id,
           jiraKey: task.jiraKey,
+          scope,
           err: err instanceof Error ? err.message : String(err),
         },
-        "jira 404 check failed; task left untouched",
+        "applying jira ticket scope change failed",
       );
-      continue;
     }
+  }
 
-    if (exists) continue;
-
+  async function failNotFound(task: { id: string; jiraKey: string }): Promise<void> {
     try {
       await db.transaction((tx) =>
         failJiraTaskNotFound(tx, {
@@ -140,6 +196,10 @@ export async function pollProject(options: PollProjectOptions): Promise<void> {
       );
     }
   }
+}
+
+function isDone(statusCategory: string | null | undefined): boolean {
+  return statusCategory === JIRA_DONE_STATUS_CATEGORY;
 }
 
 export interface StartJiraPollerOptions {

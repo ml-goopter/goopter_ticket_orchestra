@@ -156,6 +156,9 @@ const notificationKind = makeEnum([
   "needs_human",
   "ready_for_merge",
   "execution_failed",
+  // GOT.77 (user decision O1): the Jira ticket of a task with work under way
+  // was closed or left the project's JQL; a human decides what happens next.
+  "jira_out_of_scope",
 ] as const);
 export const NotificationKind = notificationKind.obj;
 export const NotificationKindSchema = notificationKind.schema;
