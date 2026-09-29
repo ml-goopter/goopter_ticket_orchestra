@@ -510,9 +510,11 @@ stateDiagram-v2
   NEEDS_HUMAN --> CANCELLED: user cancels
   READY_FOR_MERGE --> NEEDS_HUMAN: pr closed unmerged
   BLOCKED --> READY: dependency resolved
+  CANCELLED --> SPEC_APPROVED: user reopens, approved spec exists
+  CANCELLED --> NEEDS_SPEC: user reopens, no approved spec
 ```
 
-Any state except `DONE` may go to `CANCELLED` by user action. `FAILED` is reserved for a task whose Jira ticket disappears or whose repository is deleted.
+Any state except `DONE` may go to `CANCELLED` by user action. `CANCELLED` is not final: the user may reopen it (§12.2 `POST /tasks/:id/reopen`), moving it to `SPEC_APPROVED` if it has an approved spec revision or to `NEEDS_SPEC` otherwise; §6.2 then promotes a reopened `SPEC_APPROVED` task on to `READY` or `BLOCKED` the same as any other. `DONE` remains terminal, with no transition out of it. `FAILED` is reserved for a task whose Jira ticket disappears or whose repository is deleted.
 
 Derived dashboard columns:
 
@@ -1057,6 +1059,7 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 | PATCH | `/tasks/:id` | `runtime_override`, `dependencies[]` |
 | POST | `/tasks/:id/cancel` |  |
 | POST | `/tasks/:id/retry` | from `NEEDS_HUMAN` |
+| POST | `/tasks/:id/reopen` | from `CANCELLED` only; to `SPEC_APPROVED` if `approved_revision_id` is set, else `NEEDS_SPEC` (§5.1) |
 
 ### 12.3 Specification
 

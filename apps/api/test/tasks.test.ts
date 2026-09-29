@@ -781,6 +781,88 @@ describe("POST /api/tasks/:id/retry (AC6)", () => {
   });
 });
 
+describe("POST /api/tasks/:id/reopen (GOT.55)", () => {
+  it("reopens a CANCELLED task with an approved spec to SPEC_APPROVED", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-60",
+      state: "CANCELLED",
+      priority: 60,
+    });
+    const revisionId = await seedRevision(h.db, taskId, 1, "approved", {});
+    await h.sql`update tasks set approved_revision_id = ${revisionId} where id = ${taskId}`;
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ from: "CANCELLED", to: "SPEC_APPROVED" });
+
+    const audits = await listAuditEventsForEntity(h.sql, taskId);
+    expect(audits.some((a) => a.toState === "SPEC_APPROVED")).toBe(true);
+
+    const events = await listExecutionEventsForTask(h.sql, taskId);
+    expect(events.some((e) => e.type === "task.state_changed")).toBe(true);
+  });
+
+  it("reopens a CANCELLED task with no approved spec to NEEDS_SPEC", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-61",
+      state: "CANCELLED",
+      priority: 61,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ from: "CANCELLED", to: "NEEDS_SPEC" });
+
+    const audits = await listAuditEventsForEntity(h.sql, taskId);
+    expect(audits.some((a) => a.toState === "NEEDS_SPEC")).toBe(true);
+  });
+
+  it("returns 409 ILLEGAL_TRANSITION reopening a task that is not CANCELLED", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-62",
+      state: "READY",
+      priority: 62,
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe("ILLEGAL_TRANSITION");
+  });
+
+  it("returns 404 for an unknown id", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/tasks/00000000-0000-4000-8000-000000000000/reopen",
+      headers: { cookie },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("rejects without a session cookie", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-63",
+      state: "CANCELLED",
+      priority: 63,
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
 describe("auth required (AC7)", () => {
   it.each([
     ["GET", "/api/tasks"],
@@ -789,6 +871,7 @@ describe("auth required (AC7)", () => {
     ["PATCH", "/api/tasks/00000000-0000-4000-8000-000000000000"],
     ["POST", "/api/tasks/00000000-0000-4000-8000-000000000000/cancel"],
     ["POST", "/api/tasks/00000000-0000-4000-8000-000000000000/retry"],
+    ["POST", "/api/tasks/00000000-0000-4000-8000-000000000000/reopen"],
   ])("rejects %s %s without a session cookie", async (method, url) => {
     const res = await app.inject({ method: method as "GET", url });
     expect(res.statusCode).toBe(401);

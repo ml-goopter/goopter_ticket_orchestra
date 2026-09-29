@@ -24,6 +24,20 @@ describe("resolveTransition: documented illegal moves (design.md §5)", () => {
     expect(result.ok).toBe(false);
   });
 
+  // GOT.55: DONE stays terminal under the new reopen triggers too, and
+  // FAILED (never reopenable) rejects them as well.
+  it("task DONE and FAILED reject both reopen triggers", () => {
+    for (const from of [TaskState.DONE, TaskState.FAILED]) {
+      for (const trigger of [
+        "task.reopened.spec_approved",
+        "task.reopened.needs_spec",
+      ] as const) {
+        const result = resolveTransition("task", from, trigger);
+        expect(result.ok).toBe(false);
+      }
+    }
+  });
+
   it("task NEEDS_SPEC on task.claimed is illegal", () => {
     const result = resolveTransition("task", TaskState.NEEDS_SPEC, "task.claimed");
     expect(result.ok).toBe(false);

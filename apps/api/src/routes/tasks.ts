@@ -421,6 +421,40 @@ export default async function tasksRoutes(app: FastifyInstance): Promise<void> {
     return { from: result.from, to: result.to };
   });
 
+  /**
+   * design.md §12.2 POST /tasks/:id/reopen: only legal from CANCELLED. The
+   * destination depends on `tasks.approved_revision_id` (§5.1, GOT.55) --
+   * with an approved spec it goes to SPEC_APPROVED, where the worker's
+   * existing §6.2 promotion step picks it up to READY or BLOCKED; without
+   * one it goes to NEEDS_SPEC. `getTaskAggregate` reads that column inside
+   * the same transaction `transition()` locks and writes in, so the choice
+   * and the move are atomic; nothing else can set approved_revision_id on a
+   * CANCELLED task in between (only spec approval writes it, and that only
+   * fires from SPEC_REVIEW).
+   */
+  app.post("/tasks/:id/reopen", async (request) => {
+    const id = parseTaskId(request.params);
+    const actor: Actor = { kind: "user", id: request.user!.id };
+
+    let result: TransitionResult<TaskState>;
+    try {
+      result = await app.db.transaction(async (tx) => {
+        const aggregate = await getTaskAggregate(tx, id);
+        if (!aggregate) {
+          throw new NotFoundError("task", id);
+        }
+        const trigger = aggregate.task.approvedRevisionId
+          ? "task.reopened.spec_approved"
+          : "task.reopened.needs_spec";
+        return transition(tx, { entity: "task", id, trigger, actor });
+      });
+    } catch (err) {
+      rethrowTransitionError(err);
+    }
+
+    return { from: result.from, to: result.to };
+  });
+
   app.post("/tasks/:id/retry", async (request) => {
     const id = parseTaskId(request.params);
     const actor: Actor = { kind: "user", id: request.user!.id };

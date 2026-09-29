@@ -2,7 +2,7 @@ import { EXECUTION_EVENT_TYPES, TASK_TRANSITIONS } from "@orchestra/core";
 import { diffSpecs } from "@orchestra/prompts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
-import { ApiError, createApiClient, type BoardApiClient } from "../api/client.js";
+import { ApiError, createApiClient, type TaskDetailApiClient } from "../api/client.js";
 import { TimelineEventSchema, type TaskAggregate, type TimelineEvent } from "../api/types.js";
 import { useRefetchOnReconnect } from "../board/useEventReconnect.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
@@ -19,7 +19,7 @@ import { formatUsd } from "../ui/number.js";
 
 export interface TaskDetailViewProps {
   /** Injectable for tests; defaults to a real createApiClient(). */
-  client?: BoardApiClient;
+  client?: TaskDetailApiClient;
   /** Injectable for tests; defaults to the real `EventSource`. */
   createEventSource?: EventSourceFactory;
 }
@@ -40,6 +40,20 @@ const CANCELLABLE_TASK_STATES = new Set<string>(
   TASK_TRANSITIONS.filter((row) => row.entity === "task" && row.trigger === "task.cancelled").map(
     (row) => row.from,
   ),
+);
+
+/**
+ * `TaskState`s from which `packages/core/src/transitions.ts` allows either
+ * reopen trigger (GOT.55, task contract item 4): derived from the
+ * transition table the same way `CANCELLABLE_TASK_STATES` is, so it stays
+ * correct if the table changes. Today that is just `CANCELLED`.
+ */
+const REOPENABLE_TASK_STATES = new Set<string>(
+  TASK_TRANSITIONS.filter(
+    (row) =>
+      row.entity === "task" &&
+      (row.trigger === "task.reopened.spec_approved" || row.trigger === "task.reopened.needs_spec"),
+  ).map((row) => row.from),
 );
 
 /**
@@ -75,7 +89,7 @@ export function TaskDetailView({ client, createEventSource }: TaskDetailViewProp
 
 interface TaskDetailPanelProps {
   id: string;
-  client: BoardApiClient;
+  client: TaskDetailApiClient;
   createEventSource?: EventSourceFactory;
 }
 
@@ -246,6 +260,17 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
     }
   }, [apiClient, id, loadAll]);
 
+  const handleReopen = useCallback(async () => {
+    if (!id) return;
+    setActionError(null);
+    try {
+      await apiClient.reopenTask(id);
+      await loadAll();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Failed to reopen the task.");
+    }
+  }, [apiClient, id, loadAll]);
+
   const revisions = aggregate?.revisions ?? [];
 
   useEffect(() => {
@@ -298,6 +323,7 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
 
   const canRetry = aggregate.task.state === "NEEDS_HUMAN";
   const canCancel = CANCELLABLE_TASK_STATES.has(aggregate.task.state);
+  const canReopen = REOPENABLE_TASK_STATES.has(aggregate.task.state);
   const branch = aggregate.latestExecutions.implementation?.branch ?? null;
 
   return (
@@ -331,6 +357,14 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
             onClick={() => void handleRetry()}
           >
             Retry
+          </button>
+          <button
+            type="button"
+            disabled={!canReopen}
+            title={canReopen ? undefined : `Cannot reopen a task in ${humanizeEnum(aggregate.task.state)}.`}
+            onClick={() => void handleReopen()}
+          >
+            Reopen
           </button>
           <Link to={`/tasks/${aggregate.task.id}/spec`}>Open spec builder</Link>
         </div>
