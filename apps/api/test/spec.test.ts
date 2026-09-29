@@ -222,13 +222,18 @@ async function snapshot(taskId: string) {
 }
 
 describe("POST /api/tasks/:id/spec/session (P1)", () => {
-  it("moves NEEDS_SPEC to SPEC_IN_PROGRESS and enqueues exactly one start_spec_session", async () => {
+  it("moves NEEDS_SPEC to SPEC_IN_PROGRESS, locks the given repository, and enqueues exactly one start_spec_session", async () => {
     const { id } = await newTask("NEEDS_SPEC");
-    const res = await post(`/api/tasks/${id}/spec/session`);
+    const res = await post(`/api/tasks/${id}/spec/session`, {
+      repository_id: fx.repositoryId,
+    });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ from: "NEEDS_SPEC", to: "SPEC_IN_PROGRESS" });
 
-    expect((await taskRow(id)).state).toBe("SPEC_IN_PROGRESS");
+    expect(await taskRow(id)).toMatchObject({
+      state: "SPEC_IN_PROGRESS",
+      repository_id: fx.repositoryId,
+    });
     const cmds = await commands(id);
     expect(cmds).toHaveLength(1);
     expect(cmds[0]).toMatchObject({
@@ -237,6 +242,48 @@ describe("POST /api/tasks/:id/spec/session (P1)", () => {
       created_by: fx.userId,
     });
     expect(await auditTriggers(id)).toEqual(["spec.session_started"]);
+  });
+
+  it("GOT.80 D3: uses the chosen repository even when another repository of the project sorts first alphabetically", async () => {
+    const earlier = await newRepo("aaa-earlier-repo");
+    const { id } = await newTask("NEEDS_SPEC");
+    const res = await post(`/api/tasks/${id}/spec/session`, {
+      repository_id: fx.repositoryId,
+    });
+    expect(res.statusCode).toBe(200);
+    expect((await taskRow(id)).repository_id).toBe(fx.repositoryId);
+    expect((await taskRow(id)).repository_id).not.toBe(earlier);
+  });
+
+  it("GOT.80 D3: returns 422 REPOSITORY_REQUIRED when repository_id is missing on the first start, and writes nothing", async () => {
+    const { id } = await newTask("NEEDS_SPEC");
+    const before = await snapshot(id);
+    const res = await post(`/api/tasks/${id}/spec/session`);
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe("REPOSITORY_REQUIRED");
+    expect(await snapshot(id)).toEqual(before);
+  });
+
+  it("GOT.80 D3: returns 422 REPOSITORY_NOT_IN_PROJECT for a repository from another project, and writes nothing", async () => {
+    const { id } = await newTask("NEEDS_SPEC");
+    const before = await snapshot(id);
+    const res = await post(`/api/tasks/${id}/spec/session`, {
+      repository_id: fxOther.repositoryId,
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe("REPOSITORY_NOT_IN_PROJECT");
+    expect(await snapshot(id)).toEqual(before);
+  });
+
+  it("GOT.80 D3: returns 422 REPOSITORY_NOT_IN_PROJECT for an unknown repository_id, and writes nothing", async () => {
+    const { id } = await newTask("NEEDS_SPEC");
+    const before = await snapshot(id);
+    const res = await post(`/api/tasks/${id}/spec/session`, {
+      repository_id: UNKNOWN_ID,
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe("REPOSITORY_NOT_IN_PROJECT");
+    expect(await snapshot(id)).toEqual(before);
   });
 
   it.each(["SPEC_REVIEW", "READY", "IMPLEMENTING", "DONE"] as const)(
@@ -267,6 +314,27 @@ describe("POST /api/tasks/:id/spec/session (P1)", () => {
     ]);
     expect(await auditTriggers(id)).toEqual([]);
     expect((await executionRow(failed)).state).toBe("FAILED");
+  });
+
+  it("GOT.80 D2: a restart may repeat the task's own repository_id", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const res = await post(`/api/tasks/${id}/spec/session`, {
+      repository_id: fx.repositoryId,
+    });
+    expect(res.statusCode).toBe(200);
+    expect((await taskRow(id)).repository_id).toBe(fx.repositoryId);
+  });
+
+  it("GOT.80 D2: a restart with a different repository_id is 409 REPOSITORY_LOCKED and writes nothing", async () => {
+    const other = await newRepo("session-restart-other-repo");
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const before = await snapshot(id);
+    const res = await post(`/api/tasks/${id}/spec/session`, {
+      repository_id: other,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe("REPOSITORY_LOCKED");
+    expect(await snapshot(id)).toEqual(before);
   });
 
   it("returns 409 SPEC_SESSION_BUSY while a send-back resume of a COMPLETED spec execution is pending, then restarts once it completed (F1)", async () => {
@@ -380,6 +448,17 @@ describe("PUT /api/tasks/:id/spec/draft (P3)", () => {
       content: content({ scope: [], repository: "" }),
     });
     expect(res.statusCode).toBe(200);
+  });
+
+  it("GOT.80 D2: a non-empty repository different from the task's locked repository is 422 REPOSITORY_LOCKED, writing nothing", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const before = await snapshot(id);
+    const res = await put(`/api/tasks/${id}/spec/draft`, {
+      content: content({ repository: "not-the-locked-repo" }),
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe("REPOSITORY_LOCKED");
+    expect(await snapshot(id)).toEqual(before);
   });
 
   it.each([
@@ -608,7 +687,6 @@ describe("POST /api/tasks/:id/spec/approve (P5, P7)", () => {
   it("produces every approval effect and ends READY when all dependencies are DONE", async () => {
     const dep = await newTask("DONE");
     const { id } = await newTask("SPEC_REVIEW", {
-      withRepository: false,
       runtimeOverride: "claude",
     });
     const oldApproved = await seedRevision(id, 1, "approved", content());
@@ -697,7 +775,7 @@ describe("POST /api/tasks/:id/spec/approve (P5, P7)", () => {
       code: string,
       setup?: (taskId: string) => Promise<void>,
     ) {
-      const { id } = await newTask("SPEC_REVIEW", { withRepository: false });
+      const { id } = await newTask("SPEC_REVIEW");
       const oldApproved = await seedRevision(id, 1, "approved", content());
       await setApprovedRevision(id, oldApproved);
       await seedRevision(id, 2, "draft", draftContent);
@@ -1015,26 +1093,26 @@ describe("concurrency (P10)", () => {
     expect((await taskRow(waiting.id)).state).toBe("SPEC_APPROVED");
   });
 
-  // GOT.52 F2: a repository delete committing between approve's repository
-  // lookup and its write of `tasks.repository_id` used to surface as an
-  // uncaught FK violation (23503), a 500. `findProjectRepositoryByName` now
-  // locks the row it resolves, the same lock `deleteRepository` takes, so
-  // the two serialise instead. Each test below holds one side's transaction
-  // open on that lock to force the interleaving deterministically.
+  // GOT.52 F2, kept by GOT.80 D2: a repository delete committing mid-approve
+  // used to surface as an uncaught FK violation (23503), a 500.
+  // `lockRepositoryById` locks the row it resolves, the same lock
+  // `deleteRepository` takes, so the two serialise instead. A task's
+  // repository is now locked at session start, not written by approve, so
+  // each test below seeds it directly and only mirrors approve's *read*
+  // lock to force the interleaving deterministically.
   it("repository delete blocks behind an approval holding the repository lock, then sees the task and returns 409 (never 500)", async () => {
     const repoId = await newRepo("race-approve-wins-repo");
     const { id: taskId } = await newTask("SPEC_REVIEW");
+    await h.sql`update tasks set repository_id = ${repoId} where id = ${taskId}`;
 
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
     const holder = h.sql.begin(async (sql) => {
-      // Mirrors findProjectRepositoryByName's locked read.
+      // Mirrors lockRepositoryById's locked read.
       await sql`select id from repositories where id = ${repoId} for update`;
       await held;
-      // Mirrors approve's write: the task now references the locked repository.
-      await sql`update tasks set repository_id = ${repoId} where id = ${taskId}`;
     });
 
     const deleting = app.inject({
@@ -1060,9 +1138,19 @@ describe("concurrency (P10)", () => {
     ).toHaveLength(1);
   });
 
-  it("approval blocks behind a repository delete holding the repository lock, then sees it gone and returns 422 (never 500)", async () => {
+  // GOT.80 D2 narrows this race: a task's repository is locked at session
+  // start, always before it can reach SPEC_REVIEW, so `deleteRepository`'s
+  // own count check now always sees it and blocks — the old "delete
+  // actually wins and removes the row out from under a pending approval"
+  // interleaving is no longer reachable. What remains to prove is the
+  // reverse lock-acquisition order: another holder of the same row lock
+  // (mirroring `deleteRepository`'s own `FOR UPDATE`) still lets approval
+  // proceed cleanly once released (never a 500), and the repository is
+  // still there and still refused for deletion afterward.
+  it("the delete route's own lock wins first: approval still proceeds after release, and delete still refuses (never 500)", async () => {
     const repoId = await newRepo("race-delete-wins-repo");
-    const { id: taskId } = await newTask("SPEC_REVIEW", { withRepository: false });
+    const { id: taskId } = await newTask("SPEC_REVIEW");
+    await h.sql`update tasks set repository_id = ${repoId} where id = ${taskId}`;
     await seedRevision(taskId, 1, "draft", content({ repository: "race-delete-wins-repo" }));
 
     let release!: () => void;
@@ -1070,9 +1158,9 @@ describe("concurrency (P10)", () => {
       release = resolve;
     });
     const holder = h.sql.begin(async (sql) => {
+      // Mirrors deleteRepository's locked read, taken before approve's.
       await sql`select id from repositories where id = ${repoId} for update`;
       await held;
-      await sql`delete from repositories where id = ${repoId}`;
     });
 
     const approving = post(`/api/tasks/${taskId}/spec/approve`);
@@ -1083,9 +1171,16 @@ describe("concurrency (P10)", () => {
     await holder;
 
     const res = await approving;
-    expect(res.statusCode).toBe(422);
-    expect(res.json().error.code).toBe("SPEC_INVALID");
-    expect(res.json().error.message).toContain("does not resolve");
+    expect(res.statusCode).toBe(200);
+
+    // Approval never touches the repository reference (GOT.80 D2), so the
+    // task still references it and delete still refuses.
+    const deleting = await app.inject({
+      method: "DELETE",
+      url: `/api/repositories/${repoId}`,
+      headers: { cookie },
+    });
+    expect(deleting.statusCode).toBe(409);
   });
 });
 

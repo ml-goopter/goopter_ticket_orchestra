@@ -11,7 +11,7 @@ import {
   NotFoundError,
   appendEvent,
   approveRevision,
-  findProjectRepositoryByName,
+  findRepositoryById,
   getRevisionByStatus,
   hasPendingSpecResume,
   hasPendingSpecSessionStart,
@@ -19,6 +19,7 @@ import {
   insertExecutionCommand,
   listDependencies,
   lockDependencyGraph,
+  lockRepositoryById,
   lockTaskExecutionIds,
   lockTaskForSpec,
   replaceDependencies,
@@ -44,6 +45,7 @@ function parseTaskId(params: unknown): string {
   return parsed.data.id;
 }
 
+const SessionBodySchema = z.object({ repository_id: z.uuid().optional() }).strict();
 const MessageBodySchema = z.object({ text: z.string().min(1) }).strict();
 const DraftBodySchema = z.object({ content: SpecContentSchema }).strict();
 const ApproveBodySchema = z
@@ -138,12 +140,27 @@ function requireDraft<T>(draft: T | null): T {
 export default async function specRoutes(app: FastifyInstance): Promise<void> {
   app.post("/tasks/:id/spec/session", async (request) => {
     const id = parseTaskId(request.params);
+    const body = SessionBodySchema.safeParse(request.body ?? {});
+    if (!body.success) {
+      throw new AppError(400, "VALIDATION_ERROR", "repository_id must be a UUID when given.");
+    }
     const actor = userActor(request);
     try {
       return await app.db.transaction(async (tx) => {
         const task = await lockTask(tx, id);
         let result: { from: TaskState; to: TaskState };
         if (task.state === "SPEC_IN_PROGRESS") {
+          // GOT.80 D2: the repository is locked once a session has started.
+          // A restart may omit it or repeat the one already on the task; any
+          // other value is refused before the busy check below.
+          const repositoryId = body.data.repository_id;
+          if (repositoryId !== undefined && repositoryId !== task.repositoryId) {
+            throw new AppError(
+              409,
+              "REPOSITORY_LOCKED",
+              "The spec session is locked to a different repository.",
+            );
+          }
           // C49: restart a spec session that failed or was orphaned (for
           // example after a dead-host release), with no task transition.
           const live = await lockTaskExecutionIds(tx, id, "spec", LIVE_EXECUTION_STATES);
@@ -158,11 +175,35 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
           }
           result = { from: task.state, to: task.state };
         } else {
+          // The core table's only edge for this trigger is NEEDS_SPEC ->
+          // SPEC_IN_PROGRESS, checked before the repository requirement
+          // below so a wrong state is a 409 and never a 422.
+          assertTransition("task", task.state, "spec.session_started");
+          // GOT.80 D3: the first session requires an explicit repository,
+          // which must belong to the task's project. Checked, and the
+          // task's repository set, before any other write.
+          const repositoryId = body.data.repository_id;
+          if (repositoryId === undefined) {
+            throw new AppError(
+              422,
+              "REPOSITORY_REQUIRED",
+              "repository_id is required to start the first spec session.",
+            );
+          }
+          const repository = await findRepositoryById(tx, repositoryId);
+          if (!repository || repository.projectId !== task.projectId) {
+            throw new AppError(
+              422,
+              "REPOSITORY_NOT_IN_PROJECT",
+              "repository_id does not belong to the task's project.",
+            );
+          }
           result = await transition(tx, {
             entity: "task",
             id,
             trigger: "spec.session_started",
             actor,
+            set: { repositoryId },
           });
         }
         await insertExecutionCommand(tx, {
@@ -240,6 +281,19 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
             "ILLEGAL_STATE",
             `The draft can only be edited in SPEC_IN_PROGRESS, task is ${task.state}.`,
           );
+        }
+        // GOT.80 D2: the repository is locked once the session started. An
+        // empty `repository` (a hand-started draft with no content yet)
+        // makes no claim either way, so only a non-empty mismatch is refused.
+        if (body.data.content.repository !== "" && task.repositoryId !== null) {
+          const repository = await findRepositoryById(tx, task.repositoryId);
+          if (repository !== null && repository.name !== body.data.content.repository) {
+            throw new AppError(
+              422,
+              "REPOSITORY_LOCKED",
+              `The specification's repository must be "${repository.name}".`,
+            );
+          }
         }
         const now = app.now();
         const existing = await getRevisionByStatus(tx, id, "draft");
@@ -385,14 +439,13 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
         const draft = requireDraft(await getRevisionByStatus(tx, id, "draft"));
 
         // Validation first: every 422 below is thrown before any write.
-        const draftContent = draft.content as { repository?: unknown };
+        // GOT.80 D2: the repository is fixed by the task, not by the draft's
+        // claim, and never re-resolved by name. GOT.52 F2's lock is kept, now
+        // keyed by id, so a concurrent repository delete still serialises
+        // against approval instead of racing an FK violation into a 500.
         const repository =
-          typeof draftContent?.repository === "string"
-            ? await findProjectRepositoryByName(
-                tx,
-                task.projectId,
-                draftContent.repository,
-              )
+          task.repositoryId !== null
+            ? await lockRepositoryById(tx, task.repositoryId)
             : null;
         const validation = validateSpecForApproval(
           draft.content,
@@ -443,7 +496,6 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
           trigger: "spec.approved",
           actor,
           set: {
-            repositoryId: repository!.id,
             runtimeOverride: requestedRuntime ?? null,
             approvedRevisionId: draft.id,
           },

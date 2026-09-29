@@ -182,7 +182,7 @@ Unique on `(project_id, name)`.
 | --- | --- | --- |
 | id | uuid pk |  |
 | project_id | uuid fk |  |
-| repository_id | uuid fk nullable | set during spec building |
+| repository_id | uuid fk nullable | set (and locked) when the first spec session starts, GOT.80 D2/D3; approval never changes it |
 | jira_key | text unique | `GOOP-421` |
 | jira_summary | text | refreshed on each poll |
 | jira_priority | int | lower is more urgent |
@@ -1059,12 +1059,12 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 
 | method | route | notes |
 | --- | --- | --- |
-| POST | `/tasks/:id/spec/session` | enqueue `start_spec_session`, task → `SPEC_IN_PROGRESS` |
+| POST | `/tasks/:id/spec/session` | `{ repository_id? }`, enqueue `start_spec_session`, task → `SPEC_IN_PROGRESS`. First start (from `NEEDS_SPEC`) requires `repository_id` belonging to the task's project and locks it on the task (GOT.80 D2/D3). A restart (from `SPEC_IN_PROGRESS`) may omit it or repeat the locked one; any other value is `409 REPOSITORY_LOCKED` |
 | POST | `/tasks/:id/spec/messages` | `{ text }`, enqueue `send_message` on the spec execution |
-| PUT | `/tasks/:id/spec/draft` | manual edit of draft `content` |
+| PUT | `/tasks/:id/spec/draft` | manual edit of draft `content`; a non-empty `repository` different from the task's locked repository is `422 REPOSITORY_LOCKED` |
 | POST | `/tasks/:id/spec/request-review` | task → `SPEC_REVIEW` |
 | POST | `/tasks/:id/spec/send-back` | task → `SPEC_IN_PROGRESS` |
-| POST | `/tasks/:id/spec/approve` | `{ runtime? }`, validates content, creates approval, supersedes previous, mirrors dependencies, transitions |
+| POST | `/tasks/:id/spec/approve` | `{ runtime? }`, validates content against the task's locked repository (a mismatch is `422 SPEC_INVALID`), creates approval, supersedes previous, mirrors dependencies, transitions. Never changes the task's repository (GOT.80 D2) |
 | POST | `/tasks/:id/spec/revise` | from `SPEC_APPROVED` or `READY` only, creates a draft, task → `SPEC_IN_PROGRESS` |
 
 ### 12.4 Issues

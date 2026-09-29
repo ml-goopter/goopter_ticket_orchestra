@@ -12,6 +12,7 @@ import {
   executions,
   listActiveExecutionIds,
   projects,
+  repositories,
   taskLeases,
   tasks,
   transition,
@@ -123,6 +124,8 @@ interface SeedOptions {
   taskState: TaskState;
   executionState?: ExecutionState;
   maxReviewRounds?: number;
+  /** GOT.80 D2: when given, the task's repository is locked to it. */
+  repositoryName?: string;
 }
 
 let seq = 0;
@@ -141,10 +144,25 @@ async function seed(options: SeedOptions): Promise<Seeded> {
     })
     .returning({ id: projects.id });
   const when = new Date("2026-01-01T00:00:00.000Z");
+  let repositoryId: string | null = null;
+  if (options.repositoryName !== undefined) {
+    const [repository] = await db
+      .insert(repositories)
+      .values({
+        projectId: project!.id,
+        name: options.repositoryName,
+        gitUrl: `git@example.com:goopter/${options.repositoryName}.git`,
+        defaultBranch: "main",
+        defaultRuntime: "claude",
+      })
+      .returning({ id: repositories.id });
+    repositoryId = repository!.id;
+  }
   const [task] = await db
     .insert(tasks)
     .values({
       projectId: project!.id,
+      repositoryId,
       jiraKey: `AT-${n}`,
       jiraSummary: `task ${n}`,
       jiraPriority: 3,
@@ -1934,6 +1952,45 @@ describe("propose_spec", () => {
     expect((result as { message: string }).message).toMatch(/scope/);
     expect((result as { message: string }).message).toMatch(/objective/);
     expect(await snapshot(s)).toEqual(before);
+  });
+
+  it("GOT.80 D2: succeeds when the proposed repository matches the task's locked one", async () => {
+    const s = await seed({
+      role: "spec",
+      taskState: "SPEC_IN_PROGRESS",
+      repositoryName: "orchestra",
+    });
+
+    expectOk(await call(s.token, "propose_spec", specContent("matches")));
+
+    const revisions = await db.query.specificationRevisions.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    expect(revisions).toHaveLength(1);
+  });
+
+  it("GOT.80 D2: a repository different from the task's locked one is a tool error and writes no revision", async () => {
+    const s = await seed({
+      role: "spec",
+      taskState: "SPEC_IN_PROGRESS",
+      repositoryName: "orchestra",
+    });
+    const before = await snapshot(s);
+
+    const result = await call(s.token, "propose_spec", {
+      ...specContent("mismatch"),
+      repository: "some-other-repo",
+    });
+
+    expect(result).toMatchObject({ isError: true, code: "INTERNAL" });
+    const after = await snapshot(s);
+    // Only the failed call's own agent.tool_call record and lease renewal;
+    // no draft revision written (design.md §8: a failed call rolls back its
+    // side effects but is still recorded).
+    expect({ ...after, events: before.events, leaseExpiresAt: 0 }).toEqual({
+      ...before,
+      leaseExpiresAt: 0,
+    });
   });
 });
 
