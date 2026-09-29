@@ -776,7 +776,6 @@ System prompt, static per role, covers:
 - who the agent is and what it may not do (no product decisions, no editing the spec, no force push, no merging)
 - the agent-tools contract: when to call which tool, that a blocking `raise_issue` means stop
 - the review protocol for the implementation role: after tests pass, run `orchestra-review`, read its findings JSON, fix valid findings, add a regression test per fixed finding, run it again, repeat until `clean` or the tool says stop, then commit, push, `gh pr create`, and call `report_pr_created`
-- if the repository has `no-mistakes` initialized, run that pipeline instead of the manual review loop and report each of its review rounds through `report_review_result`
 - the resume contract: on resume, the prompt begins with a header saying what happened since the last turn
 
 User prompt, assembled per start or resume:
@@ -1249,7 +1248,7 @@ Jira received the spec-approved, PR-opened and CI-passed comments on both ticket
 | D11 | Two state machines, task and execution. One transition function writes audit events. |
 | D12 | User chooses clarification or spec revision when resolving. Revision routes to `SPEC_IN_PROGRESS` and resumes with the new revision and a diff. |
 | D13 | Worker classifies failures by how the execution ended. Limits: 3 infra, 2 protocol, 3 CI rounds, 3 review rounds. Lease TTL 5 minutes. |
-| D14 | Review is a phase inside the implementation execution, run by a fresh-context subagent through `orchestra-review`. `no-mistakes` used when present, not required. Order: implement, review loop, push, PR, CI. |
+| D14 | Review is a phase inside the implementation execution, run by a fresh-context subagent through `orchestra-review`. Order: implement, review loop, push, PR, CI. |
 | D15 | Postgres `LISTEN/NOTIFY` fanned out over SSE. |
 | D16 | Postgres, api, web in compose. Worker native on the host with capability tags. Secrets from the environment. |
 | D17 | Cost per execution: tokens and USD on `executions`, per-round rows in `execution_usage`, Codex priced from a config table. |

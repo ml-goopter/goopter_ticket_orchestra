@@ -123,9 +123,6 @@ export const END_DETAIL_MAX_CHARS = 4_000;
 /** Tool-name prefix of the agent-tools server; those calls record themselves. */
 export const ORCHESTRA_TOOL_PREFIX = "mcp__orchestra__";
 
-/** `.no-mistakes` at the worktree root selects the no-mistakes prompt (§9.2). */
-export const NO_MISTAKES_MARKER = ".no-mistakes";
-
 /**
  * `packages/review-wrapper/bin`, prepended to the agent's PATH (GOT.40 Q7).
  * Resolved from this module: `src/runner` and `dist/runner` sit at the same
@@ -1700,11 +1697,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       return;
     }
 
-    const noMistakes = await pathExists(
-      path.join(prepared.worktreePath, NO_MISTAKES_MARKER),
-    );
     const systemPrompt = systemPromptFor("implementation", {
-      noMistakes,
       runtime: ctx.execution.runtime,
     });
     const startPrompt = await implementationUserPrompt(ctx, spec, prepared.branch, log);
@@ -2310,7 +2303,6 @@ export function createRunner(deps: RunnerDeps): Runner {
       const done = track(state, log, () =>
         withLease(state, ctx, log, false, async () => {
           if (!(await containerReady())) return;
-          const noMistakes = await pathExists(path.join(cwd, NO_MISTAKES_MARKER));
           const prompt = buildPrompt(
             await implementationUserPrompt(ctx, spec, ctx.execution.branch, log),
           );
@@ -2324,7 +2316,6 @@ export function createRunner(deps: RunnerDeps): Runner {
                 {
                   cwd,
                   systemPrompt: systemPromptFor("implementation", {
-                    noMistakes,
                     runtime: ctx.execution.runtime,
                   }),
                   prompt,
