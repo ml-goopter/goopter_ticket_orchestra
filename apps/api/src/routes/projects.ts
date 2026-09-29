@@ -1,7 +1,9 @@
 import {
   UniqueViolationError,
+  deleteProject,
   getProjectById,
   insertProject,
+  isUuid,
   listProjects,
   updateProject,
   type ProjectRow,
@@ -69,6 +71,14 @@ function toResponse(row: ProjectRow) {
 
 function notFound(id: string): AppError {
   return new AppError(404, "NOT_FOUND", `project not found: ${id}`);
+}
+
+/** design.md §12.5. Not applied to GET/PATCH above; only DELETE needs it here (GOT.52). */
+function parseId(id: string): string {
+  if (!isUuid(id)) {
+    throw new AppError(400, "VALIDATION_ERROR", "id must be a uuid");
+  }
+  return id;
 }
 
 /** Admin routes for `projects` (design.md §12.5, §4.2). */
@@ -164,5 +174,28 @@ export default async function projectsRoutes(
       }
       throw err;
     }
+  });
+
+  /**
+   * Tracker GOT.52 O1/D2: deletes the project and all its repositories in
+   * one transaction only when no task references the project directly or
+   * through one of those repositories; otherwise 409 with the reason and
+   * referencing task count, nothing deleted.
+   */
+  app.delete<{ Params: { id: string } }>("/:id", async (request, reply) => {
+    const id = parseId(request.params.id);
+    const result = await deleteProject(app.db, id);
+    if (result.status === "not_found") throw notFound(id);
+    if (result.status === "blocked") {
+      reply.code(409);
+      return {
+        error: {
+          code: "REFERENCED_BY_TASKS",
+          message: `Cannot delete: ${result.taskCount} task(s) reference this project or its repositories.`,
+          task_count: result.taskCount,
+        },
+      };
+    }
+    reply.code(204);
   });
 }

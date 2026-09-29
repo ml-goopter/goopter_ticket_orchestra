@@ -1,7 +1,9 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Runtime } from "@orchestra/core";
+import type { Db } from "../client.js";
 import { agentWorkers, executions } from "../schema/executions.js";
 import { projects, repositories } from "../schema/projects.js";
+import { tasks } from "../schema/tasks.js";
 import { users } from "../schema/users.js";
 import type { DbOrTx } from "../transition.js";
 // `ProjectRow`, `RepositoryRow` (task-aggregate.ts) and `AgentWorkerRow`
@@ -231,6 +233,96 @@ export async function updateRepository(
     }
     throw err;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Deletion (GOT.52, tracker 2026-09-28 O1/D2)
+// ---------------------------------------------------------------------------
+
+export type AdminDeleteResult =
+  | { status: "not_found" }
+  | { status: "blocked"; taskCount: number }
+  | { status: "deleted" };
+
+/**
+ * Deletes a repository iff no task references it (tracker O1). Locks the
+ * repository row `FOR UPDATE` before counting: Postgres takes a `FOR KEY
+ * SHARE` lock on a row for every insert/update that points a foreign key
+ * at it (`agent-tools.ts`'s `ToolRowLock` documents the same mechanism),
+ * and that conflicts with `FOR UPDATE`. So a concurrent `INSERT INTO tasks
+ * (repository_id, ...)` referencing this row blocks until this transaction
+ * commits or rolls back — it can never land against a row this call just
+ * deleted, and a blocked insert that resolves after the delete fails its
+ * own foreign-key check rather than creating an orphan.
+ */
+export async function deleteRepository(
+  db: Db,
+  id: string,
+): Promise<AdminDeleteResult> {
+  return db.transaction(async (tx) => {
+    const [row] = await tx
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(eq(repositories.id, id))
+      .for("update");
+    if (!row) return { status: "not_found" as const };
+
+    const [countRow] = await tx
+      .select({ count: sql<number>`count(*)::int` })
+      .from(tasks)
+      .where(eq(tasks.repositoryId, id));
+    const taskCount = countRow?.count ?? 0;
+    if (taskCount > 0) return { status: "blocked" as const, taskCount };
+
+    await tx.delete(repositories).where(eq(repositories.id, id));
+    return { status: "deleted" as const };
+  });
+}
+
+/**
+ * Deletes a project and, in the same transaction, every repository under
+ * it (tracker D2), iff no task references the project directly or through
+ * one of those repositories. Locks the project row and every one of its
+ * repository rows `FOR UPDATE` before counting, for the same reason
+ * `deleteRepository` does: a concurrent task insert/update pointing at any
+ * of those rows takes a `FOR KEY SHARE` lock that blocks behind ours, so it
+ * cannot land after or during this delete.
+ */
+export async function deleteProject(
+  db: Db,
+  id: string,
+): Promise<AdminDeleteResult> {
+  return db.transaction(async (tx) => {
+    const [row] = await tx
+      .select({ id: projects.id })
+      .from(projects)
+      .where(eq(projects.id, id))
+      .for("update");
+    if (!row) return { status: "not_found" as const };
+
+    const repoRows = await tx
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(eq(repositories.projectId, id))
+      .for("update");
+    const repoIds = repoRows.map((r) => r.id);
+
+    const referencesProject =
+      repoIds.length > 0
+        ? or(eq(tasks.projectId, id), inArray(tasks.repositoryId, repoIds))
+        : eq(tasks.projectId, id);
+
+    const [countRow] = await tx
+      .select({ count: sql<number>`count(*)::int` })
+      .from(tasks)
+      .where(referencesProject);
+    const taskCount = countRow?.count ?? 0;
+    if (taskCount > 0) return { status: "blocked" as const, taskCount };
+
+    await tx.delete(repositories).where(eq(repositories.projectId, id));
+    await tx.delete(projects).where(eq(projects.id, id));
+    return { status: "deleted" as const };
+  });
 }
 
 // ---------------------------------------------------------------------------

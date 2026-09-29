@@ -55,6 +55,10 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | containers | GOT.79 | adapters: agent-tools token off the Claude CLI command line (C3b) | #60 |
 | fixes | GOT.54 | web: spec repository field is a dropdown of project repositories | #61 |
 | containers | GOT.70 | worker: agent container manager and sweeper cleanup (C2) | #62 |
+| fixes | GOT.56 | scheduler: idle spec sessions stop holding worker and repository capacity | #63 |
+| containers | GOT.72 | scheduler: container-mode tasks go only to docker-capable workers (C4a) | #64 |
+| fixes | GOT.52 | api: delete project and repository | #65 |
+| fixes | GOT.53 | web: delete controls for projects and repositories | #66 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 

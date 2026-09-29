@@ -3,6 +3,8 @@ import {
   agentWorkers,
   createDb,
   executions,
+  lockExecutionForTool,
+  lockTaskForTool,
   projects,
   replaceTaskLease,
   repositories,
@@ -21,6 +23,7 @@ import {
   it,
 } from "vitest";
 import { LEASE_TTL_MS } from "../src/agent-tools/lease.js";
+import { issueToken, revokeToken } from "../src/agent-tools/tokens.js";
 import { loadConfig } from "../src/config.js";
 import type { LogFields, Logger } from "../src/logger.js";
 import { createDefaultPhases } from "../src/phases/index.js";
@@ -183,6 +186,7 @@ async function seedExecution(options: {
   host?: string | null;
   role?: "spec" | "implementation";
   attempt?: number;
+  toolsTokenHash?: string | null;
 }): Promise<string> {
   const [row] = await db
     .insert(executions)
@@ -194,6 +198,7 @@ async function seedExecution(options: {
       runtime: "claude",
       model: "claude-opus",
       host: options.host ?? null,
+      toolsTokenHash: options.toolsTokenHash ?? null,
     })
     .returning({ id: executions.id });
   return row!.id;
@@ -1108,6 +1113,297 @@ describe("claim (design.md §6.3, §7.3)", () => {
       expect(await slotHolding("shared-wt")).toBe(1);
       expect(await taskState(second)).toBe("READY");
       expect(await executionsFor(second)).toEqual([]);
+    });
+  });
+
+  describe("spec sessions between turns (GOT.56)", () => {
+    /**
+     * A spec execution stays RUNNING between chat turns (C42). Its agent
+     * process exists only while a turn runs, and the runner holds an
+     * agent-tools token exactly that long (§8, §9.3: issued at start or
+     * resume, revoked when the turn ends). So only an ASSIGNED spec
+     * execution or a RUNNING one with a token holds a slot.
+     */
+    async function specSession(
+      host: string,
+      state: ExecutionState,
+      toolsTokenHash: string | null,
+      repositoryId: string | null = null,
+    ): Promise<{ taskId: string; executionId: string }> {
+      const taskId = await seedTask({ state: "SPEC_IN_PROGRESS", repositoryId });
+      const executionId = await seedExecution({
+        taskId,
+        role: "spec",
+        state,
+        host,
+        toolsTokenHash,
+      });
+      return { taskId, executionId };
+    }
+
+    /** The runner's token issue for a spec turn: task, then execution. */
+    const startSpecTurn = (s: { taskId: string; executionId: string }, on: Db = db) =>
+      on.transaction(async (tx) => {
+        await lockTaskForTool(tx, s.taskId, "key share");
+        await lockExecutionForTool(tx, s.executionId);
+        return issueToken(tx, s.executionId);
+      });
+
+    it("two idle spec sessions on a 2-slot worker do not block claiming a READY task", async () => {
+      const worker = await seedWorker({ host: "spec-idle", maxConcurrent: 2 });
+      const repo = await seedRepo({ maxWorktrees: 10 });
+      await specSession("spec-idle", "RUNNING", null);
+      await specSession("spec-idle", "RUNNING", null);
+      const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+      expect((await runClaim(worker.id))?.taskId).toBe(ready);
+      expect(await taskState(ready)).toBe("IMPLEMENTING");
+    });
+
+    it("a spec session mid-turn holds a slot", async () => {
+      const worker = await seedWorker({ host: "spec-live", maxConcurrent: 2 });
+      const repo = await seedRepo({ maxWorktrees: 10 });
+      const busy = await seedTask({ state: "IMPLEMENTING", repositoryId: repo });
+      await seedExecution({ taskId: busy, state: "RUNNING", host: "spec-live" });
+      await specSession("spec-live", "RUNNING", "live-turn-hash");
+      await specSession("spec-live", "RUNNING", null);
+      const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+      expect(await runClaim(worker.id)).toBeNull();
+      expect(await taskState(ready)).toBe("READY");
+      expect(await executionsFor(ready)).toEqual([]);
+    });
+
+    it("an ASSIGNED spec session, whose first turn is starting, holds a slot", async () => {
+      const worker = await seedWorker({ host: "spec-assigned", maxConcurrent: 1 });
+      const repo = await seedRepo({ maxWorktrees: 10 });
+      await specSession("spec-assigned", "ASSIGNED", null);
+      const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+      expect(await runClaim(worker.id)).toBeNull();
+      expect(await taskState(ready)).toBe("READY");
+    });
+
+    it("counts a spec turn from its token issue until its revocation", async () => {
+      const worker = await seedWorker({ host: "spec-turn", maxConcurrent: 1 });
+      const repo = await seedRepo({ maxWorktrees: 10 });
+      const session = await specSession("spec-turn", "RUNNING", null);
+      const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+      await startSpecTurn(session);
+      expect(await runClaim(worker.id)).toBeNull();
+
+      await revokeToken(db, session.executionId);
+      expect((await runClaim(worker.id))?.taskId).toBe(ready);
+    });
+
+    it("does not count a completed spec execution or a spec session on another host", async () => {
+      const worker = await seedWorker({ host: "spec-other", maxConcurrent: 1 });
+      const repo = await seedRepo({ maxWorktrees: 10 });
+      await specSession("spec-other", "COMPLETED", null);
+      await specSession("elsewhere", "RUNNING", "elsewhere-hash");
+      const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+      expect((await runClaim(worker.id))?.taskId).toBe(ready);
+    });
+
+    it("a spec turn starting mid-claim overshoots by that turn only, and no claim lands until it ends", async () => {
+      const host = "spec-race";
+      const worker = await seedWorker({ host, maxConcurrent: 2 });
+      const repo = await seedRepo({ maxWorktrees: 10 });
+      const running = await seedTask({ state: "IMPLEMENTING", repositoryId: repo });
+      const runningExecution = await seedExecution({ taskId: running, state: "RUNNING", host });
+      const sessionA = await specSession(host, "RUNNING", null);
+      await specSession(host, "RUNNING", null);
+      const first = await seedTask({ state: "READY", repositoryId: repo, priority: 1 });
+      const second = await seedTask({ state: "READY", repositoryId: repo, priority: 2 });
+
+      const liveAgents = async (): Promise<number> => {
+        const [row] = (await raw(
+          `select count(*)::int as n from executions where host = $1 and (
+             (role = 'implementation' and state in ('ASSIGNED', 'RUNNING'))
+             or (role = 'spec' and state = 'RUNNING' and tools_token_hash is not null))`,
+          [host],
+        )) as Array<{ n: number }>;
+        return row!.n;
+      };
+
+      // Hold the claim inside its execution insert: it has already locked the
+      // worker row, read 1 busy slot of 2, and locked `first`.
+      await raw(`create or replace function orchestra_test_slow() returns trigger
+        language plpgsql as $$ begin perform pg_sleep(1); return new; end $$`);
+      await raw(`create trigger orchestra_test_slow before insert on executions
+        for each row when (new.task_id = '${first}')
+        execute function orchestra_test_slow()`);
+      let claimed: ClaimedExecution | null = null;
+      let claimSettled = false;
+      const other = createDb(testDb.connectionString);
+      try {
+        const claim = runClaim(worker.id, ["claude"]).then((c) => {
+          claimSettled = true;
+          claimed = c;
+        });
+        await waitFor(
+          async () => {
+            const rows = (await raw(
+              "select count(*)::int as n from pg_stat_activity where query ilike '%insert into \"executions\"%' and state = 'active' and pid <> pg_backend_pid()",
+            )) as Array<{ n: number }>;
+            return rows[0]!.n > 0 ? true : undefined;
+          },
+          { what: "the claim to be inside its execution insert", everyMs: 10 },
+        );
+
+        // The spec turn takes no lock the claim holds, so it starts at once.
+        await startSpecTurn(sessionA, other);
+        expect(claimSettled).toBe(false);
+        await claim;
+      } finally {
+        await other.$client.end({ timeout: 5 });
+        await raw("drop trigger orchestra_test_slow on executions");
+      }
+
+      // The claim read its count before the turn started: one over the cap,
+      // and the overshoot is exactly that one in-flight spec turn.
+      expect(claimed).toMatchObject({ taskId: first });
+      expect(await liveAgents()).toBe(3);
+
+      // No claim lands while the overshoot lasts.
+      expect(await runClaim(worker.id)).toBeNull();
+      expect(await taskState(second)).toBe("READY");
+
+      // The turn ends: back to the cap, which is still full.
+      await revokeToken(db, sessionA.executionId);
+      expect(await liveAgents()).toBe(2);
+      expect(await runClaim(worker.id)).toBeNull();
+
+      // An implementation slot frees: the next claim lands, at the cap.
+      await raw("update executions set state = 'COMPLETED' where id = $1", [runningExecution]);
+      expect((await runClaim(worker.id))?.taskId).toBe(second);
+      expect(await liveAgents()).toBe(2);
+    });
+
+    describe("against the repository's max_concurrent_worktrees (GOT.56 ext)", () => {
+      /** Live agents on `repositoryId` and `host`, by the live-turn rule. */
+      const liveOnRepo = async (repositoryId: string, host: string): Promise<number> => {
+        const [row] = (await raw(
+          `select count(*)::int as n from executions e join tasks t on t.id = e.task_id
+           where t.repository_id = $1 and e.host = $2 and (
+             (e.role = 'implementation' and e.state in ('ASSIGNED', 'RUNNING'))
+             or (e.role = 'spec' and e.state = 'ASSIGNED')
+             or (e.role = 'spec' and e.state = 'RUNNING' and e.tools_token_hash is not null))`,
+          [repositoryId, host],
+        )) as Array<{ n: number }>;
+        return row!.n;
+      };
+
+      it("an idle spec session on a 1-worktree repository does not block claiming another task there", async () => {
+        const worker = await seedWorker({ host: "repo-idle", maxConcurrent: 5 });
+        const repo = await seedRepo({ maxWorktrees: 1 });
+        await specSession("repo-idle", "RUNNING", null, repo);
+        const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+        expect((await runClaim(worker.id))?.taskId).toBe(ready);
+        expect(await taskState(ready)).toBe("IMPLEMENTING");
+      });
+
+      it("a spec session mid-turn on a 1-worktree repository blocks claiming there", async () => {
+        const worker = await seedWorker({ host: "repo-live", maxConcurrent: 5 });
+        const repo = await seedRepo({ maxWorktrees: 1 });
+        await specSession("repo-live", "RUNNING", "repo-live-hash", repo);
+        const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+        expect(await runClaim(worker.id)).toBeNull();
+        expect(await taskState(ready)).toBe("READY");
+        expect(await executionsFor(ready)).toEqual([]);
+      });
+
+      it("an ASSIGNED spec session on a 1-worktree repository blocks claiming there", async () => {
+        const worker = await seedWorker({ host: "repo-assigned", maxConcurrent: 5 });
+        const repo = await seedRepo({ maxWorktrees: 1 });
+        await specSession("repo-assigned", "ASSIGNED", null, repo);
+        const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+        expect(await runClaim(worker.id)).toBeNull();
+        expect(await taskState(ready)).toBe("READY");
+      });
+
+      it("counts a spec turn against the repository from its token issue until its revocation", async () => {
+        const worker = await seedWorker({ host: "repo-turn", maxConcurrent: 5 });
+        const repo = await seedRepo({ maxWorktrees: 1 });
+        const session = await specSession("repo-turn", "RUNNING", null, repo);
+        const ready = await seedTask({ state: "READY", repositoryId: repo });
+
+        await startSpecTurn(session);
+        expect(await runClaim(worker.id)).toBeNull();
+
+        await revokeToken(db, session.executionId);
+        expect((await runClaim(worker.id))?.taskId).toBe(ready);
+      });
+
+      it("a spec turn starting mid-claim overshoots the repository by that turn only, and no claim lands there until it ends", async () => {
+        const host = "repo-race";
+        // Worker slots are plentiful: only the repository limit binds.
+        const worker = await seedWorker({ host, maxConcurrent: 10 });
+        const repo = await seedRepo({ maxWorktrees: 2 });
+        const running = await seedTask({ state: "IMPLEMENTING", repositoryId: repo });
+        const runningExecution = await seedExecution({ taskId: running, state: "RUNNING", host });
+        const sessionA = await specSession(host, "RUNNING", null, repo);
+        await specSession(host, "RUNNING", null, repo);
+        const first = await seedTask({ state: "READY", repositoryId: repo, priority: 1 });
+        const second = await seedTask({ state: "READY", repositoryId: repo, priority: 2 });
+
+        // Hold the claim inside its execution insert: it has already read the
+        // repository at 1 busy worktree of 2, and locked `first`.
+        await raw(`create or replace function orchestra_test_slow() returns trigger
+          language plpgsql as $$ begin perform pg_sleep(1); return new; end $$`);
+        await raw(`create trigger orchestra_test_slow before insert on executions
+          for each row when (new.task_id = '${first}')
+          execute function orchestra_test_slow()`);
+        let claimed: ClaimedExecution | null = null;
+        let claimSettled = false;
+        const other = createDb(testDb.connectionString);
+        try {
+          const claim = runClaim(worker.id, ["claude"]).then((c) => {
+            claimSettled = true;
+            claimed = c;
+          });
+          await waitFor(
+            async () => {
+              const rows = (await raw(
+                "select count(*)::int as n from pg_stat_activity where query ilike '%insert into \"executions\"%' and state = 'active' and pid <> pg_backend_pid()",
+              )) as Array<{ n: number }>;
+              return rows[0]!.n > 0 ? true : undefined;
+            },
+            { what: "the claim to be inside its execution insert", everyMs: 10 },
+          );
+
+          // The spec turn takes no lock the claim holds, so it starts at once.
+          await startSpecTurn(sessionA, other);
+          expect(claimSettled).toBe(false);
+          await claim;
+        } finally {
+          await other.$client.end({ timeout: 5 });
+          await raw("drop trigger orchestra_test_slow on executions");
+        }
+
+        // One over the repository limit: exactly the in-flight spec turn.
+        expect(claimed).toMatchObject({ taskId: first });
+        expect(await liveOnRepo(repo, host)).toBe(3);
+
+        // No claim lands on the repository while the overshoot lasts.
+        expect(await runClaim(worker.id)).toBeNull();
+        expect(await taskState(second)).toBe("READY");
+
+        // The turn ends: back to the limit, which is still full.
+        await revokeToken(db, sessionA.executionId);
+        expect(await liveOnRepo(repo, host)).toBe(2);
+        expect(await runClaim(worker.id)).toBeNull();
+
+        // An implementation worktree frees: the next claim lands, at the limit.
+        await raw("update executions set state = 'COMPLETED' where id = $1", [runningExecution]);
+        expect((await runClaim(worker.id))?.taskId).toBe(second);
+        expect(await liveOnRepo(repo, host)).toBe(2);
+      });
     });
   });
 

@@ -17,6 +17,7 @@ import { agentWorkers, executions } from "../schema/executions.js";
 import { projects, repositories } from "../schema/projects.js";
 import { tasks } from "../schema/tasks.js";
 import type { DbOrTx, Tx } from "../transition.js";
+import { containerModeMatches, holdsCapacity } from "./scheduler.js";
 import type { ExecutionRow, ProjectRow, TaskRow } from "./task-aggregate.js";
 
 /**
@@ -122,9 +123,6 @@ const LIVE_STATES = [
   "WAITING_FOR_USER",
 ] as const;
 
-/** Execution states that hold a worker slot (§6.3). */
-const SLOT_HOLDING_STATES = ["ASSIGNED", "RUNNING"] as const;
-
 /** Task states a retry execution may start in (§9.5). */
 const RETRYABLE_TASK_STATES = ["IMPLEMENTING", "REVIEWING"] as const;
 
@@ -152,7 +150,8 @@ const queuedEvent = alias(executionEvents, "queued_event");
  * `execution.queued` event's `not_before` has passed at `now`, whose task
  * is `IMPLEMENTING` or `REVIEWING` with no other live execution, whose
  * runtime this worker detected, whose repository this worker is capable of
- * (D16) and is below `max_concurrent_worktrees` on this host (§6.3).
+ * (D16), matches in container mode (§9.9) and is below `max_concurrent_worktrees` on this host (§6.3),
+ * counted per `holdsCapacity` (GOT.56: an idle spec session does not count).
  *
  * Locks the task row `FOR UPDATE OF tasks SKIP LOCKED`, so a concurrent
  * starter skips it and takes the next one. Call after `getClaimWorker` and
@@ -172,12 +171,7 @@ export async function selectRetryCandidate(
       })
       .from(executions)
       .innerJoin(tasks, eq(tasks.id, executions.taskId))
-      .where(
-        and(
-          eq(executions.host, input.host),
-          inArray(executions.state, [...SLOT_HOLDING_STATES]),
-        ),
-      )
+      .where(and(eq(executions.host, input.host), holdsCapacity()))
       .groupBy(tasks.repositoryId),
   );
 
@@ -233,6 +227,7 @@ export async function selectRetryCandidate(
               ),
           ),
         ),
+        containerModeMatches(tx, input.workerId),
         sql`coalesce(${busy.n}, 0) < ${repositories.maxConcurrentWorktrees}`,
       ),
     )
