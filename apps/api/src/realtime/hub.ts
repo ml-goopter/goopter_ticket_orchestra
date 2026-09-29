@@ -55,6 +55,12 @@ export const defaultLoadEvent: LoadEvent = async (db, taskId, eventId) => {
 export const defaultListBacklog: ListBacklog = (db, taskId, after) =>
   listTimeline(db, taskId, { after: BigInt(after), limit: TIMELINE_LIMIT_MAX });
 
+/** The session a stream was opened under, so a disable can end it (GOT.61 F2). */
+export interface StreamOwner {
+  userId: string;
+  sessionId: string;
+}
+
 export interface RealtimeHubOptions {
   db: Db;
   log: FastifyBaseLogger;
@@ -76,7 +82,7 @@ export interface RealtimeHubOptions {
 export class RealtimeHub {
   private readonly taskStreams = new Map<string, Set<TaskStream>>();
   private readonly globalStreams = new Set<SseConnection>();
-  private readonly connections = new Set<SseConnection>();
+  private readonly connections = new Map<SseConnection, StreamOwner>();
   private delivery: Promise<void> = Promise.resolve();
   /** Set by `closeAll()`; a stream opened afterwards ends at once (H8). */
   private closing = false;
@@ -119,8 +125,13 @@ export class RealtimeHub {
     }
   }
 
-  openTaskStream(res: ServerResponse, taskId: string, cursor: number | undefined): void {
-    const sse = this.track(res);
+  openTaskStream(
+    res: ServerResponse,
+    taskId: string,
+    cursor: number | undefined,
+    owner: StreamOwner,
+  ): void {
+    const sse = this.track(res, owner);
     if (!sse) return;
     const stream = new TaskStream({
       sse,
@@ -153,8 +164,8 @@ export class RealtimeHub {
   }
 
   /** Q8: no replay; only live `GLOBAL_STREAM_TYPES` events. */
-  openGlobalStream(res: ServerResponse): void {
-    const sse = this.track(res);
+  openGlobalStream(res: ServerResponse, owner: StreamOwner): void {
+    const sse = this.track(res, owner);
     if (!sse) return;
     this.globalStreams.add(sse);
     sse.onClose(() => this.globalStreams.delete(sse));
@@ -163,7 +174,21 @@ export class RealtimeHub {
   /** H8: ends every open stream, and every stream opened from now on. */
   closeAll(): void {
     this.closing = true;
-    for (const sse of [...this.connections]) sse.end();
+    for (const sse of [...this.connections.keys()]) sse.end();
+  }
+
+  /** Ends every open stream of `userId`; called once a disable commits (GOT.61 F2). */
+  closeUserStreams(userId: string): void {
+    for (const [sse, owner] of [...this.connections]) {
+      if (owner.userId === userId) sse.end();
+    }
+  }
+
+  /** Ends every open stream opened under `sessionId`. */
+  closeSessionStreams(sessionId: string): void {
+    for (const [sse, owner] of [...this.connections]) {
+      if (owner.sessionId === sessionId) sse.end();
+    }
   }
 
   subscriberCount(): { task: number; global: number } {
@@ -177,7 +202,7 @@ export class RealtimeHub {
    * nothing to register: the api is closing (the response is ended at
    * once) or the client already disconnected while the route awaited.
    */
-  private track(res: ServerResponse): SseConnection | null {
+  private track(res: ServerResponse, owner: StreamOwner): SseConnection | null {
     if (this.closing) {
       endStreamImmediately(res);
       return null;
@@ -188,7 +213,7 @@ export class RealtimeHub {
       this.options.maxBufferedBytes,
     );
     if (sse.isClosed) return null;
-    this.connections.add(sse);
+    this.connections.set(sse, owner);
     sse.onClose(() => this.connections.delete(sse));
     return sse;
   }

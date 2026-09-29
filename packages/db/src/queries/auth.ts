@@ -1,4 +1,5 @@
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
+import type { Db } from "../client.js";
 import { sessions, users } from "../schema/users.js";
 import type { DbOrTx } from "../transition.js";
 
@@ -133,6 +134,36 @@ export async function insertSession(
     throw new Error("Failed to create session.");
   }
   return row;
+}
+
+/**
+ * Inserts a session only if the user is still enabled at insert time
+ * (design.md §13, GOT.61 F1). Returns `null`, inserting nothing, when the
+ * user is disabled or gone.
+ *
+ * The user row is locked `FOR SHARE` and `disabled_at` re-checked in the
+ * same transaction as the insert. That lock conflicts with the `FOR
+ * UPDATE` a disable (`updateAdminUser`) takes on every enabled row, so the
+ * two serialize: a disable that holds the row first makes this select
+ * wait, then re-evaluate `disabled_at IS NULL` against the committed
+ * disable (READ COMMITTED) and find no row; a login that holds the row
+ * first commits its session before the disable's session delete runs.
+ * A plain insert is not enough: its foreign-key check also waits on the
+ * disable's lock, but then inserts against the now-disabled row.
+ */
+export async function insertSessionIfEnabled(
+  db: Db,
+  input: InsertSessionInput,
+): Promise<{ id: string } | null> {
+  return db.transaction(async (tx) => {
+    const [user] = await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.id, input.userId), isNull(users.disabledAt)))
+      .for("share");
+    if (!user) return null;
+    return insertSession(tx, input);
+  });
 }
 
 export interface SessionWithUser {
