@@ -658,7 +658,7 @@ export interface StartRequest {
   allowedTools: ToolPolicy;           // 'implementation' | 'spec' | 'review'
   mcp: { url: string; token: string };
   env: Record<string, string>;
-  maxBudgetUsd?: number;
+  maxBudgetUsd?: number;              // projects.max_budget_usd, a per-execution cap (user decision 2026-09-29)
 }
 
 export interface ResumeRequest extends Omit<StartRequest, 'systemPrompt'> {
