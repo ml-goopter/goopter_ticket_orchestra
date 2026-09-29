@@ -470,8 +470,8 @@ export default async function tasksRoutes(app: FastifyInstance): Promise<void> {
               409,
               "JIRA_SCOPE_CANCELLED",
               scope === "closed"
-                ? "This task's Jira ticket is closed. The Jira poller cancelled the task and it cannot be reopened."
-                : "This task's Jira ticket is outside the project's JQL. The Jira poller cancelled the task and it cannot be reopened.",
+                ? "This task's Jira ticket was last recorded as closed, so it cannot be reopened."
+                : "This task's Jira ticket was last recorded outside the project's JQL, so it cannot be reopened.",
             );
           }
         }
