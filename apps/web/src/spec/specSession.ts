@@ -4,15 +4,18 @@ import type { Execution, TimelineEvent } from "../api/types.js";
 /**
  * Event types the spec builder's chat subscribes to on `GET
  * /tasks/:id/stream` (design.md §12.3, §12.6, §14 Spec builder row). Agent
- * text and tool calls drive the chat; `execution.started`/`.resumed` (F2,
- * GOT.38 review round 2: a retry or resume can start a spec execution the
- * last-loaded aggregate doesn't know about yet), the `spec.*` events, and
- * `task.state_changed` drive refetches of the draft and aggregate.
+ * text and tool calls, plus the user's own `spec.message` (GOT.57 D1), drive
+ * the chat directly; `execution.started`/`.resumed` (F2, GOT.38 review round
+ * 2: a retry or resume can start a spec execution the last-loaded aggregate
+ * doesn't know about yet), the other `spec.*` events, and `task.state_changed`
+ * drive refetches of the draft and aggregate instead of being rendered
+ * directly.
  */
 export const SPEC_STREAM_EVENT_TYPES = [
   "agent.message.delta",
   "agent.message",
   "agent.tool_call",
+  "spec.message",
   "execution.started",
   "execution.resumed",
   "spec.proposed",
@@ -65,15 +68,21 @@ export function specRoleExecutionIds(executions: readonly Pick<Execution, "id" |
   return new Set(executions.filter((execution) => execution.role === "spec").map((execution) => execution.id));
 }
 
-const CHAT_EVENT_TYPES: ReadonlySet<string> = new Set(["agent.message", "agent.message.delta", "agent.tool_call"]);
+const CHAT_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "agent.message",
+  "agent.message.delta",
+  "agent.tool_call",
+  "spec.message",
+]);
 
 /**
  * Whether `type` is one of the per-execution live chat row types
- * (`agent.message`, `.delta`, `agent.tool_call`) `SpecBuilderView` gates on
- * a spec-execution id (F1, GOT.38 review round 1: the stream carries every
- * execution event for the task, not just the spec execution's, e.g. a
- * paused implementation execution sharing the task, design.md §10.4), as
- * opposed to a task-scoped type (`spec.*`, `task.state_changed`,
+ * (`agent.message`, `.delta`, `agent.tool_call`, and the user's own
+ * `spec.message`, GOT.57 D1) `SpecBuilderView` gates on a spec-execution id
+ * (F1, GOT.38 review round 1: the stream carries every execution event for
+ * the task, not just the spec execution's, e.g. a paused implementation
+ * execution sharing the task, design.md §10.4), as opposed to a task-scoped
+ * type (the other `spec.*` events, `task.state_changed`,
  * `execution.started`/`.resumed`) that is never gated on an execution id.
  * An id that doesn't match the task's known spec-role executions is
  * buffered rather than dropped outright (F2, GOT.38 review round 2): a

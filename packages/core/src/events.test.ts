@@ -25,6 +25,7 @@ const EXPECTED_EVENT_TYPES = [
   "spec.approved",
   "spec.sent_back",
   "spec.revised",
+  "spec.message",
   "issue.created",
   "issue.message",
   "issue.resolved",
