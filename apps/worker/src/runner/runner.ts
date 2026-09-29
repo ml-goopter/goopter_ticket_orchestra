@@ -1702,7 +1702,10 @@ export function createRunner(deps: RunnerDeps): Runner {
     const noMistakes = await pathExists(
       path.join(prepared.worktreePath, NO_MISTAKES_MARKER),
     );
-    const systemPrompt = systemPromptFor("implementation", { noMistakes });
+    const systemPrompt = systemPromptFor("implementation", {
+      noMistakes,
+      runtime: ctx.execution.runtime,
+    });
     const startPrompt = await implementationUserPrompt(ctx, spec, prepared.branch, log);
     const prompt = retryOf
       ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure", reuse !== null, nudge)}\n\n${startPrompt}`
@@ -2311,7 +2314,10 @@ export function createRunner(deps: RunnerDeps): Runner {
               adapter!.start(
                 {
                   cwd,
-                  systemPrompt: systemPromptFor("implementation", { noMistakes }),
+                  systemPrompt: systemPromptFor("implementation", {
+                    noMistakes,
+                    runtime: ctx.execution.runtime,
+                  }),
                   prompt,
                   model: modelFor(ctx),
                   allowedTools: "implementation",
