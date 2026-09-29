@@ -24,6 +24,7 @@ import {
   lockTaskForSpec,
   replaceDependencies,
   resolveTaskIdsByJiraKey,
+  setTaskRepositoryId,
   transition,
   updateDraftRevisionContent,
   wouldCreateCycle,
@@ -154,7 +155,23 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
           // A restart may omit it or repeat the one already on the task; any
           // other value is refused before the busy check below.
           const repositoryId = body.data.repository_id;
-          if (repositoryId !== undefined && repositoryId !== task.repositoryId) {
+          if (task.repositoryId === null) {
+            // F2: a task left over from before D2 locked the repository at
+            // session start has none yet, so a restart may supply one now,
+            // validated and locked exactly as the first start does below
+            // (F1). Omitting it just restarts without setting one.
+            if (repositoryId !== undefined) {
+              const repository = await lockRepositoryById(tx, repositoryId);
+              if (!repository || repository.projectId !== task.projectId) {
+                throw new AppError(
+                  422,
+                  "REPOSITORY_NOT_IN_PROJECT",
+                  "repository_id does not belong to the task's project.",
+                );
+              }
+              await setTaskRepositoryId(tx, id, repositoryId, app.now());
+            }
+          } else if (repositoryId !== undefined && repositoryId !== task.repositoryId) {
             throw new AppError(
               409,
               "REPOSITORY_LOCKED",
@@ -190,7 +207,12 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
               "repository_id is required to start the first spec session.",
             );
           }
-          const repository = await findRepositoryById(tx, repositoryId);
+          // F1: locked (not `findRepositoryById`'s plain read), the same
+          // lock `deleteRepository` takes, so a concurrent delete either
+          // blocks behind this and then sees the task once it commits (409),
+          // or commits first and this sees the repository gone (422) —
+          // never races an FK violation on the write below into a 500.
+          const repository = await lockRepositoryById(tx, repositoryId);
           if (!repository || repository.projectId !== task.projectId) {
             throw new AppError(
               422,

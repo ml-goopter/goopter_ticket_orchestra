@@ -1059,7 +1059,7 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 
 | method | route | notes |
 | --- | --- | --- |
-| POST | `/tasks/:id/spec/session` | `{ repository_id? }`, enqueue `start_spec_session`, task → `SPEC_IN_PROGRESS`. First start (from `NEEDS_SPEC`) requires `repository_id` belonging to the task's project and locks it on the task (GOT.80 D2/D3). A restart (from `SPEC_IN_PROGRESS`) may omit it or repeat the locked one; any other value is `409 REPOSITORY_LOCKED` |
+| POST | `/tasks/:id/spec/session` | `{ repository_id? }`, enqueue `start_spec_session`, task → `SPEC_IN_PROGRESS`. First start (from `NEEDS_SPEC`) requires `repository_id` belonging to the task's project and locks it on the task (GOT.80 D2/D3). A restart (from `SPEC_IN_PROGRESS`) may omit it or repeat the locked one; any other value against an already-locked repository is `409 REPOSITORY_LOCKED`. A restart of a task with no repository locked yet (created before D2) may instead supply one now, validated the same way as the first start and then locked (GOT.80 F2) |
 | POST | `/tasks/:id/spec/messages` | `{ text }`, enqueue `send_message` on the spec execution |
 | PUT | `/tasks/:id/spec/draft` | manual edit of draft `content`; a non-empty `repository` different from the task's locked repository is `422 REPOSITORY_LOCKED` |
 | POST | `/tasks/:id/spec/request-review` | task → `SPEC_REVIEW` |

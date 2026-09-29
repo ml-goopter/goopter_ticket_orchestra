@@ -366,6 +366,170 @@ describe("POST /api/tasks/:id/spec/session (P1)", () => {
       expect(await snapshot(id)).toEqual(before);
     },
   );
+
+  // GOT.80 F1: the first start used to read the repository with an unlocked
+  // `findRepositoryById`, then write `tasks.repository_id` in the same
+  // transaction. A repository delete that locked and counted referencing
+  // tasks first (seeing none, since the write had not happened yet) could
+  // commit in between: the read had already seen the row, but the write's
+  // own FK check then found it gone and raised an uncaught 23503, a 500.
+  // Locking the repository the same way `deleteRepository` does (F1's fix)
+  // makes the two interleavings below the only possible outcomes, and
+  // neither is ever a 500. Both hold one side's transaction open so the
+  // interleaving is deterministic rather than a matter of scheduling luck.
+  describe("F1: first start racing a concurrent repository delete", () => {
+    it("the delete's lock wins: it deletes and commits while the start is blocked, so the start sees the repository gone (422, never 500)", async () => {
+      const repoId = await newRepo("race-first-start-delete-wins");
+      const { id: taskId } = await newTask("NEEDS_SPEC");
+      const before = await snapshot(taskId);
+
+      let deleteLocked!: () => void;
+      const deleteLockedPromise = new Promise<void>((resolve) => {
+        deleteLocked = resolve;
+      });
+      let releaseDelete!: () => void;
+      const releaseDeletePromise = new Promise<void>((resolve) => {
+        releaseDelete = resolve;
+      });
+
+      // Mirrors deleteRepository: lock the row, then (nothing references it
+      // yet) delete it, held open uncommitted.
+      const deleteTx = h.sql.begin(async (sql) => {
+        await sql`select id from repositories where id = ${repoId} for update`;
+        deleteLocked();
+        await releaseDeletePromise;
+        await sql`delete from repositories where id = ${repoId}`;
+      });
+      deleteTx.catch(() => {});
+
+      await deleteLockedPromise;
+
+      const starting = post(`/api/tasks/${taskId}/spec/session`, {
+        repository_id: repoId,
+      });
+
+      // The start's own `lockRepositoryById` conflicts with the delete
+      // transaction's lock: it must still be pending while that transaction
+      // holds it, so nothing is written yet.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await snapshot(taskId)).toEqual(before);
+
+      releaseDelete();
+      await deleteTx;
+
+      const res = await starting;
+      expect(res.statusCode).toBe(422);
+      expect(res.json().error.code).toBe("REPOSITORY_NOT_IN_PROJECT");
+      expect(await snapshot(taskId)).toEqual(before);
+    });
+
+    it("the start's lock wins: it commits the repository reference while a delete is blocked, so the delete sees the task and refuses (409, never 500)", async () => {
+      const repoId = await newRepo("race-first-start-wins");
+      const { id: taskId } = await newTask("NEEDS_SPEC");
+
+      let repoLocked!: () => void;
+      const repoLockedPromise = new Promise<void>((resolve) => {
+        repoLocked = resolve;
+      });
+      let release!: () => void;
+      const releasePromise = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+
+      // Mirrors the fixed start route: lock the repository, then (as
+      // `transition()` would) write it onto the task, held open uncommitted.
+      const holder = h.sql.begin(async (sql) => {
+        await sql`select id from repositories where id = ${repoId} for update`;
+        repoLocked();
+        await releasePromise;
+        await sql`update tasks set repository_id = ${repoId} where id = ${taskId}`;
+      });
+      holder.catch(() => {});
+
+      await repoLockedPromise;
+
+      const deleting = app.inject({
+        method: "DELETE",
+        url: `/api/repositories/${repoId}`,
+        headers: { cookie },
+      });
+
+      // deleteRepository's own `SELECT ... FOR UPDATE` conflicts with the
+      // holder's lock: it must still be pending, so the repository is untouched.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(
+        await h.sql`select id from repositories where id = ${repoId}`,
+      ).toHaveLength(1);
+
+      release();
+      await holder;
+
+      const res = await deleting;
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toMatchObject({
+        error: { code: "REFERENCED_BY_TASKS", task_count: 1 },
+      });
+      expect(
+        await h.sql`select id from repositories where id = ${repoId}`,
+      ).toHaveLength(1);
+    });
+  });
+
+  // GOT.80 F2: a task left `SPEC_IN_PROGRESS` before D2 locked a repository
+  // at session start has `repository_id` null. A restart used to refuse any
+  // `repository_id` (even a valid one) with 409 REPOSITORY_LOCKED though
+  // nothing was actually locked, leaving the task stuck forever.
+  describe("F2: restarting a legacy task with no repository locked yet", () => {
+    it("accepts and locks a repository_id, validated the same way the first start is", async () => {
+      const { id } = await newTask("SPEC_IN_PROGRESS", { withRepository: false });
+      const res = await post(`/api/tasks/${id}/spec/session`, {
+        repository_id: fx.repositoryId,
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ from: "SPEC_IN_PROGRESS", to: "SPEC_IN_PROGRESS" });
+      expect((await taskRow(id)).repository_id).toBe(fx.repositoryId);
+      // Now locked: a further restart with a different one is refused (D2).
+      const other = await newRepo("legacy-restart-other-repo");
+      const second = await post(`/api/tasks/${id}/spec/session`, {
+        repository_id: other,
+      });
+      expect(second.statusCode).toBe(409);
+      expect(second.json().error.code).toBe("REPOSITORY_LOCKED");
+    });
+
+    it("returns 422 REPOSITORY_NOT_IN_PROJECT for a repository from another project, and writes nothing", async () => {
+      const { id } = await newTask("SPEC_IN_PROGRESS", { withRepository: false });
+      const before = await snapshot(id);
+      const res = await post(`/api/tasks/${id}/spec/session`, {
+        repository_id: fxOther.repositoryId,
+      });
+      expect(res.statusCode).toBe(422);
+      expect(res.json().error.code).toBe("REPOSITORY_NOT_IN_PROJECT");
+      expect(await snapshot(id)).toEqual(before);
+    });
+
+    it("omitting repository_id restarts without setting one (unlike the first start, it is not required)", async () => {
+      const { id } = await newTask("SPEC_IN_PROGRESS", { withRepository: false });
+      const res = await post(`/api/tasks/${id}/spec/session`);
+      expect(res.statusCode).toBe(200);
+      expect((await taskRow(id)).repository_id).toBeNull();
+    });
+
+    it("a SPEC_REVIEW task with no repository is unstuck via send-back then a restart with repository_id", async () => {
+      const { id } = await newTask("SPEC_REVIEW", { withRepository: false });
+      await seedRevision(id, 1, "draft", content());
+
+      const sentBack = await post(`/api/tasks/${id}/spec/send-back`);
+      expect(sentBack.statusCode).toBe(200);
+      expect((await taskRow(id)).state).toBe("SPEC_IN_PROGRESS");
+
+      const res = await post(`/api/tasks/${id}/spec/session`, {
+        repository_id: fx.repositoryId,
+      });
+      expect(res.statusCode).toBe(200);
+      expect((await taskRow(id)).repository_id).toBe(fx.repositoryId);
+    });
+  });
 });
 
 describe("POST /api/tasks/:id/spec/messages (P2)", () => {
@@ -813,6 +977,24 @@ describe("POST /api/tasks/:id/spec/approve (P5, P7)", () => {
       const dep = await newTask("DONE");
       await expect422(
         content({ dependencies: [dep.key], repository: OTHER_PROJECT_REPO }),
+        "SPEC_INVALID",
+      );
+    });
+
+    // GOT.80 F3: pre-GOT.80, approval resolved the draft's named repository
+    // by looking it up within the task's project (`findProjectRepositoryByName`),
+    // so naming any real repository of that project — not just the one the
+    // task is locked to — resolved and let approval proceed (200). D2 ties
+    // approval to the task's own locked repository by id instead, so this
+    // now must fail even though the named repository genuinely exists in
+    // the task's project: this test fails (wrongly passes/200s) against
+    // that old name-lookup behaviour and only passes against the fix.
+    it("a draft naming a second, existing repository of the task's own project (D2: locked by id, not any same-project name)", async () => {
+      const secondRepoName = "spc-second-repo";
+      await newRepo(secondRepoName);
+      const dep = await newTask("DONE");
+      await expect422(
+        content({ dependencies: [dep.key], repository: secondRepoName }),
         "SPEC_INVALID",
       );
     });

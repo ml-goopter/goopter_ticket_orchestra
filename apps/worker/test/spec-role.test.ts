@@ -738,7 +738,7 @@ describe("start_spec_session (GOT.37 AC1, AC7)", () => {
     );
   });
 
-  it("skips when the project has no repository, logs at error and writes no notification", async () => {
+  it("skips when the task has no repository, logs at error and writes no notification", async () => {
     const s = await seedSpecTask({ repos: [] });
     const h = makeHarness();
     const startId = await enqueue(s.taskId, "start_spec_session", null);
@@ -754,7 +754,7 @@ describe("start_spec_session (GOT.37 AC1, AC7)", () => {
     expect(records).toContainEqual(
       expect.objectContaining({
         msg: "command skipped",
-        fields: expect.objectContaining({ reason: "project has no repository" }),
+        fields: expect.objectContaining({ reason: "task has no repository" }),
       }),
     );
   });

@@ -257,6 +257,27 @@ export async function lockRepositoryById(
   return row ?? null;
 }
 
+/**
+ * Sets `tasks.repository_id` outside `transition()` (GOT.80 F2): a restart
+ * of a task left over from before D2 locked the repository at session
+ * start, whose `repository_id` is still null. The task's state does not
+ * move on a restart, so there is no trigger to route this through
+ * `transition()`. The caller already holds the task row locked
+ * (`lockTaskForSpec`) and the repository row locked (`lockRepositoryById`),
+ * the same order the first start uses (F1).
+ */
+export async function setTaskRepositoryId(
+  tx: Tx,
+  taskId: string,
+  repositoryId: string,
+  now: Date,
+): Promise<void> {
+  await tx
+    .update(tasks)
+    .set({ repositoryId, updatedAt: now })
+    .where(eq(tasks.id, taskId));
+}
+
 export interface ApproveRevisionInput {
   taskId: string;
   revisionId: string;
