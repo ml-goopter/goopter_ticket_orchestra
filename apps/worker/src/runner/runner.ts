@@ -37,6 +37,7 @@ import {
   resolveSpecRepository,
   restoreEvictedWorktree as restoreEvictedWorktreeRow,
   setExecutionPlacement,
+  workerMatchesRepositoryContainerMode,
   setExecutionSessionId,
   setExecutionWorktree,
   sumSessionUsageByModel,
@@ -2098,6 +2099,8 @@ export function createRunner(deps: RunnerDeps): Runner {
       let expectedWorkerId = execution.workerId;
       if (fresh !== null) {
         freshSpec = freshContext(ctx);
+        // freshContext refused NO_SESSION without a repository.
+        const repositoryId = ctx.repository!.id;
         await deps.hooks?.beforeFallbackPin?.(executionId);
         // C21: pin here before touching the worktree, so two workers
         // handling commands for the same released execution never both
@@ -2111,6 +2114,12 @@ export function createRunner(deps: RunnerDeps): Runner {
           const pinned = (await loadRunnerContext(tx, executionId))?.execution;
           if (pinned?.host != null) {
             refuse("OTHER_HOST", "execution was pinned to a host since the context loaded");
+          }
+          // §9.9 Scheduling: a container-mode execution is pinned only on a
+          // docker-capable worker. The handler unclaims on OTHER_HOST and the
+          // §6.1 claim then leaves the command for a docker worker.
+          if (!(await workerMatchesRepositoryContainerMode(tx, repositoryId, workerId))) {
+            refuse("OTHER_HOST", "container-mode execution needs a worker with the docker capability");
           }
           await pinExecutionToHost(tx, executionId, { workerId, host });
         });
