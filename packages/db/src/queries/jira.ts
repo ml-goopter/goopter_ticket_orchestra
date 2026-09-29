@@ -265,6 +265,12 @@ export interface UpsertJiraTaskInput {
   priority: number;
   createdAt: Date;
   syncedAt: Date;
+  /**
+   * The ticket's status category is Done as of this poll (GOT.77, user
+   * decision Q1, 2026-09-29). A ticket that is Done the first time the JQL
+   * returns it is never imported.
+   */
+  isDone: boolean;
 }
 
 export interface UpsertJiraTaskResult {
@@ -284,12 +290,31 @@ export interface UpsertJiraTaskResult {
  * An existing key only refreshes `jira_summary`, `jira_priority` and
  * `jira_synced_at` — state and every other column, including on a terminal
  * task, are left untouched (design.md §11.1, C4).
+ *
+ * `isDone` (GOT.77, Q1): a ticket already Done the first time it is seen is
+ * never inserted — no task, no notification, no event. `null` is returned
+ * for that case. An already-imported task whose ticket is Done still gets
+ * its summary/priority/synced_at refreshed here; `pollProject`'s later
+ * closed/left-JQL sweep is what cancels or signals it.
  */
 export async function upsertJiraTask(
   tx: Tx,
   input: UpsertJiraTaskInput,
   actor: Actor,
-): Promise<UpsertJiraTaskResult> {
+): Promise<UpsertJiraTaskResult | null> {
+  if (input.isDone) {
+    const [updated] = await tx
+      .update(tasks)
+      .set({
+        jiraSummary: input.summary,
+        jiraPriority: input.priority,
+        jiraSyncedAt: input.syncedAt,
+      })
+      .where(eq(tasks.jiraKey, input.jiraKey))
+      .returning({ id: tasks.id });
+    return updated ? { taskId: updated.id, inserted: false } : null;
+  }
+
   const [inserted] = await tx
     .insert(tasks)
     .values({

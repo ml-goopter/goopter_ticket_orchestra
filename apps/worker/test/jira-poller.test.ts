@@ -682,22 +682,40 @@ describe("pollProject: DONE and CANCELLED tasks are ignored (GOT.77)", () => {
   });
 });
 
-describe("pollProject: a never-imported ticket already Done (GOT.77)", () => {
-  it("is imported by the existing upsert rule and then cancelled as closed in the same poll", async () => {
+describe("pollProject: a ticket already Done when first seen (GOT.77 Q1)", () => {
+  it("is not imported: no task, no notification, no event", async () => {
     const project = await insertProject();
     const key = nextKey();
     const client = fakeClient({ search: vi.fn(async () => [searchIssue(key, "done")]) });
 
     await pollProject({ db, project, client, actor, logger });
 
+    expect(await taskByKey(key)).toHaveLength(0);
+    const notifs = await db.select().from(notifications);
+    expect(notifs.filter((n) => n.title.includes(key))).toHaveLength(0);
+  });
+
+  it("a later poll that sees it reopened and still matching the JQL imports it normally", async () => {
+    const project = await insertProject();
+    const key = nextKey();
+    let status = "done";
+    const client = fakeClient({ search: vi.fn(async () => [searchIssue(key, status)]) });
+
+    await pollProject({ db, project, client, actor, logger });
+    expect(await taskByKey(key)).toHaveLength(0);
+
+    status = "indeterminate";
+    await pollProject({ db, project, client, actor, logger });
+
     const [task] = await taskByKey(key);
-    expect(task!.state).toBe(TaskState.CANCELLED);
-    const stateEvents = (await stateChangedEventsFor(task!.id)).sort((a, b) =>
-      a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
-    );
-    expect(stateEvents.map((e) => (e.payload as { to: string }).to)).toEqual([
-      "NEEDS_SPEC",
-      "CANCELLED",
-    ]);
+    expect(task).toBeDefined();
+    expect(task!.state).toBe(TaskState.NEEDS_SPEC);
+    const events = await stateChangedEventsFor(task!.id);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.payload).toMatchObject({
+      from: null,
+      to: "NEEDS_SPEC",
+      trigger: "jira.imported",
+    });
   });
 });

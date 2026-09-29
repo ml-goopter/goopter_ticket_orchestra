@@ -36,14 +36,20 @@ export interface PollProjectOptions {
 
 /**
  * Polls one project (design.md §11.1). Runs the project's JQL with
- * `ORDER BY created ASC` appended (E1) and upserts every result. Then, for
- * every non-terminal task, works out where its ticket stands (GOT.77, user
- * decision O1): returned by the search, it is `closed` when its status
- * category is Done and `in_scope` otherwise; not returned, its status is
- * looked up, a 404 moves the task to `FAILED` (E3), Done is `closed`, and
- * anything else is `left_jql`. `applyJiraScope` then cancels a spec-group
- * task or signals one with work under way. A transient error on that one
- * lookup leaves the task untouched.
+ * `ORDER BY created ASC` appended (E1) and upserts every result — except a
+ * ticket whose status category is already Done, which `upsertJiraTask`
+ * refuses to insert the first time it is seen (GOT.77, user decision Q1):
+ * no task, no notification, no event. A ticket already imported still gets
+ * its summary/priority/synced_at refreshed even when Done; the closed/
+ * left-JQL sweep below is what acts on it.
+ *
+ * Then, for every non-terminal task, works out where its ticket stands
+ * (GOT.77, user decision O1): returned by the search, it is `closed` when
+ * its status category is Done and `in_scope` otherwise; not returned, its
+ * status is looked up, a 404 moves the task to `FAILED` (E3), Done is
+ * `closed`, and anything else is `left_jql`. `applyJiraScope` then cancels a
+ * spec-group task or signals one with work under way. A transient error on
+ * that one lookup leaves the task untouched.
  *
  * A failure fetching the search results itself (network error, non-2xx) is
  * logged and ends this project's poll here; it never touches the database
@@ -93,6 +99,7 @@ export async function pollProject(options: PollProjectOptions): Promise<void> {
             priority: issue.priority,
             createdAt: issue.createdAt,
             syncedAt,
+            isDone: isDone(issue.statusCategory),
           },
           actor,
         ),
