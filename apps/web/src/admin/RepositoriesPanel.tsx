@@ -257,6 +257,8 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<CreateRepositoryInput | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<{ id: string; message: string } | null>(null);
   const [editErrors, setEditErrors] = useState<FieldErrors>({});
   const [editError, setEditError] = useState<string | null>(null);
 
@@ -324,6 +326,26 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
       await fetchRepositories();
     } catch (err) {
       setEditError(describeApiError(err, "Failed to update the repository."));
+    }
+  }
+
+  /**
+   * Confirm names the repository, matching `TaskDetailView.tsx`'s
+   * cancel-task pattern; cancelling the browser confirm does nothing.
+   */
+  async function handleDelete(repository: Repository) {
+    if (!window.confirm(`Delete repository ${repository.name}?`)) {
+      return;
+    }
+    setDeletingId(repository.id);
+    setDeleteError(null);
+    try {
+      await adminApi.deleteRepository(repository.id);
+      await fetchRepositories();
+    } catch (err) {
+      setDeleteError({ id: repository.id, message: describeApiError(err, "Failed to delete the repository.") });
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -451,10 +473,32 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
                     <td>
                       <button type="button" className="admin-table__action" onClick={() => startEdit(repository)}>
                         Edit
+                      </button>{" "}
+                      <button
+                        type="button"
+                        className="admin-table__action"
+                        aria-label={`Delete ${repository.name}`}
+                        disabled={deletingId === repository.id}
+                        onClick={() => void handleDelete(repository)}
+                      >
+                        Delete
                       </button>
                     </td>
                   </tr>
                 ),
+              )}
+              {deleteError && (
+                <tr key={`${deleteError.id}-delete-error`}>
+                  <td colSpan={12}>
+                    <p
+                      className="alert alert--error"
+                      role="alert"
+                      data-testid={`delete-error-${deleteError.id}`}
+                    >
+                      {deleteError.message}
+                    </p>
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>

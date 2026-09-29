@@ -2,7 +2,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client.js";
-import type { AdminApi, Project, Repository } from "../api/admin.js";
+import { DeleteBlockedError, type AdminApi, type Project, type Repository } from "../api/admin.js";
 import { RepositoriesPanel } from "./RepositoriesPanel.js";
 
 afterEach(cleanup);
@@ -48,9 +48,11 @@ function fakeAdminApi(overrides: Partial<AdminApi> = {}): AdminApi {
     listProjects: vi.fn().mockResolvedValue([project(), project({ id: "proj-2", key: "OTHER" })]),
     createProject: vi.fn(),
     patchProject: vi.fn(),
+    deleteProject: vi.fn(),
     listRepositories: vi.fn().mockResolvedValue([]),
     createRepository: vi.fn(),
     patchRepository: vi.fn(),
+    deleteRepository: vi.fn(),
     listUsers: vi.fn(),
     createUser: vi.fn(),
     patchUser: vi.fn(),
@@ -221,5 +223,82 @@ describe("RepositoriesPanel", () => {
     expect((await screen.findByTestId("create-error")).textContent).toBe(
       "VALIDATION_ERROR: test_command: test_command must not contain ( ) * & ; | ` $ < > or a newline",
     );
+  });
+
+  describe("delete", () => {
+    it("cancelling the confirm does nothing", async () => {
+      const deleteRepository = vi.fn();
+      const adminApi = fakeAdminApi({
+        listRepositories: vi.fn().mockResolvedValue([repository()]),
+        deleteRepository,
+      });
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+      render(<RepositoriesPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("goopter_odoo_modules")).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: "Delete goopter_odoo_modules" }));
+
+      expect(confirmSpy).toHaveBeenCalled();
+      expect(deleteRepository).not.toHaveBeenCalled();
+      expect(screen.getByText("goopter_odoo_modules")).toBeTruthy();
+      confirmSpy.mockRestore();
+    });
+
+    it("confirming names the repository, calls the api, and the row disappears", async () => {
+      const deleteRepository = vi.fn().mockResolvedValue(undefined);
+      const listRepositories = vi.fn().mockResolvedValueOnce([repository()]).mockResolvedValueOnce([]);
+      const adminApi = fakeAdminApi({ listRepositories, deleteRepository });
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      render(<RepositoriesPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("goopter_odoo_modules")).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: "Delete goopter_odoo_modules" }));
+
+      expect(confirmSpy.mock.calls[0]?.[0]).toContain("goopter_odoo_modules");
+      await waitFor(() => expect(deleteRepository).toHaveBeenCalledWith("repo-1"));
+      await waitFor(() => expect(listRepositories).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByText("No repositories yet.")).toBeTruthy());
+      confirmSpy.mockRestore();
+    });
+
+    it("on a 409 the row stays and an inline message shows the reason and task count", async () => {
+      const deleteRepository = vi
+        .fn()
+        .mockRejectedValue(new DeleteBlockedError("Cannot delete: 4 task(s) reference this repository.", 4));
+      const adminApi = fakeAdminApi({
+        listRepositories: vi.fn().mockResolvedValue([repository()]),
+        deleteRepository,
+      });
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      render(<RepositoriesPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("goopter_odoo_modules")).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: "Delete goopter_odoo_modules" }));
+
+      expect((await screen.findByTestId("delete-error-repo-1")).textContent).toBe(
+        "Cannot delete: 4 task(s) reference this repository.",
+      );
+      expect(screen.getByText("goopter_odoo_modules")).toBeTruthy();
+      confirmSpy.mockRestore();
+    });
+
+    it("disables the delete button while the request is in flight", async () => {
+      let resolveDelete!: () => void;
+      const deleteRepository = vi.fn(() => new Promise<void>((resolve) => (resolveDelete = resolve)));
+      const adminApi = fakeAdminApi({
+        listRepositories: vi.fn().mockResolvedValue([repository()]),
+        deleteRepository,
+      });
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      render(<RepositoriesPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("goopter_odoo_modules")).toBeTruthy());
+      const deleteButton = screen.getByRole("button", { name: "Delete goopter_odoo_modules" });
+      fireEvent.click(deleteButton);
+
+      await waitFor(() => expect(deleteButton.hasAttribute("disabled")).toBe(true));
+      resolveDelete();
+      confirmSpy.mockRestore();
+    });
   });
 });

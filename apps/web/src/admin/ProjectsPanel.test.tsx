@@ -2,7 +2,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client.js";
-import type { AdminApi, Project } from "../api/admin.js";
+import { DeleteBlockedError, type AdminApi, type Project } from "../api/admin.js";
 import { ProjectsPanel } from "./ProjectsPanel.js";
 
 afterEach(cleanup);
@@ -28,9 +28,11 @@ function fakeAdminApi(overrides: Partial<AdminApi> = {}): AdminApi {
     listProjects: vi.fn().mockResolvedValue([]),
     createProject: vi.fn(),
     patchProject: vi.fn(),
+    deleteProject: vi.fn(),
     listRepositories: vi.fn(),
     createRepository: vi.fn(),
     patchRepository: vi.fn(),
+    deleteRepository: vi.fn(),
     listUsers: vi.fn(),
     createUser: vi.fn(),
     patchUser: vi.fn(),
@@ -154,6 +156,75 @@ describe("ProjectsPanel", () => {
     await waitFor(() => expect(patchProject).toHaveBeenCalledWith("proj-1", { name: "Goopter Renamed" }));
     await waitFor(() => expect(listProjects).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByText("Goopter Renamed")).toBeTruthy());
+  });
+
+  describe("delete", () => {
+    it("cancelling the confirm does nothing", async () => {
+      const deleteProject = vi.fn();
+      const adminApi = fakeAdminApi({ listProjects: vi.fn().mockResolvedValue([project()]), deleteProject });
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+      render(<ProjectsPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("GOOP")).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: "Delete GOOP" }));
+
+      expect(confirmSpy).toHaveBeenCalled();
+      expect(deleteProject).not.toHaveBeenCalled();
+      expect(screen.getByText("GOOP")).toBeTruthy();
+      confirmSpy.mockRestore();
+    });
+
+    it("confirming names the project and states its repositories are deleted with it (D2)", async () => {
+      const deleteProject = vi.fn().mockResolvedValue(undefined);
+      const listProjects = vi.fn().mockResolvedValueOnce([project()]).mockResolvedValueOnce([]);
+      const adminApi = fakeAdminApi({ listProjects, deleteProject });
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      render(<ProjectsPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("GOOP")).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: "Delete GOOP" }));
+
+      expect(confirmSpy.mock.calls[0]?.[0]).toContain("GOOP");
+      expect(confirmSpy.mock.calls[0]?.[0]).toMatch(/repositories/i);
+      await waitFor(() => expect(deleteProject).toHaveBeenCalledWith("proj-1"));
+      await waitFor(() => expect(listProjects).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByText("No projects yet.")).toBeTruthy());
+      confirmSpy.mockRestore();
+    });
+
+    it("on a 409 the row stays and an inline message shows the reason and task count", async () => {
+      const deleteProject = vi
+        .fn()
+        .mockRejectedValue(new DeleteBlockedError("Cannot delete: 2 task(s) reference this project or its repositories.", 2));
+      const adminApi = fakeAdminApi({ listProjects: vi.fn().mockResolvedValue([project()]), deleteProject });
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      render(<ProjectsPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("GOOP")).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: "Delete GOOP" }));
+
+      expect((await screen.findByTestId("delete-error-proj-1")).textContent).toBe(
+        "Cannot delete: 2 task(s) reference this project or its repositories.",
+      );
+      expect(screen.getByText("GOOP")).toBeTruthy();
+      confirmSpy.mockRestore();
+    });
+
+    it("disables the delete button while the request is in flight", async () => {
+      let resolveDelete!: () => void;
+      const deleteProject = vi.fn(() => new Promise<void>((resolve) => (resolveDelete = resolve)));
+      const adminApi = fakeAdminApi({ listProjects: vi.fn().mockResolvedValue([project()]), deleteProject });
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      render(<ProjectsPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("GOOP")).toBeTruthy());
+      const deleteButton = screen.getByRole("button", { name: "Delete GOOP" });
+      fireEvent.click(deleteButton);
+
+      await waitFor(() => expect(deleteButton.hasAttribute("disabled")).toBe(true));
+      resolveDelete();
+      confirmSpy.mockRestore();
+    });
   });
 });
 

@@ -1,6 +1,6 @@
 import { RuntimeSchema, type Runtime } from "@orchestra/core";
 import { z } from "zod";
-import type { ApiClient } from "./client.js";
+import { ApiError, type ApiClient } from "./client.js";
 
 /**
  * Standalone client for the admin routes -- `/projects`, `/repositories`,
@@ -115,13 +115,55 @@ export interface AdminApi {
   listProjects(): Promise<Project[]>;
   createProject(input: CreateProjectInput): Promise<Project>;
   patchProject(id: string, patch: PatchProjectInput): Promise<Project>;
+  /** `DELETE /projects/:id` (GOT.52, D2): also deletes the project's repositories. */
+  deleteProject(id: string): Promise<void>;
   listRepositories(projectId?: string): Promise<Repository[]>;
   createRepository(input: CreateRepositoryInput): Promise<Repository>;
   patchRepository(id: string, patch: PatchRepositoryInput): Promise<Repository>;
+  /** `DELETE /repositories/:id` (GOT.52). */
+  deleteRepository(id: string): Promise<void>;
   listUsers(): Promise<AdminUser[]>;
   createUser(input: CreateUserInput): Promise<AdminUser>;
   patchUser(id: string, patch: PatchUserInput): Promise<AdminUser>;
   listWorkers(): Promise<Worker[]>;
+}
+
+/**
+ * Thrown by `deleteProject`/`deleteRepository` when the api responds 409
+ * `REFERENCED_BY_TASKS` (GOT.52): a task still references the row, so
+ * nothing was deleted. `ApiError` (owned by `client.ts`, outside this
+ * task's scope) only carries `code` and `message` -- the raw `task_count`
+ * field on the error body never reaches this module -- so the count is
+ * parsed back out of the api's own message, whose format both delete
+ * routes fix as "Cannot delete: N task(s) reference ...".
+ */
+export class DeleteBlockedError extends Error {
+  readonly code = "REFERENCED_BY_TASKS" as const;
+  readonly taskCount: number;
+
+  constructor(message: string, taskCount: number) {
+    super(message);
+    this.name = "DeleteBlockedError";
+    this.taskCount = taskCount;
+  }
+}
+
+function parseTaskCount(message: string): number {
+  const match = /(\d+)/.exec(message);
+  return match ? Number(match[1]) : 0;
+}
+
+/**
+ * Rethrows a `REFERENCED_BY_TASKS` `ApiError` as a `DeleteBlockedError`
+ * carrying a typed `taskCount`; every other error (including a 404,
+ * handled by callers the same way as the client's other not-found
+ * responses) passes through unchanged.
+ */
+function rethrowDeleteError(err: unknown): never {
+  if (err instanceof ApiError && err.code === "REFERENCED_BY_TASKS") {
+    throw new DeleteBlockedError(err.message, parseTaskCount(err.message));
+  }
+  throw err;
 }
 
 const ProjectSchema = z.object({
@@ -324,6 +366,13 @@ export function createAdminApi(request: ApiClient["request"]): AdminApi {
       const json = await request<unknown>("PATCH", `/projects/${id}`, { body: projectPatchBody(patch) });
       return mapProject(ProjectSchema.parse(json));
     },
+    deleteProject: async (id) => {
+      try {
+        await request<void>("DELETE", `/projects/${id}`);
+      } catch (err) {
+        rethrowDeleteError(err);
+      }
+    },
     listRepositories: async (projectId) => {
       const json = await request<unknown>("GET", `/repositories${buildQuery({ project: projectId })}`);
       return z.array(RepositorySchema).parse(json).map(mapRepository);
@@ -335,6 +384,13 @@ export function createAdminApi(request: ApiClient["request"]): AdminApi {
     patchRepository: async (id, patch) => {
       const json = await request<unknown>("PATCH", `/repositories/${id}`, { body: repositoryPatchBody(patch) });
       return mapRepository(RepositorySchema.parse(json));
+    },
+    deleteRepository: async (id) => {
+      try {
+        await request<void>("DELETE", `/repositories/${id}`);
+      } catch (err) {
+        rethrowDeleteError(err);
+      }
     },
     listUsers: async () => {
       const json = await request<unknown>("GET", "/users");
