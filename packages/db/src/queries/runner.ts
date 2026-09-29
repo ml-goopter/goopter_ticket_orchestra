@@ -5,6 +5,8 @@ import {
   eq,
   inArray,
   isNull,
+  not,
+  notExists,
   or,
   sql,
 } from "drizzle-orm";
@@ -18,6 +20,7 @@ import { projects, repositories } from "../schema/projects.js";
 import { specificationRevisions, tasks } from "../schema/tasks.js";
 import { users } from "../schema/users.js";
 import type { DbOrTx } from "../transition.js";
+import { containerModeMatches } from "./scheduler.js";
 import type {
   ExecutionRow,
   ProjectRow,
@@ -39,6 +42,8 @@ export type ExecutionCommandRow = typeof executionCommands.$inferSelect;
 export const COMMAND_CLAIM_LIMIT = 10;
 
 export interface ClaimExecutionCommandsInput {
+  /** This worker's `agent_workers.id`; its capabilities gate container mode. */
+  workerId: string;
   /** This worker's `WORKER_HOST`. */
   host: string;
   /** Command types a handler is registered for. Others stay unclaimed. */
@@ -48,11 +53,32 @@ export interface ClaimExecutionCommandsInput {
 }
 
 /**
+ * Command types whose handler pins an implementation execution released
+ * from a dead host (host null) for a fresh session (C21, D5).
+ */
+const FRESH_SESSION_COMMAND_TYPES: readonly CommandType[] = [
+  "send_message",
+  "resume_with_decision",
+  "resume_with_revision",
+];
+
+/**
  * design.md §6.1 in one statement, so the select, its row locks and the
  * `claimed_at` write share one transaction. Takes unclaimed commands of a
  * handled `type` whose execution is unset, unpinned (`host` null) or pinned
  * to `host`, oldest first, `FOR UPDATE SKIP LOCKED` so two workers never
  * claim the same row. Returned oldest first.
+ *
+ * §9.9 Scheduling (C4b): a command that would place a container-mode agent
+ * session on this worker needs `containerModeMatches`, as the §6.3 claim
+ * does. That is a `start_spec_session` whose task's repository (the spec
+ * repository since GOT.80) has `agent_container = true`, and a
+ * fresh-session command on a released implementation execution whose
+ * task's repository has it. A worker without `docker` leaves them
+ * unclaimed for a docker worker; with none, they wait unclaimed and no
+ * handler runs. The filters read tasks, executions, repositories and the
+ * worker row in subqueries, so the statement still locks only commands;
+ * each handler re-checks under its task lock before it places a session.
  */
 export async function claimExecutionCommands(
   db: DbOrTx,
@@ -66,6 +92,34 @@ export async function claimExecutionCommands(
     .from(executions)
     .where(or(eq(executions.host, input.host), isNull(executions.host)));
 
+  const containerSpecStart = db
+    .select({ one: sql`1` })
+    .from(tasks)
+    .innerJoin(repositories, eq(repositories.id, tasks.repositoryId))
+    .where(
+      and(
+        eq(tasks.id, executionCommands.taskId),
+        isNull(executionCommands.executionId),
+        eq(executionCommands.type, "start_spec_session"),
+        not(containerModeMatches(db, input.workerId)),
+      ),
+    );
+
+  const containerFreshSession = db
+    .select({ one: sql`1` })
+    .from(executions)
+    .innerJoin(tasks, eq(tasks.id, executions.taskId))
+    .innerJoin(repositories, eq(repositories.id, tasks.repositoryId))
+    .where(
+      and(
+        eq(executions.id, executionCommands.executionId),
+        isNull(executions.host),
+        eq(executions.role, "implementation"),
+        inArray(executionCommands.type, [...FRESH_SESSION_COMMAND_TYPES]),
+        not(containerModeMatches(db, input.workerId)),
+      ),
+    );
+
   const candidates = db
     .select({ id: executionCommands.id })
     .from(executionCommands)
@@ -77,6 +131,8 @@ export async function claimExecutionCommands(
           isNull(executionCommands.executionId),
           inArray(executionCommands.executionId, hostMatches),
         ),
+        notExists(containerSpecStart),
+        notExists(containerFreshSession),
       ),
     )
     .orderBy(asc(executionCommands.createdAt), asc(executionCommands.id))
@@ -94,6 +150,25 @@ export async function claimExecutionCommands(
       a.createdAt.getTime() - b.createdAt.getTime() ||
       a.id.localeCompare(b.id),
   );
+}
+
+/**
+ * §9.9 Scheduling: true when `workerId` may run the repository's agents,
+ * per `containerModeMatches` (host mode, or `docker` among the worker's
+ * capabilities). False when the repository is gone. Takes no lock; the
+ * command handlers call it under their task lock, before placing a session.
+ */
+export async function workerMatchesRepositoryContainerMode(
+  db: DbOrTx,
+  repositoryId: string,
+  workerId: string,
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(and(eq(repositories.id, repositoryId), containerModeMatches(db, workerId)))
+    .limit(1);
+  return row !== undefined;
 }
 
 /** Stamps `completed_at` once the command's handler has resolved (§6.1). */

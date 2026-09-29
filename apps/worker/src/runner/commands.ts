@@ -92,6 +92,7 @@ export function createConsumeCommandsPhase(
 
       const host = ctx.config.host;
       const claimed = await claimExecutionCommands(ctx.db, {
+        workerId: ctx.workerId,
         host,
         types,
         now: ctx.now,
