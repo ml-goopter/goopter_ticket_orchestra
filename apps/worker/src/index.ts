@@ -2,7 +2,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClaudeAdapter, CodexAdapter } from "@orchestra/adapters";
-import { createDb, deploymentOwner, type Db } from "@orchestra/db";
+import {
+  createDb,
+  deploymentOwner,
+  revokeRunningSpecTokensOnHost,
+  type Db,
+} from "@orchestra/db";
 import {
   DEFAULT_AGENT_TOOLS_HOST,
   createAgentToolsServer,
@@ -112,6 +117,24 @@ async function main(): Promise<void> {
 
   const log = logger.child({ workerId });
   log.info({ config: redactConfig(config) }, "worker registered");
+
+  // GOT.82, design.md §9.3, §6.3: a spec execution stays `RUNNING` with a
+  // live agent-tools token only for the length of one turn; a crash on this
+  // host can leave that token set with no agent process left to finish the
+  // turn and revoke it. Run once, before the runner, scheduler phases and
+  // the agent-tools server below accept any work, so `holdsCapacity` never
+  // counts a leftover token as a held slot and worktree.
+  try {
+    const revoked = await revokeRunningSpecTokensOnHost(db, config.host);
+    log.info({ revoked }, "revoked stale spec-execution agent-tools tokens");
+  } catch (err) {
+    log.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      "failed to revoke stale spec-execution agent-tools tokens",
+    );
+    await closeDb(db).catch(() => {});
+    process.exit(1);
+  }
 
   // design.md §9.7: `config/pricing.json`, loaded once and passed to the
   // runner. A bad or missing file fails startup rather than silently
