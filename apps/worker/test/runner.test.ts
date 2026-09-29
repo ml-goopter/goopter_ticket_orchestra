@@ -324,6 +324,68 @@ const aborted = (signal: AbortSignal): Promise<void> =>
     else signal.addEventListener("abort", () => resolve(), { once: true });
   });
 
+/**
+ * GOT.67: a manual quiet timer for `runSession`'s injected `setTimer`/
+ * `clearTimer` (§9.4). Only intercepts scheduling at `quietMs`, the exact
+ * value the test passes as `quietTimeoutMs`; every other `after()` caller
+ * (flush, blocking grace) keeps using the real setTimeout/clearTimeout, so
+ * their behaviour is unchanged (acceptance 5). Firing is driven entirely by
+ * the test, never by elapsed wall-clock time, so a reset that stacks rather
+ * than replaces, or a reset that never happens, both surface deterministically.
+ */
+function createManualQuietTimer(quietMs: number) {
+  let nextId = 1;
+  const live = new Map<number, () => void>();
+  const scheduled: number[] = [];
+  let waiter: { count: number; resolve: () => void } | null = null;
+
+  const maybeNotify = (): void => {
+    if (waiter && scheduled.length >= waiter.count) {
+      const w = waiter;
+      waiter = null;
+      w.resolve();
+    }
+  };
+
+  return {
+    setTimer: (fn: () => void, ms: number): unknown => {
+      if (ms !== quietMs) return setTimeout(fn, ms);
+      const id = nextId++;
+      live.set(id, fn);
+      scheduled.push(id);
+      maybeNotify();
+      return id;
+    },
+    clearTimer: (handle: unknown): void => {
+      if (typeof handle === "number" && live.has(handle)) {
+        live.delete(handle);
+        return;
+      }
+      clearTimeout(handle as NodeJS.Timeout);
+    },
+    /** Resolves once `count` quiet timers have been scheduled in total. */
+    waitForSchedule(count: number): Promise<void> {
+      if (scheduled.length >= count) return Promise.resolve();
+      return new Promise((resolve) => (waiter = { count, resolve }));
+    },
+    scheduledCount(): number {
+      return scheduled.length;
+    },
+    /** Timers scheduled but not yet cancelled or fired: 1 when resets replace rather than stack. */
+    liveCount(): number {
+      return live.size;
+    },
+    /** Fires the most recently scheduled, still-live quiet timer. */
+    fireLatest(): void {
+      const id = scheduled[scheduled.length - 1];
+      const fn = id === undefined ? undefined : live.get(id);
+      if (!fn) throw new Error("no live quiet timer to fire");
+      live.delete(id!);
+      fn();
+    },
+  };
+}
+
 /** What `report_pr_created` does to the execution (§8). */
 async function completeViaTool(executionId: string): Promise<void> {
   const row = await execution(executionId);
@@ -377,6 +439,9 @@ function makeRunner(
     /** A real manager to delegate to instead of the fake one. */
     worktrees?: RunnerDeps["worktrees"];
     workerId: string;
+    /** GOT.67: a manual timer for the quiet-timer test to drive itself. */
+    setTimer?: RunnerDeps["setTimer"];
+    clearTimer?: RunnerDeps["clearTimer"];
   },
 ): Harness {
   const registry = createExecutionRegistry();
@@ -421,6 +486,8 @@ function makeRunner(
     quietTimeoutMs: options.quietTimeoutMs ?? 10_000,
     basePath: BASE_PATH,
     timings: { leaseRenewMs: options.leaseRenewMs ?? 100, blockingGraceMs: 400, blockingPollMs: 50 },
+    setTimer: options.setTimer,
+    clearTimer: options.clearTimer,
   });
   runner = created;
   return { adapter, registry, prepared, specPrepared, runner: created };
@@ -679,30 +746,53 @@ describe("event loop (design.md §9.3)", () => {
     expect(delta!.id).toBeLessThan(noteRow!.id);
   });
 
-  it("resets the quiet timer on every event (§9.4)", async () => {
-    const s = await seedClaimed();
-    const h = makeRunner({ workerId: s.workerId, quietTimeoutMs: 300 });
-    h.adapter.script = async function* ({ executionId }) {
-      yield { type: "session", sessionId: "sess-qt" };
-      // 8 x 100 ms: every gap is under the timeout, the span is well over it.
-      for (let i = 0; i < 8; i++) {
-        await sleep(100);
-        yield { type: "text", delta: "." };
-      }
-      await completeViaTool(executionId);
-      yield { type: "turn_done", finalText: "........" };
-    };
+  it(
+    "resets the quiet timer on every event (§9.4)",
+    async () => {
+      const s = await seedClaimed();
+      // A sentinel the manual timer alone reacts to; large enough that no
+      // other `after()` caller (flush, blocking grace) could ever collide.
+      const QUIET_MS = 999_999_999;
+      const EVENTS = 8;
+      const quiet = createManualQuietTimer(QUIET_MS);
+      const h = makeRunner({
+        workerId: s.workerId,
+        quietTimeoutMs: QUIET_MS,
+        setTimer: quiet.setTimer,
+        clearTimer: quiet.clearTimer,
+      });
+      h.adapter.script = async function* () {
+        yield { type: "session", sessionId: "sess-qt" };
+        for (let i = 0; i < EVENTS; i++) {
+          yield { type: "text", delta: "." };
+        }
+        // No more events: only the quiet timer, fired manually below, ends this run.
+        await new Promise(() => {});
+      };
 
-    const started = Date.now();
-    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+      const run = h.runner.start({ executionId: s.executionId, taskId: s.taskId });
 
-    expect(Date.now() - started).toBeGreaterThanOrEqual(800);
-    const row = await execution(s.executionId);
-    expect(row.state).toBe("COMPLETED");
-    expect(row.endReason).toBeNull();
-    expect(h.adapter.signals[0]!.aborted).toBe(false);
-    expect(await eventTypes(s.executionId)).not.toContain("execution.failed");
-  });
+      // One unconditional reset before the event loop starts, plus one per
+      // received event (the session event and each of the EVENTS text
+      // events): EVENTS + 2 in total.
+      await quiet.waitForSchedule(EVENTS + 2);
+      expect(quiet.scheduledCount()).toBe(EVENTS + 2);
+      // Every earlier quiet timer was cancelled by the next event's reset,
+      // not left running alongside it.
+      expect(quiet.liveCount()).toBe(1);
+
+      // Simulate the quiet period elapsing with no further event.
+      quiet.fireLatest();
+      await run;
+
+      const row = await execution(s.executionId);
+      expect(row.state).toBe("FAILED");
+      expect(row.endReason).toBe("agent_hung");
+      expect(h.adapter.signals[0]!.aborted).toBe(true);
+      await expectCleanedUp(h, s.executionId);
+    },
+    5_000,
+  );
 
   it("an iterator that throws ends FAILED process_crash with the token redacted from end_detail and logs", async () => {
     const s = await seedClaimed();
