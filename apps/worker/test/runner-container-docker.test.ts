@@ -119,6 +119,8 @@ class SpawningAdapter implements AgentAdapter {
   spawn: ProcessSpawner | undefined;
   output: string | undefined;
   exitCode: number | null | undefined;
+  /** The turn's agent-tools token, as the runner issued it. */
+  token: string | undefined;
   constructor(
     readonly runtime: Runtime,
     private readonly hostEnv: NodeJS.ProcessEnv,
@@ -132,6 +134,7 @@ class SpawningAdapter implements AgentAdapter {
       const executionId = path.basename(req.cwd);
       yield { type: "session", sessionId: randomUUID() } as AgentEvent;
       const { command, args, spawn } = self.command(self.spawn!);
+      self.token = req.mcp.token;
       const proc = spawn(command, args, {
         cwd: req.cwd,
         env: { ...self.hostEnv, ...req.env, ORCHESTRA_TOKEN: req.mcp.token },
@@ -259,7 +262,12 @@ describe.skipIf(!dockerOk)("container-mode execution against real Docker (§9.9,
     });
   }
 
-  function makeRunner(workerId: string, repositoryName: string, adapter: SpawningAdapter): Runner {
+  function makeRunner(
+    workerId: string,
+    repositoryName: string,
+    adapter: SpawningAdapter,
+    containerManager: ContainerManager = manager,
+  ): Runner {
     runner = createRunner({
       db,
       registry: createExecutionRegistry(),
@@ -285,7 +293,7 @@ describe.skipIf(!dockerOk)("container-mode execution against real Docker (§9.9,
       toolsUrl: () => "http://127.0.0.1:4999/mcp",
       quietTimeoutMs: 120_000,
       containers: {
-        manager,
+        manager: containerManager,
         toolsUrl: () => CONTAINER_TOOLS_URL,
         credentials: {
           githubToken: GH_SECRET,
@@ -348,6 +356,42 @@ describe.skipIf(!dockerOk)("container-mode execution against real Docker (§9.9,
     expect(adapter.output).not.toContain(JIRA_LEAK);
 
     // Removed when the execution ended.
+    expect(dockerStatus("container", "inspect", containerName(s.executionId))).not.toBe(0);
+  });
+
+  it("gives the container the turn's ORCHESTRA_TOKEN and ORCHESTRA_URL when the worker's own environment has stale ones (C4 F2)", async () => {
+    const STALE_TOKEN = `stale-${randomUUID()}`;
+    const STALE_URL = "http://127.0.0.1:1/stale";
+    const staleEnv: NodeJS.ProcessEnv = { ...hostEnv, ORCHESTRA_TOKEN: STALE_TOKEN, ORCHESTRA_URL: STALE_URL };
+    const staleManager = new ContainerManager({
+      workspaceRoot: root,
+      image: IMAGE,
+      cpus: 1,
+      memory: "512m",
+      owner,
+      network,
+      hostEnv: staleEnv,
+    });
+    const s = await seedClaimed("codex", null);
+    const adapter = new SpawningAdapter(
+      "codex",
+      staleEnv,
+      (spawn) => ({ command: "sh", args: ["-c", "env"], spawn }),
+      completeViaTool,
+    );
+    const r = makeRunner(s.workerId, s.repositoryName, adapter, staleManager);
+
+    await r.start({ executionId: s.executionId, taskId: s.taskId });
+
+    expect(adapter.exitCode).toBe(0);
+    const env = toMap(adapter.output!);
+    expect(adapter.token).toMatch(/.{20,}/);
+    expect(env.ORCHESTRA_TOKEN).toBe(adapter.token);
+    expect(env.ORCHESTRA_URL).toBe(CONTAINER_TOOLS_URL);
+    expect(adapter.output).not.toContain(STALE_TOKEN);
+    expect(adapter.output).not.toContain(STALE_URL);
+    const row = (await db.query.executions.findFirst({ where: (e, { eq }) => eq(e.id, s.executionId) }))!;
+    expect(row.state).toBe("COMPLETED");
     expect(dockerStatus("container", "inspect", containerName(s.executionId))).not.toBe(0);
   });
 

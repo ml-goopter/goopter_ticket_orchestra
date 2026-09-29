@@ -8,6 +8,7 @@ import type { ExecutionState, TaskState } from "@orchestra/core";
 import {
   executionEvents,
   executions,
+  failJiraTaskNotFound,
   lockTaskForTool,
   projects,
   repositories,
@@ -28,7 +29,6 @@ import { loadConfig } from "../src/config.js";
 import {
   ContainerManager,
   DockerError,
-  forgetEnsure,
   type ExecutionContainerOps,
   type LabelledContainer,
 } from "../src/containers/index.js";
@@ -1710,20 +1710,129 @@ describe("orphan agent containers (§9.9 Orphans)", () => {
     expect(containers.removed).toEqual([]);
   });
 
-  it("leaves an ended execution's container this worker ensured and has not removed, until it is removed", async () => {
-    // A resume recreating an evicted worktree runs setup in the container
-    // before its state move, so the row still says COMPLETED.
-    const completed = await seedExecution("COMPLETED");
-    containers = fakeContainers({ listed: [labelled("c-completed", completed.executionId)] });
-    await resumeEnsure(completed.executionId, completed.taskId);
+  describe("an execution the api ended while this worker ran no turn of it (C4 F1)", () => {
+    const actor = { kind: "user" as const, id: "api-user" };
+    const idle = () => false;
 
-    await sweepTracked();
-    expect(containers.removed).toEqual([]);
+    it("removes the container of a spec execution completed by request-review", async () => {
+      const task = await seedTask("SPEC_IN_PROGRESS");
+      const [row] = await db
+        .insert(executions)
+        .values({
+          taskId: task.id,
+          role: "spec",
+          attempt: 1,
+          state: "RUNNING",
+          runtime: "claude",
+          model: "claude-opus",
+          host: HOST,
+          startedAt: at(-HOUR),
+          createdAt: at(-HOUR),
+        })
+        .returning({ id: executions.id });
+      const executionId = row!.id;
+      containers = fakeContainers({ listed: [labelled("c-spec", executionId, task.id)] });
+      // The spec session's turn ensured the container; between turns it stays.
+      await resumeEnsure(executionId, task.id);
+      await sweepTracked({ isLive: idle });
+      expect(containers.removed).toEqual([]);
 
-    // The runner's removal clears the mark; the next sweep collects a leftover.
-    forgetEnsure(completed.executionId);
-    await sweepTracked();
-    expect(containers.removed).toEqual(["c-completed"]);
+      // apps/api POST /tasks/:id/spec/request-review, with no worker notified.
+      await db.transaction(async (tx) => {
+        await transition(tx, { entity: "task", id: task.id, trigger: "spec.review_requested", actor });
+        await transition(tx, {
+          entity: "execution",
+          id: executionId,
+          trigger: "execution.completed",
+          actor,
+          set: { endedAt: NOW, toolsTokenHash: null },
+        });
+      });
+
+      await sweepTracked({ isLive: idle });
+      expect(containers.removed).toEqual(["c-spec"]);
+    });
+
+    it("removes the container of an execution cancelled by the api while it waited for the user", async () => {
+      const waiting = await seedExecution("WAITING_FOR_USER");
+      containers = fakeContainers({ listed: [labelled("c-waiting", waiting.executionId, waiting.taskId)] });
+      await resumeEnsure(waiting.executionId, waiting.taskId);
+      await sweepTracked({ isLive: idle });
+      expect(containers.removed).toEqual([]);
+
+      // apps/api POST /tasks/:id/cancel of an execution with no live run.
+      await db.transaction(async (tx) => {
+        await transition(tx, { entity: "task", id: waiting.taskId, trigger: "task.cancelled", actor });
+        await transition(tx, {
+          entity: "execution",
+          id: waiting.executionId,
+          trigger: "execution.cancelled",
+          actor,
+        });
+      });
+
+      await sweepTracked({ isLive: idle });
+      expect(containers.removed).toEqual(["c-waiting"]);
+    });
+
+    it("removes the container of an execution cancelled because its Jira ticket returned 404", async () => {
+      const waiting = await seedExecution("WAITING_FOR_USER");
+      const [task] = (await raw("select jira_key from tasks where id = $1", [waiting.taskId])) as Array<{
+        jira_key: string;
+      }>;
+      containers = fakeContainers({ listed: [labelled("c-jira", waiting.executionId, waiting.taskId)] });
+      await resumeEnsure(waiting.executionId, waiting.taskId);
+
+      await db.transaction((tx) =>
+        failJiraTaskNotFound(tx, {
+          taskId: waiting.taskId,
+          jiraKey: task!.jira_key,
+          actor: { kind: "system", id: "jira-poller" },
+        }),
+      );
+      expect((await execution(waiting.executionId)).state).toBe("CANCELLED");
+
+      await sweepTracked({ isLive: idle });
+      expect(containers.removed).toEqual(["c-jira"]);
+    });
+
+    it("keeps the container of an ended execution while this worker still runs it", async () => {
+      const completed = await seedExecution("COMPLETED");
+      containers = fakeContainers({ listed: [labelled("c-live", completed.executionId)] });
+      await resumeEnsure(completed.executionId, completed.taskId);
+
+      await sweepTracked({ isLive: (id) => id === completed.executionId });
+      expect(containers.removed).toEqual([]);
+      expect(records).toContainEqual(
+        expect.objectContaining({
+          level: "info",
+          msg: "agent container kept, execution resumed",
+          fields: expect.objectContaining({ executionId: completed.executionId, reason: "live" }),
+        }),
+      );
+
+      // The run ended here without removing it; the next sweep collects it.
+      await sweepTracked({ isLive: idle });
+      expect(containers.removed).toEqual(["c-live"]);
+    });
+
+    it("keeps the container when a run of it starts here after the sweeper's decision", async () => {
+      const completed = await seedExecution("COMPLETED");
+      containers = fakeContainers({ listed: [labelled("c-resumed", completed.executionId)] });
+      await resumeEnsure(completed.executionId, completed.taskId);
+      let live = false;
+
+      await sweepTracked(
+        { isLive: () => live },
+        {
+          afterTransaction: async () => {
+            live = true;
+          },
+        },
+      );
+
+      expect(containers.removed).toEqual([]);
+    });
   });
 
   it("a failed orphan removal is logged and the next container is still removed", async () => {

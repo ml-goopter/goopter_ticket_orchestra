@@ -62,6 +62,12 @@ export interface WorktreeSweeperOptions {
    * passes it; omitted, the sweeper touches no container.
    */
   containers?: ExecutionContainerOps;
+  /**
+   * The runner's `isLive`: true while this process runs, starts or resumes
+   * the execution. A live execution's container is never removed, whatever
+   * its row says. Omitted, no execution counts as live here.
+   */
+  isLive?: (executionId: string) => boolean;
 }
 
 export interface WorktreeSweepInput {
@@ -111,18 +117,21 @@ interface GuardedRemoval {
   removable: (row: ContainerExecution | null) => boolean;
   /** The docker removal. */
   remove: () => Promise<void>;
+  /** `WorktreeSweeperOptions.isLive`. */
+  isLive?: ((executionId: string) => boolean) | undefined;
   fields: Record<string, unknown>;
 }
 
 /**
  * Removes one container after the sweeper's decision has committed, holding
  * only the execution's container lock: no transaction is open and no
- * repository lock is held. Under that lock it skips when an `ensure` ran
- * since `mark` was read (a resume is using the container), re-reads the
- * execution without row locks and skips unless `removable`, then removes
- * and clears the mark. A resume whose `ensure` arrives meanwhile waits for
- * the lock and recreates the container. Logs; never throws. True when
- * removed.
+ * repository lock is held. Under that lock it skips when this process runs
+ * the execution (`isLive`), or when an `ensure` ran since `mark` was read (a
+ * resume is using the container), re-reads the execution without row locks
+ * and skips unless `removable`, then removes and clears the mark. A run
+ * that starts or resumes meanwhile ensures only after it is live and its
+ * state move has committed; that `ensure` waits for the lock and recreates
+ * the container. Logs; never throws. True when removed.
  */
 async function removeContainerGuarded(
   db: Db,
@@ -132,6 +141,10 @@ async function removeContainerGuarded(
   const { executionId, fields } = removal;
   try {
     return await withExecutionContainerLock(executionId, async () => {
+      if (removal.isLive?.(executionId)) {
+        logger.info({ ...fields, reason: "live" }, "agent container kept, execution resumed");
+        return false;
+      }
       if (ensureMark(executionId) !== removal.mark) {
         logger.info({ ...fields, reason: "ensured" }, "agent container kept, execution resumed");
         return false;
@@ -202,16 +215,18 @@ async function removeContainerGuarded(
  * 3. take the execution's in-process container lock, which
  *    `ContainerManager.ensure` also takes and which is acquired last
  *    everywhere, so it joins no wait cycle;
- * 4. keep the container if the mark changed (an `ensure` ran after step 1:
- *    a resume, for example of the worktree just evicted, is using it) or
- *    if a fresh read shows the execution `QUEUED`, `ASSIGNED` or `RUNNING`;
+ * 4. keep the container if this process runs the execution (`isLive`), if
+ *    the mark changed (an `ensure` ran after step 1: a resume, for example
+ *    of the worktree just evicted, is using it) or if a fresh read shows the
+ *    execution `QUEUED`, `ASSIGNED` or `RUNNING`;
  * 5. otherwise remove it and clear the mark.
  *
  * A resume that ensures during step 5 waits for the lock, finds the
- * container missing and recreates it (§9.9 Recreation). The orphan pass
- * also keeps any container this process has ensured and not removed, so a
- * resume still before its state move (recreating an evicted worktree) is
- * never cut off; the runner removes that container when the execution ends.
+ * container missing and recreates it (§9.9 Recreation). The runner ensures
+ * only while the execution is live here and after its state move, so a
+ * container this process ensured earlier is removed by the orphan pass
+ * once its execution has ended by any path, the api's request-review,
+ * cancel or a Jira 404 included, which notify no worker (C4 F1).
  */
 export async function sweepWorktrees(
   input: WorktreeSweepInput,
@@ -239,6 +254,7 @@ export async function sweepWorktrees(
       mark,
       removable: (row) => row === null || !CONTAINER_LIVE_STATES.has(row.state),
       remove: () => containers.removeForExecution(executionId),
+      isLive: options.isLive,
       fields,
     });
   };
@@ -426,7 +442,7 @@ export async function sweepWorktrees(
     }
   }
 
-  if (containers) await sweepOrphanContainers({ db, logger }, containers);
+  if (containers) await sweepOrphanContainers({ db, logger }, containers, options.isLive);
 
   // Rule four.
   const threshold = input.diskHighWaterPct;
@@ -461,14 +477,18 @@ export async function sweepWorktrees(
  * are exclusively its own regardless of which host the execution's row
  * currently names: a row released to no host or moved to another host is
  * still ended, and its container is still this deployment's to reclaim. A
- * container this process has ensured and not removed is the runner's and is
- * left alone too. A known execution is re-checked with its task and
- * execution rows locked; the removal itself runs after that transaction
- * commits, under the guard of `removeContainerGuarded`. Never throws.
+ * container of an execution this process runs (`isLive`) is left alone; one
+ * this process ensured for a run that has since finished is not, so an
+ * execution the api ended without any worker's knowledge loses its
+ * container on the next pass (C4 F1). A known execution is re-checked with
+ * its task and execution rows locked; the removal itself runs after that
+ * transaction commits, under the guard of `removeContainerGuarded`. Never
+ * throws.
  */
 async function sweepOrphanContainers(
   input: Pick<WorktreeSweepInput, "db" | "logger">,
   containers: ExecutionContainerOps,
+  isLive: WorktreeSweeperOptions["isLive"],
 ): Promise<void> {
   const { db, logger } = input;
   let listed: LabelledContainer[];
@@ -500,7 +520,6 @@ async function sweepOrphanContainers(
     const fields = { container: container.id, executionId };
     try {
       const mark = ensureMark(executionId);
-      if (mark !== 0) continue;
       const row = known.get(executionId.toLowerCase());
       if (row) {
         if (!ownedAndEnded(row)) continue;
@@ -512,6 +531,7 @@ async function sweepOrphanContainers(
         mark,
         removable: (current) => current === null || ownedAndEnded(current),
         remove: () => containers.remove(container.id),
+        isLive,
         fields,
       });
       if (removed) {

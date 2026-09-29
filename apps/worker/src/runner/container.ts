@@ -109,14 +109,28 @@ export function codexSessionRoot(home: string): string {
 /** The Claude CLI on the image's PATH (§9.9 Image). */
 export const CLAUDE_CONTAINER_COMMAND = "claude";
 
+/** A script entry point: the SDK is running the CLI through a JavaScript runtime. */
+const SCRIPT_ENTRY = /\.(?:js|mjs|cjs)$/i;
+
 /**
  * The SDK launches the Claude CLI binary it resolved on the host, a path
  * that does not exist in the container. Runs the image's `claude` with the
- * SDK's arguments instead. The SDK's default executable is native, so its
- * arguments are the CLI's own.
+ * SDK's arguments instead. That is only right for the SDK's native form,
+ * a `claude` binary whose arguments are the CLI's own; any other form (a
+ * runtime running a `.js` entry point, or another binary) throws, so an
+ * SDK change fails loudly instead of running the wrong command (C4 F3).
  */
 export function claudeContainerSpawner(spawn: ProcessSpawner): ProcessSpawner {
-  return (_command, args, options) => spawn(CLAUDE_CONTAINER_COMMAND, args, options);
+  return (command, args, options) => {
+    const first = args[0];
+    if (path.basename(command) !== CLAUDE_CONTAINER_COMMAND || (first !== undefined && SCRIPT_ENTRY.test(first))) {
+      throw new Error(
+        `unexpected Claude CLI launch from the agent SDK: ${JSON.stringify(command)} ` +
+          `${JSON.stringify(first ?? "")}; container mode runs only the native \`claude\` binary`,
+      );
+    }
+    return spawn(CLAUDE_CONTAINER_COMMAND, args, options);
+  };
 }
 
 /**

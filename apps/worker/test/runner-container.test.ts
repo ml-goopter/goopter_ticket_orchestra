@@ -1001,6 +1001,22 @@ describe("container adapters (§9.9 Launching processes)", () => {
     expect(calls).toEqual([{ command: "claude", args: ["--output-format", "stream-json"] }]);
   });
 
+  it.each([
+    ["a JavaScript entry point run by node", "/usr/local/bin/node", ["/sdk/cli.js", "--output-format", "stream-json"]],
+    ["an .mjs entry point run by node", "node", ["/sdk/cli.mjs", "--print"]],
+    ["a binary that is not claude", "/sdk/bin/claude-code", ["--print"]],
+  ])("the Claude spawner refuses %s instead of rewriting it (C4 F3)", (_label, command, args) => {
+    const calls: string[] = [];
+    const inner: ProcessSpawner = (c) => {
+      calls.push(c);
+      return fakeProcess().proc;
+    };
+    expect(() => claudeContainerSpawner(inner)(command, args, { cwd: "/w", env: {} })).toThrow(
+      /unexpected Claude CLI launch/,
+    );
+    expect(calls).toEqual([]);
+  });
+
   it("canResume reads the session stores under the agent home", async () => {
     const home = path.join(workRoot, "agent-home", "task-canresume");
     const cwd = path.join(workRoot, "work", "exec-canresume");

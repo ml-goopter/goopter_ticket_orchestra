@@ -287,8 +287,13 @@ async function main(): Promise<void> {
         onClaimed: runner.onClaimed,
         commands,
       },
-      // §6.6, §9.9 Orphans: container cleanup only on a docker-capable worker.
-      { worktrees, ...(dockerStack ? { containers: dockerStack.executionContainers } : {}) },
+      // §6.6, §9.9 Orphans: container cleanup only on a docker-capable worker,
+      // never of an execution the runner is running here (C4 F1).
+      {
+        worktrees,
+        isLive: runner.isLive,
+        ...(dockerStack ? { containers: dockerStack.executionContainers } : {}),
+      },
     ),
     logger: log,
     intervalMs: DEFAULT_TICK_INTERVAL_MS,

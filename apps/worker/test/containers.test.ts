@@ -808,6 +808,24 @@ describe("ContainerManager.spawner (design.md §9.9 Launching processes)", () =>
     expect(names).toEqual(["ORCHESTRA_TOKEN"]);
   });
 
+  it("always passes the turn's ORCHESTRA_TOKEN and ORCHESTRA_URL, even when the worker's own environment defines them (C4 F2)", () => {
+    const clients = fakeSpawner();
+    const staleEnv = { ...WORKER_ENV, ORCHESTRA_TOKEN: "stale-token", ORCHESTRA_URL: "http://127.0.0.1:1/stale" };
+    const m = manager(fakeDocker().run, { spawnClient: clients.spawn, hostEnv: staleEnv });
+    m.spawner(`orchestra-exec-${EXEC}`)("claude", [], {
+      cwd: "/w",
+      env: { ...staleEnv, ORCHESTRA_TOKEN: SECRET_TURN, ORCHESTRA_URL: "http://host.docker.internal:4999/mcp" },
+    });
+    const client = clients.clients[0]!;
+    expect(client.options.env.ORCHESTRA_TOKEN).toBe(SECRET_TURN);
+    expect(client.options.env.ORCHESTRA_URL).toBe("http://host.docker.internal:4999/mcp");
+    expect(client.options.env.DATABASE_URL).toBeUndefined();
+    const names = client.args.filter((_, i, a) => a[i - 1] === "-e");
+    expect(names.sort()).toEqual(["ORCHESTRA_TOKEN", "ORCHESTRA_URL"]);
+    expect(client.args.join(" ")).not.toContain(SECRET_TURN);
+    expect(client.args.join(" ")).not.toContain("stale");
+  });
+
   it("uses a unique turn id per spawn", () => {
     const { clients, spawn } = setup();
     spawn("a", [], { cwd: "/w", env: {} });
