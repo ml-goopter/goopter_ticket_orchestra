@@ -75,12 +75,6 @@ Once your tests pass, call \`report_review_started\` and run \`orchestra-review\
 
 Once the verdict is clean, commit, push, run \`gh pr create\`, and call \`report_pr_created\`.`;
 
-const NO_MISTAKES_REVIEW_PROTOCOL = `## Review protocol (no-mistakes)
-
-This repository has \`no-mistakes\` initialized. Run its pipeline instead of the manual \`orchestra-review\` loop above. After each round completes, call \`report_review_result\` yourself with that round's verdict and findings — the pipeline does not report on your behalf. Repeat rounds until the pipeline reports clean or tells you to stop.
-
-Once the verdict is clean, commit, push, run \`gh pr create\`, and call \`report_pr_created\`.`;
-
 const RESUME_CONTRACT = `## Resuming
 
 If this prompt opens with a header describing what happened since your last turn (an answer, a spec revision, a CI failure, or a user message), read it first and reconcile it with the work you have already done in the worktree before doing anything else.`;
@@ -91,24 +85,10 @@ ${MANUAL_REVIEW_PROTOCOL}
 
 ${RESUME_CONTRACT}`;
 
-export const IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES = `${PREAMBLE}
-
-${NO_MISTAKES_REVIEW_PROTOCOL}
-
-${RESUME_CONTRACT}`;
-
 export const IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE = `${PREAMBLE}
 
 ${DELEGATION_PROTOCOL}
 
 ${MANUAL_REVIEW_PROTOCOL}
-
-${RESUME_CONTRACT}`;
-
-export const IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES_CLAUDE = `${PREAMBLE}
-
-${DELEGATION_PROTOCOL}
-
-${NO_MISTAKES_REVIEW_PROTOCOL}
 
 ${RESUME_CONTRACT}`;
