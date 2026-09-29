@@ -28,8 +28,10 @@ import {
   type Db,
 } from "@orchestra/db";
 import {
+  DELEGATION_PROTOCOL,
   IMPLEMENTATION_SYSTEM_PROMPT,
-  IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES,
+  IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE,
+  IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES_CLAUDE,
 } from "@orchestra/prompts";
 import {
   afterAll,
@@ -359,6 +361,8 @@ function makeRunner(
     quietTimeoutMs?: number;
     leaseRenewMs?: number;
     adapters?: RunnerDeps["adapters"];
+    /** The runtime the fake adapter is registered under. Defaults to `claude`. */
+    adapterRuntime?: Runtime;
     /** Runs inside `prepareImplementation`, before it returns. */
     onPrepare?: (input: PrepareImplementationInput) => Promise<void>;
     /** A real manager to delegate to instead of the fake one. */
@@ -401,7 +405,7 @@ function makeRunner(
         return { branchDeleted: false };
       },
     },
-    adapters: options.adapters ?? { claude: adapter },
+    adapters: options.adapters ?? { [options.adapterRuntime ?? "claude"]: adapter },
     pricing: PRICING,
     toolsUrl: () => TOOLS_URL,
     githubToken: "gh-token",
@@ -1570,7 +1574,7 @@ describe("prompts and request (§9.2, AC10)", () => {
     expect(req.prompt).toContain("Receipt language is device-local");
     expect(req.prompt).toMatch(/## Ticket\nRUN-\d+: Receipt language/);
     expect(req.prompt).toContain("Setup command: npm ci");
-    expect(req.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES);
+    expect(req.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES_CLAUDE);
     expect(req.model).toBeUndefined();
     expect(req.allowedTools).toBe("implementation");
     expect(req.maxBudgetUsd).toBeUndefined();
@@ -1605,8 +1609,23 @@ describe("prompts and request (§9.2, AC10)", () => {
 
     await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
 
-    expect(h.adapter.starts[0]!.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT);
+    expect(h.adapter.starts[0]!.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE);
     expect(h.adapter.starts[0]!.model).toBe("claude-opus-test");
+  });
+
+  it("a codex execution gets the implementation prompt without the delegation section", async () => {
+    const s = await seedClaimed({ runtime: "codex" });
+    const h = makeRunner({ workerId: s.workerId, adapterRuntime: "codex" });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-codex" };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "" };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    expect(h.adapter.starts[0]!.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT);
+    expect(h.adapter.starts[0]!.systemPrompt).not.toContain(DELEGATION_PROTOCOL);
   });
 });
 

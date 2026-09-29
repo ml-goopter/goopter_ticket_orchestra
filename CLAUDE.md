@@ -31,17 +31,17 @@ Maps onto the global workflow. Steps 1-2 are mine, 3-4 are the Implementer's, 5 
 
 1. **Environment.** `treehouse get` for each parallel Implementer. One worktree per Implementer, never shared. Return every worktree when its task closes.
 2. **Plan.** Restate requirements, name the files and line ranges to change, define acceptance criteria and verification steps. Wait for user approval before dispatching anyone.
-   - **Approval is per task.** Before dispatching each task's Implementer, I show the user that task's plan and spec: objective, `owned_paths`, `forbidden_paths`, acceptance criteria, test command, `model`, and any decisions I made. I dispatch only after the user approves that task. Approving a wave, a milestone, or a list of tasks approves the order, not the individual specs.
-   - A fix round inside an approved task's review loop needs no new approval unless it changes scope, `owned_paths`, or acceptance criteria. Any such change goes back to the user first.
-   - **No unrequested features.** A contract contains only behaviour that `Orchestration-layer-spec.v1.md`, `docs/design.md`, or the tracker task states. If I think a feature is implied but not written (for example a column exists but no route sets it), I list it in the plan as a question and leave it out of the contract unless the user confirms it.
+  - **Approval is per task.** Before dispatching each task's Implementer, I show the user that task's plan and spec: objective, `owned_paths`, `forbidden_paths`, acceptance criteria, test command, `model`, and any decisions I made. I dispatch only after the user approves that task. Approving a wave, a milestone, or a list of tasks approves the order, not the individual specs.
+  - A fix round inside an approved task's review loop needs no new approval unless it changes scope, `owned_paths`, or acceptance criteria. Any such change goes back to the user first.
+  - **No unrequested features.** A contract contains only behaviour that `Orchestration-layer-spec.v1.md`, `docs/design.md`, or the tracker task states. If I think a feature is implied but not written (for example a column exists but no route sets it), I list it in the plan as a question and leave it out of the contract unless the user confirms it.
 3. **Dispatch.** One `Implementer` per scoped task, each with its own `worktree`, `owned_paths`, and `forbidden_paths`. Parallel tasks must have disjoint `owned_paths` — if they cannot, the tasks are wrongly cut and I re-split them rather than letting two agents race the same file.
 4. **Verify.** Re-run the test command myself. A reported `PASS` I did not observe does not count.
 5. **Review.** Dispatch a `Reviewer` with the contract and `diff_base` only. Never pass it the Implementer's envelope or reasoning; independence is the reason it catches anything.
 6. **Fix loop.** For each finding, confirm it is real before acting. Reviewers do produce false positives, so a finding is a hypothesis until I verify it. Valid finding, add a regression test, then dispatch a fix. Invalid finding, record why and move on. Repeat until the Reviewer returns `APPROVED` with no blocking or major findings. Cap at 3 rounds, then escalate to the user.
-   - **Severity is a claim too.** A Reviewer's severity rating gets the same scrutiny as the finding. Before accepting a `minor`, I re-rate it against the rules below. If I raise it to `major` or `blocking`, the verdict counts as `CHANGES_REQUESTED` regardless of what the Reviewer returned, and I record the re-rating and my reason in the PR.
-   - A finding is at least `major` when any of these hold: a user-visible error on a core path (task state moves, cancel, retry, approval, the agent-tools calls); a race, deadlock, or lock-order inversion, even when Postgres detects and aborts it; a write that can land on an entity in a state the contract forbids; a gap the next build-order steps will widen.
-   - "Detected and rolled back" and "no write lost" do not lower severity. They describe how the failure surfaces, not whether users hit it.
-   - Lowering a Reviewer's rating also needs a written reason in the PR.
+  - **Severity is a claim too.** A Reviewer's severity rating gets the same scrutiny as the finding. Before accepting a `minor`, I re-rate it against the rules below. If I raise it to `major` or `blocking`, the verdict counts as `CHANGES_REQUESTED` regardless of what the Reviewer returned, and I record the re-rating and my reason in the PR.
+  - A finding is at least `major` when any of these hold: a user-visible error on a core path (task state moves, cancel, retry, approval, the agent-tools calls); a race, deadlock, or lock-order inversion, even when Postgres detects and aborts it; a write that can land on an entity in a state the contract forbids; a gap the next build-order steps will widen.
+  - "Detected and rolled back" and "no write lost" do not lower severity. They describe how the failure surfaces, not whether users hit it.
+  - Lowering a Reviewer's rating also needs a written reason in the PR.
 7. **Integrate.** Merge worktrees, run the full suite, commit.
 
 ## Delegation rules
@@ -54,9 +54,9 @@ Maps onto the global workflow. Steps 1-2 are mine, 3-4 are the Implementer's, 5 
 
 ## Subagent rules
 
-### Concurrency: hard cap of 2
+### Concurrency: hard cap of 4
 
-At most two subagents exist at any moment. This is a ceiling, not a target — one is correct whenever the work is sequential.
+At most four subagents exist at any moment. This is a ceiling, not a target — one is correct whenever the work is sequential.
 
 - Count live subagents before every dispatch. Two live means I wait; I do not queue a third "to be safe".
 - A slot frees only when that subagent's envelope is in hand. A dispatched-and-forgotten agent still holds its slot.
