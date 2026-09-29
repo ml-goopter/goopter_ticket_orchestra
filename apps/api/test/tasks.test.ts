@@ -61,6 +61,21 @@ function seedTaskViaHarness(
   return seedTask(h.db, fixtures, options);
 }
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Polls `check` until it returns true, mirroring stream.test.ts's helper. */
+async function waitFor(
+  check: () => boolean | Promise<boolean>,
+  timeoutMs = 10000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() > deadline) throw new Error("waitFor timed out");
+    await sleep(20);
+  }
+}
+
 describe("GET /api/tasks (AC1)", () => {
   let needsSpecId: string;
   let waitingId: string;
@@ -823,6 +838,120 @@ describe("POST /api/tasks/:id/reopen (GOT.55)", () => {
 
     const audits = await listAuditEventsForEntity(h.sql, taskId);
     expect(audits.some((a) => a.toState === "NEEDS_SPEC")).toBe(true);
+  });
+
+  // F1: a task cancelled after `spec/revise` keeps both its approved
+  // revision and a draft. Reopen must not send it to SPEC_APPROVED, where
+  // the draft can never be edited or superseded (PUT draft and
+  // `spec/revise`/issue resolve all require SPEC_IN_PROGRESS, and
+  // `spec/revise`/issue resolve permanently 409 DRAFT_EXISTS otherwise).
+  it("F1: reopens a task with an approved revision and a draft to NEEDS_SPEC, and the draft stays present and editable", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-64",
+      state: "CANCELLED",
+      priority: 64,
+    });
+    const approvedId = await seedRevision(h.db, taskId, 1, "approved", {});
+    const draftId = await seedRevision(h.db, taskId, 2, "draft", {});
+    await h.sql`update tasks set approved_revision_id = ${approvedId} where id = ${taskId}`;
+
+    const reopenRes = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+    expect(reopenRes.statusCode).toBe(200);
+    expect(reopenRes.json()).toEqual({ from: "CANCELLED", to: "NEEDS_SPEC" });
+
+    const draftRows = await h.sql<{ status: string }[]>`
+      select status from specification_revisions where id = ${draftId}
+    `;
+    expect(draftRows[0]?.status).toBe("draft");
+
+    const sessionRes = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/spec/session`,
+      headers: { cookie },
+      payload: { repository_id: fx.repositoryId },
+    });
+    expect(sessionRes.statusCode).toBe(200);
+    expect(sessionRes.json()).toMatchObject({ to: "SPEC_IN_PROGRESS" });
+
+    const putRes = await app.inject({
+      method: "PUT",
+      url: `/api/tasks/${taskId}/spec/draft`,
+      headers: { cookie },
+      payload: {
+        content: {
+          repository: "",
+          objective: "Do the thing",
+          scope: [],
+          out_of_scope: [],
+          requirements: [],
+          acceptance_criteria: [],
+          validation: [],
+          constraints: [],
+          dependencies: [],
+        },
+      },
+    });
+    expect(putRes.statusCode).toBe(200);
+  });
+
+  // F3: `lockTaskForSpec` locks the task row `FOR UPDATE` before either the
+  // approved-revision or draft read, so a concurrent transaction holding
+  // that same row lock and changing the draft is fully committed before
+  // reopen ever reads -- not racing a plain unlocked SELECT against it.
+  it("F3: reopen waits behind a concurrent holder of the task row lock and then uses the value it committed", async () => {
+    const taskId = await seedTaskViaHarness(fx, {
+      jiraKey: "TSK-65",
+      state: "CANCELLED",
+      priority: 65,
+    });
+    const approvedId = await seedRevision(h.db, taskId, 1, "approved", {});
+    await h.sql`update tasks set approved_revision_id = ${approvedId} where id = ${taskId}`;
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = h.sql.begin(async (sql) => {
+      // Mirrors lockTaskForSpec's own locked read.
+      await sql`select id from tasks where id = ${taskId} for update`;
+      await held;
+      // Adds a draft while still holding the row lock. If reopen's read
+      // were not gated on this same lock, it could run and pick
+      // SPEC_APPROVED before this row exists to it.
+      await sql`
+        insert into specification_revisions (task_id, version, status, content)
+        values (${taskId}, 2, 'draft', '{}'::jsonb)
+      `;
+    });
+
+    const reopening = app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/reopen`,
+      headers: { cookie },
+    });
+
+    await waitFor(async () => {
+      const rows = await h.sql`
+        select 1 from pg_stat_activity where wait_event_type = 'Lock'
+      `;
+      return rows.length > 0;
+    });
+    // Reopen is blocked behind the holder's lock; nothing has moved yet.
+    const midRows = await h.sql<{ state: string }[]>`
+      select state from tasks where id = ${taskId}
+    `;
+    expect(midRows[0]?.state).toBe("CANCELLED");
+
+    release();
+    await holder;
+
+    const res = await reopening;
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ from: "CANCELLED", to: "NEEDS_SPEC" });
   });
 
   it("returns 409 ILLEGAL_TRANSITION reopening a task that is not CANCELLED", async () => {

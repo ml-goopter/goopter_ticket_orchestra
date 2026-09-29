@@ -7,6 +7,7 @@ import {
 } from "@orchestra/core";
 import {
   ZERO_TASK_COST,
+  getRevisionByStatus,
   getTaskAggregate,
   getTaskCostBreakdown,
   listActiveExecutionIds,
@@ -16,6 +17,7 @@ import {
   listDependencies,
   listTimeline,
   lockDependencyGraph,
+  lockTaskForSpec,
   NotFoundError,
   replaceDependencies,
   resolveProjectFilter,
@@ -423,14 +425,23 @@ export default async function tasksRoutes(app: FastifyInstance): Promise<void> {
 
   /**
    * design.md §12.2 POST /tasks/:id/reopen: only legal from CANCELLED. The
-   * destination depends on `tasks.approved_revision_id` (§5.1, GOT.55) --
-   * with an approved spec it goes to SPEC_APPROVED, where the worker's
-   * existing §6.2 promotion step picks it up to READY or BLOCKED; without
-   * one it goes to NEEDS_SPEC. `getTaskAggregate` reads that column inside
-   * the same transaction `transition()` locks and writes in, so the choice
-   * and the move are atomic; nothing else can set approved_revision_id on a
-   * CANCELLED task in between (only spec approval writes it, and that only
-   * fires from SPEC_REVIEW).
+   * destination depends on `tasks.approved_revision_id` and whether a draft
+   * revision exists (§5.1, GOT.55 fix round 1): it goes to SPEC_APPROVED
+   * only with an approved revision and no draft, where the worker's
+   * existing §6.2 promotion step picks it up to READY or BLOCKED. With a
+   * draft (approved or not) or with no approved revision, it goes to
+   * NEEDS_SPEC instead, so a draft left behind by `spec/revise` or an
+   * issue resolved as `spec_revision` stays editable (PUT draft and
+   * `spec/revise` both require SPEC_IN_PROGRESS) rather than being stuck
+   * under an unreachable SPEC_APPROVED with a permanent DRAFT_EXISTS.
+   *
+   * `lockTaskForSpec` locks the task row `FOR UPDATE` before either read, so
+   * both the approved-revision id and the draft check see a value nothing
+   * else can change until this transaction commits; `transition()`'s own
+   * `SELECT ... FOR UPDATE` on the same row is then a no-op re-lock, not a
+   * second read that could see something new. The choice and the move are
+   * genuinely atomic under that lock, not just because nothing "should"
+   * write approved_revision_id on a CANCELLED task in between.
    */
   app.post("/tasks/:id/reopen", async (request) => {
     const id = parseTaskId(request.params);
@@ -439,13 +450,15 @@ export default async function tasksRoutes(app: FastifyInstance): Promise<void> {
     let result: TransitionResult<TaskState>;
     try {
       result = await app.db.transaction(async (tx) => {
-        const aggregate = await getTaskAggregate(tx, id);
-        if (!aggregate) {
+        const locked = await lockTaskForSpec(tx, id);
+        if (!locked) {
           throw new NotFoundError("task", id);
         }
-        const trigger = aggregate.task.approvedRevisionId
-          ? "task.reopened.spec_approved"
-          : "task.reopened.needs_spec";
+        const draft = await getRevisionByStatus(tx, id, "draft");
+        const trigger =
+          locked.approvedRevisionId && !draft
+            ? "task.reopened.spec_approved"
+            : "task.reopened.needs_spec";
         return transition(tx, { entity: "task", id, trigger, actor });
       });
     } catch (err) {

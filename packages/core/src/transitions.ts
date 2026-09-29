@@ -25,9 +25,9 @@ import { TaskState, ExecutionState } from "./enums.js";
  *  - `task.cancelled`        any state except DONE/CANCELLED -> CANCELLED
  *  - `task.failed`           any non-terminal state -> FAILED
  *  - `task.reopened.spec_approved` CANCELLED -> SPEC_APPROVED (§12.2 `POST
- *    /tasks/:id/reopen`, task has an approved spec revision)
- *  - `task.reopened.needs_spec`    CANCELLED -> NEEDS_SPEC (same route, no
- *    approved spec revision)
+ *    /tasks/:id/reopen`, task has an approved spec revision and no draft)
+ *  - `task.reopened.needs_spec`    CANCELLED -> NEEDS_SPEC (same route: no
+ *    approved spec revision, or a draft revision exists alongside one)
  *  - `execution.assigned`    QUEUED -> ASSIGNED
  *  - `execution.started`     ASSIGNED -> RUNNING
  *  - `execution.waiting`     RUNNING -> WAITING_FOR_USER
@@ -105,10 +105,10 @@ export const TASK_TRANSITIONS = [
   // GOT.55: a CANCELLED task may be reopened by the user (design.md §12.2
   // POST /tasks/:id/reopen). Two triggers, not one, because both rows share
   // `from: CANCELLED` and the table is keyed on (entity, from, trigger); the
-  // route picks the trigger from `tasks.approved_revision_id` and the
-  // existing §6.2 promotion step takes SPEC_APPROVED on to READY/BLOCKED.
-  // DONE and FAILED (and every other state) have no row here and stay
-  // terminal with respect to reopen.
+  // route picks the trigger from `tasks.approved_revision_id` and whether a
+  // draft revision exists, and the existing §6.2 promotion step takes
+  // SPEC_APPROVED on to READY/BLOCKED. DONE and FAILED (and every other
+  // state) have no row here and stay terminal with respect to reopen.
   { entity: "task", from: TaskState.CANCELLED, trigger: "task.reopened.spec_approved", to: TaskState.SPEC_APPROVED },
   { entity: "task", from: TaskState.CANCELLED, trigger: "task.reopened.needs_spec", to: TaskState.NEEDS_SPEC },
 ] as const satisfies readonly {
