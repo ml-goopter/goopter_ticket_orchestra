@@ -153,6 +153,19 @@ export interface BoardApiClient extends ApiClient {
 }
 
 /**
+ * The task detail view's extension of `BoardApiClient` (GOT.55), kept as its
+ * own interface for the same reason `IssueApiClient`/`SpecApiClient` are
+ * kept separate above: `BoardApiClient` is the type every other view's test
+ * fake implements in full, and adding a required method there would force
+ * an edit to those files outside this task's `owned_paths`.
+ * `createApiClient()` implements this too.
+ */
+export interface TaskDetailApiClient extends BoardApiClient {
+  /** `POST /tasks/:id/reopen`, only legal from `CANCELLED` (design.md §12.2). */
+  reopenTask(id: string): Promise<TaskTransitionResult>;
+}
+
+/**
  * The issue detail view's extension of `BoardApiClient` (GOT.42), kept as
  * its own interface for the same reason `BoardApiClient` is kept separate
  * from `ApiClient` above: `BoardApiClient` is the type
@@ -216,7 +229,9 @@ export interface SpecApiClient extends IssueApiClient {
  * every request is sent with `credentials: "include"` and the caller never
  * touches the session cookie directly (design.md §13).
  */
-export function createApiClient(options: ApiClientOptions = {}): SpecApiClient {
+export function createApiClient(
+  options: ApiClientOptions = {},
+): SpecApiClient & TaskDetailApiClient {
   const baseUrl = options.baseUrl ?? "/api";
   const fetchImpl = options.fetch ?? fetch;
 
@@ -303,6 +318,10 @@ export function createApiClient(options: ApiClientOptions = {}): SpecApiClient {
       }),
     retryTask: (id) =>
       request<TaskTransitionResult>("POST", `/tasks/${id}/retry`, {
+        schema: TaskTransitionResultSchema,
+      }),
+    reopenTask: (id) =>
+      request<TaskTransitionResult>("POST", `/tasks/${id}/reopen`, {
         schema: TaskTransitionResultSchema,
       }),
     getIssue: (id) =>

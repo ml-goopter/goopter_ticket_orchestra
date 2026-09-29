@@ -42,6 +42,9 @@ const EXPECTED_EDGES: {
   { entity: "task", from: "NEEDS_SPEC", trigger: "task.cancelled", to: "CANCELLED" },
   { entity: "task", from: "READY", trigger: "task.cancelled", to: "CANCELLED" },
   { entity: "task", from: "IMPLEMENTING", trigger: "task.cancelled", to: "CANCELLED" },
+  // reopen edges (GOT.55, §12.2 POST /tasks/:id/reopen)
+  { entity: "task", from: "CANCELLED", trigger: "task.reopened.spec_approved", to: "SPEC_APPROVED" },
+  { entity: "task", from: "CANCELLED", trigger: "task.reopened.needs_spec", to: "NEEDS_SPEC" },
 
   // --- Execution machine (§5.2) ---
   { entity: "execution", from: "QUEUED", trigger: "execution.assigned", to: "ASSIGNED" },
@@ -159,6 +162,40 @@ describe("spec.revise edges (design.md §12.3 POST /spec/revise)", () => {
       expect(resolveTransition("execution", from, "spec.revise").ok).toBe(
         false,
       );
+    }
+  });
+});
+
+describe("reopen edges (design.md §12.2 POST /tasks/:id/reopen, GOT.55)", () => {
+  it.each([
+    ["task.reopened.spec_approved", "SPEC_APPROVED"],
+    ["task.reopened.needs_spec", "NEEDS_SPEC"],
+  ] as const)("task CANCELLED -(%s)-> %s", (trigger, to) => {
+    expect(resolveTransition("task", TaskState.CANCELLED, trigger)).toEqual({
+      ok: true,
+      to,
+    });
+  });
+
+  it("CANCELLED has exactly the two reopen rows", () => {
+    const fromCancelled = TRANSITIONS.filter(
+      (r) => r.entity === "task" && r.from === "CANCELLED",
+    ).map((r) => `${r.trigger}->${r.to}`);
+    expect(fromCancelled.sort()).toEqual([
+      "task.reopened.needs_spec->NEEDS_SPEC",
+      "task.reopened.spec_approved->SPEC_APPROVED",
+    ]);
+  });
+
+  it("no other task state accepts either reopen trigger, including DONE and FAILED", () => {
+    for (const trigger of [
+      "task.reopened.spec_approved",
+      "task.reopened.needs_spec",
+    ] as const) {
+      const accepting = Object.values(TaskState).filter(
+        (from) => resolveTransition("task", from, trigger).ok,
+      );
+      expect(accepting).toEqual(["CANCELLED"]);
     }
   });
 });

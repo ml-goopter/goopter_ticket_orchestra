@@ -510,9 +510,11 @@ stateDiagram-v2
   NEEDS_HUMAN --> CANCELLED: user cancels
   READY_FOR_MERGE --> NEEDS_HUMAN: pr closed unmerged
   BLOCKED --> READY: dependency resolved
+  CANCELLED --> SPEC_APPROVED: user reopens, approved spec and no draft
+  CANCELLED --> NEEDS_SPEC: user reopens, no approved spec or a draft exists
 ```
 
-Any state except `DONE` may go to `CANCELLED` by user action. `FAILED` is reserved for a task whose Jira ticket disappears or whose repository is deleted.
+Any state except `DONE` may go to `CANCELLED` by user action. `CANCELLED` is not final: the user may reopen it (§12.2 `POST /tasks/:id/reopen`), moving it to `SPEC_APPROVED` only when it has an approved spec revision and no draft revision, and to `NEEDS_SPEC` otherwise (a draft left by `spec/revise` or an issue resolved as `spec_revision` stays editable rather than stuck under a SPEC_APPROVED it cannot leave); §6.2 then promotes a reopened `SPEC_APPROVED` task on to `READY` or `BLOCKED` the same as any other. `DONE` remains terminal, with no transition out of it. `FAILED` is reserved for a task whose Jira ticket disappears or whose repository is deleted. Reopening does not reset the poller's last recorded Jira scope (§11.1); the poller judges a task by its current state and that last recorded scope, independent of when the reopen or promotion happened. If a poll finds the task still `NEEDS_SPEC`, or still `SPEC_APPROVED` because §6.2's promotion has not yet moved it (for example its dependencies are not all `DONE`), the task is still in the poller's spec-state group and is cancelled again if its Jira ticket is closed or out of the JQL. If a poll finds the task already promoted to `READY` or `BLOCKED`, it is outside that group: when the ticket's current scope differs from the last recorded scope, the poller signals it (notification plus note) if the ticket newly closed or left the JQL, or adds a note without a notification if the ticket came back in scope. A task the poller itself cancelled already has a recorded closed-or-out-of-JQL scope from that cancellation; if it is reopened, promoted, and the ticket's scope has not changed by the time a poll finds it promoted, that recorded scope still matches the current one, so the poller takes no action — no cancel, no signal. This is a known gap; a follow-up poller change must close it.
 
 Derived dashboard columns:
 
@@ -1059,6 +1061,7 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 | PATCH | `/tasks/:id` | `runtime_override`, `dependencies[]` |
 | POST | `/tasks/:id/cancel` |  |
 | POST | `/tasks/:id/retry` | from `NEEDS_HUMAN` |
+| POST | `/tasks/:id/reopen` | from `CANCELLED` only; to `SPEC_APPROVED` if `approved_revision_id` is set and no draft revision exists, else `NEEDS_SPEC` (§5.1) |
 
 ### 12.3 Specification
 

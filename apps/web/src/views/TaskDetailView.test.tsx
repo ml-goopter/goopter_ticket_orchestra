@@ -3,7 +3,7 @@ import { EXECUTION_EVENT_TYPES } from "@orchestra/core";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { Link, MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { BoardApiClient } from "../api/client.js";
+import type { TaskDetailApiClient } from "../api/client.js";
 import { ApiError } from "../api/client.js";
 import type { SpecificationRevision, TimelineEvent, TimelinePage } from "../api/types.js";
 import type { EventSourceLike, MessageEventLike } from "../sse/useEventStream.js";
@@ -59,13 +59,14 @@ function emptyPage(nextAfter = 0): TimelinePage {
 }
 
 interface MakeClientOptions {
-  getTask?: BoardApiClient["getTask"];
-  getTimeline?: BoardApiClient["getTimeline"];
-  cancelTask?: BoardApiClient["cancelTask"];
-  retryTask?: BoardApiClient["retryTask"];
+  getTask?: TaskDetailApiClient["getTask"];
+  getTimeline?: TaskDetailApiClient["getTimeline"];
+  cancelTask?: TaskDetailApiClient["cancelTask"];
+  retryTask?: TaskDetailApiClient["retryTask"];
+  reopenTask?: TaskDetailApiClient["reopenTask"];
 }
 
-function makeClient(options: MakeClientOptions = {}): BoardApiClient {
+function makeClient(options: MakeClientOptions = {}): TaskDetailApiClient {
   return {
     request: vi.fn(),
     login: vi.fn(),
@@ -80,6 +81,7 @@ function makeClient(options: MakeClientOptions = {}): BoardApiClient {
     getTimeline: options.getTimeline ?? vi.fn().mockResolvedValue(emptyPage()),
     cancelTask: options.cancelTask ?? vi.fn().mockResolvedValue({ from: "IMPLEMENTING", to: "CANCELLED" }),
     retryTask: options.retryTask ?? vi.fn().mockResolvedValue({ from: "NEEDS_HUMAN", to: "IMPLEMENTING" }),
+    reopenTask: options.reopenTask ?? vi.fn().mockResolvedValue({ from: "CANCELLED", to: "NEEDS_SPEC" }),
   };
 }
 
@@ -107,7 +109,7 @@ function makeRevision(overrides: Partial<SpecificationRevision>): SpecificationR
   };
 }
 
-function renderDetail(client: BoardApiClient, taskId = "task-1") {
+function renderDetail(client: TaskDetailApiClient, taskId = "task-1") {
   return render(
     <MemoryRouter initialEntries={[`/tasks/${taskId}`]}>
       <Routes>
@@ -305,6 +307,30 @@ describe("TaskDetailView", () => {
     });
 
     await waitFor(() => expect(retryTask).toHaveBeenCalledWith("task-1"));
+  });
+
+  it("shows Reopen only for CANCELLED and calls reopenTask (GOT.55)", async () => {
+    const reopenTask = vi.fn().mockResolvedValue({ from: "CANCELLED", to: "SPEC_APPROVED" });
+    const aggregate = makeTaskAggregate({ task: { ...makeTaskAggregate().task, state: "CANCELLED" } });
+    const client = makeClient({ getTask: vi.fn().mockResolvedValue(aggregate), reopenTask });
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Cancelled"));
+    expect((screen.getByRole("button", { name: "Reopen" }) as HTMLButtonElement).disabled).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    });
+
+    await waitFor(() => expect(reopenTask).toHaveBeenCalledWith("task-1"));
+  });
+
+  it("disables Reopen for a non-CANCELLED task", async () => {
+    const client = makeClient();
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state")).toBeTruthy());
+    expect((screen.getByRole("button", { name: "Reopen" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("shows a diff between two spec revisions with a changed field (AC7)", async () => {

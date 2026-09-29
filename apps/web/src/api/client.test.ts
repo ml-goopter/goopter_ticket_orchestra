@@ -250,6 +250,19 @@ describe("createApiClient", () => {
     expect(init.method).toBe("POST");
   });
 
+  it("reopenTask(id) posts to /tasks/:id/reopen and validates the response", async () => {
+    const body = { from: "CANCELLED", to: "SPEC_APPROVED" };
+    const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
+    const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
+
+    const result = await client.reopenTask("task-1");
+
+    expect(result).toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tasks/task-1/reopen");
+    expect(init.method).toBe("POST");
+  });
+
   const adminRepository = {
     id: "r1",
     project_id: "p1",
