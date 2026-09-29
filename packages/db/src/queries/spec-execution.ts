@@ -96,30 +96,26 @@ export async function hasPendingSpecResume(tx: Tx, taskId: string): Promise<bool
 }
 
 /**
- * The repository a spec session explores (GOT.37 C41): the task's
- * repository when set, else the project's repositories ordered by name,
- * the first one. Before approval a task may have no repository. `null` when
- * the task is gone or its project has no repository.
+ * The repository a spec session explores (GOT.80 D2, D3): the task's own
+ * `repository_id`, fixed once its first spec session starts and never the
+ * project's other repositories. `null` when the task is gone or has no
+ * repository yet (only possible before that first session starts, since
+ * D3 requires one to start it).
  */
 export async function resolveSpecRepository(
   db: DbOrTx,
   taskId: string,
 ): Promise<RepositoryRow | null> {
   const [task] = await db
-    .select({ projectId: tasks.projectId, repositoryId: tasks.repositoryId })
+    .select({ repositoryId: tasks.repositoryId })
     .from(tasks)
     .where(eq(tasks.id, taskId))
     .limit(1);
-  if (!task) return null;
+  if (!task || task.repositoryId === null) return null;
   const [row] = await db
     .select()
     .from(repositories)
-    .where(
-      task.repositoryId !== null
-        ? eq(repositories.id, task.repositoryId)
-        : eq(repositories.projectId, task.projectId),
-    )
-    .orderBy(asc(repositories.name), asc(repositories.id))
+    .where(eq(repositories.id, task.repositoryId))
     .limit(1);
   return row ?? null;
 }

@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { deleteRepository, findProjectRepositoryByName } from "../src/queries/index.js";
+import { deleteRepository, lockRepositoryById } from "../src/queries/index.js";
 import * as schema from "../src/schema/index.js";
 import { seedFixtures, seedTask, sleep, startTestDb, type TestDb } from "./harness.js";
 
@@ -15,19 +15,20 @@ afterAll(async () => {
 });
 
 /**
- * GOT.52 F2: `findProjectRepositoryByName` locks the repository row it
- * resolves, the same lock `deleteRepository` takes before it counts
- * referencing tasks (design.md §12.3). These reproduce both interleavings
- * deterministically by holding one side's transaction open, proving the
- * fix rather than relying on scheduling luck.
+ * GOT.52 F2, kept by GOT.80 D2: `lockRepositoryById` locks the repository row
+ * it resolves, the same lock `deleteRepository` takes before it counts
+ * referencing tasks (design.md §12.3). Approval now resolves the task's own
+ * (already locked-in) `repository_id` instead of a name, so these seed the
+ * task with that repository up front and lock by id. These reproduce both
+ * interleavings deterministically by holding one side's transaction open,
+ * proving the fix rather than relying on scheduling luck.
  */
-describe("findProjectRepositoryByName vs deleteRepository (GOT.52 F2)", () => {
-  it("the approve-side lookup's lock wins: delete blocks, then sees the task the lookup's caller just pointed at the repository and blocks (never races past a delete)", async () => {
+describe("lockRepositoryById vs deleteRepository (GOT.52 F2, GOT.80 D2)", () => {
+  it("the approve-side lookup's lock wins: delete blocks, then sees the referencing task and blocks (never races past a delete)", async () => {
     const fx = await seedFixtures(h.db, "SPQ1");
-    const taskId = await seedTask(h.db, fx, {
+    await seedTask(h.db, fx, {
       jiraKey: "SPQ1-1",
       state: "SPEC_REVIEW",
-      withRepository: false,
     });
 
     let lookupLocked!: () => void;
@@ -39,17 +40,11 @@ describe("findProjectRepositoryByName vs deleteRepository (GOT.52 F2)", () => {
       releaseLookup = resolve;
     });
 
-    // Mirrors the approve route's order: resolve the draft's named
-    // repository (now locked `FOR UPDATE`), then later in the same
-    // transaction point the task's `repository_id` at it.
+    // Mirrors the approve route: lock the task's own repository by id.
     const lookupTxPromise = h.db.transaction(async (tx) => {
-      const repo = await findProjectRepositoryByName(tx, fx.projectId, "spq1-repo");
+      await lockRepositoryById(tx, fx.repositoryId);
       lookupLocked();
       await releaseLookupPromise;
-      await tx
-        .update(schema.tasks)
-        .set({ repositoryId: repo!.id })
-        .where(eq(schema.tasks.id, taskId));
     });
     lookupTxPromise.catch(() => {});
 
@@ -110,7 +105,7 @@ describe("findProjectRepositoryByName vs deleteRepository (GOT.52 F2)", () => {
 
     let lookupSettled = false;
     const lookupPromise = h.db
-      .transaction((tx) => findProjectRepositoryByName(tx, fx.projectId, "spq2-repo"))
+      .transaction((tx) => lockRepositoryById(tx, fx.repositoryId))
       .then((result) => {
         lookupSettled = true;
         return result;

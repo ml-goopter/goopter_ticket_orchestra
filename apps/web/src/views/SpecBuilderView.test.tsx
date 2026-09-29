@@ -648,32 +648,15 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
   });
 
-  it("GOT.54: the repository chosen in the dropdown reaches the saved draft", async () => {
-    const saveDraft = vi.fn().mockResolvedValue(makeRevision());
-    const getTask = vi
-      .fn()
-      .mockResolvedValue(aggregateInProgress({ revisions: [makeRevision({ content: { ...validSpecContent, repository: "" } })] }));
-    const client = makeFakeClient({
-      getTask,
-      saveDraft,
-      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ name: "repo-a" }), makeAdminRepository({ name: "repo-b" })]),
-    });
+  it("GOT.81 D2: the draft's repository field is read-only and shows the task's repository, not a dropdown", async () => {
+    const getTask = vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision({ content: validSpecContent })] }));
+    const client = makeFakeClient({ getTask });
     renderSpecBuilder(client);
 
-    const select = await screen.findByLabelText("Repository");
-    await waitFor(() => expect((select as HTMLSelectElement).options.length).toBeGreaterThan(1));
-    fireEvent.change(select, { target: { value: "repo-b" } });
-
-    await waitFor(() =>
-      expect((screen.getByRole("button", { name: "Save Draft" }) as HTMLButtonElement).disabled).toBe(false),
-    );
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save Draft" }));
-    });
-
-    await waitFor(() =>
-      expect(saveDraft).toHaveBeenCalledWith("task-1", expect.objectContaining({ repository: "repo-b" })),
-    );
+    const field = (await screen.findByLabelText("Repository")) as HTMLInputElement;
+    expect(field.tagName).toBe("INPUT");
+    expect(field.readOnly).toBe(true);
+    expect(field.value).toBe("tsk-repo");
   });
 
   it("calls requestReview and refetches", async () => {
@@ -794,21 +777,155 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
   });
 
-  it("calls startSpecSession from the NEEDS_SPEC state and refetches", async () => {
-    const startSpecSession = vi.fn().mockResolvedValue({ from: "NEEDS_SPEC", to: "SPEC_IN_PROGRESS" });
-    const getTask = vi
-      .fn()
-      .mockResolvedValue(aggregateInProgress({ task: { ...makeTaskAggregate().task, state: "NEEDS_SPEC" } }));
-    const client = makeFakeClient({ getTask, startSpecSession });
+  function needsSpecAggregate(overrides: Partial<TaskAggregate> = {}): TaskAggregate {
+    return aggregateInProgress({
+      task: { ...makeTaskAggregate().task, state: "NEEDS_SPEC" },
+      // GOT.81 D1-D3: before a session starts, no repository is assigned yet.
+      repository: null,
+      ...overrides,
+    });
+  }
+
+  it("GOT.81 D1: preselects the project's single repository in the start-session dropdown, but still requires confirming", async () => {
+    const getTask = vi.fn().mockResolvedValue(needsSpecAggregate());
+    const client = makeFakeClient({
+      getTask,
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ id: "repo-1", name: "tsk-repo" })]),
+    });
     renderSpecBuilder(client);
 
+    const select = await screen.findByLabelText("Repository");
+    await waitFor(() => expect((select as HTMLSelectElement).value).toBe("repo-1"));
+    expect((screen.getByRole("button", { name: "Start spec session" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("GOT.81: lists the project's repositories as dropdown options and disables Start until one is chosen", async () => {
+    const getTask = vi.fn().mockResolvedValue(needsSpecAggregate());
+    const client = makeFakeClient({
+      getTask,
+      listProjectRepositories: vi
+        .fn()
+        .mockResolvedValue([makeAdminRepository({ id: "repo-1", name: "repo-a" }), makeAdminRepository({ id: "repo-2", name: "repo-b" })]),
+    });
+    renderSpecBuilder(client);
+
+    const select = (await screen.findByLabelText("Repository")) as HTMLSelectElement;
+    expect(Array.from(select.options).map((option) => option.textContent)).toEqual([
+      "Select a repository...",
+      "repo-a",
+      "repo-b",
+    ]);
+    expect((screen.getByRole("button", { name: "Start spec session" }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.change(select, { target: { value: "repo-2" } });
+
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Start spec session" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it("GOT.81 D2/D3: Start opens an inline confirmation naming the repository; Cancel sends nothing", async () => {
+    const startSpecSession = vi.fn().mockResolvedValue({ from: "NEEDS_SPEC", to: "SPEC_IN_PROGRESS" });
+    const getTask = vi.fn().mockResolvedValue(needsSpecAggregate());
+    const client = makeFakeClient({
+      getTask,
+      startSpecSession,
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ id: "repo-1", name: "tsk-repo" })]),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Repository") as HTMLSelectElement).value).toBe("repo-1"));
+    fireEvent.click(screen.getByRole("button", { name: "Start spec session" }));
+
+    await waitFor(() => expect(screen.getByText(/Start spec session on tsk-repo\?/)).toBeTruthy());
+    expect(screen.getByText(/can.t be changed afterwards/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
     await waitFor(() => expect(screen.getByRole("button", { name: "Start spec session" })).toBeTruthy());
+    expect(startSpecSession).not.toHaveBeenCalled();
+  });
+
+  it("GOT.81: Confirm sends repository_id to startSpecSession and refetches", async () => {
+    const startSpecSession = vi.fn().mockResolvedValue({ from: "NEEDS_SPEC", to: "SPEC_IN_PROGRESS" });
+    const getTask = vi.fn().mockResolvedValue(needsSpecAggregate());
+    const client = makeFakeClient({
+      getTask,
+      startSpecSession,
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ id: "repo-1", name: "tsk-repo" })]),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Repository") as HTMLSelectElement).value).toBe("repo-1"));
+    fireEvent.click(screen.getByRole("button", { name: "Start spec session" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy());
+
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Start spec session" }));
+      fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
     });
 
-    await waitFor(() => expect(startSpecSession).toHaveBeenCalledWith("task-1"));
+    await waitFor(() => expect(startSpecSession).toHaveBeenCalledWith("task-1", "repo-1"));
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
+  });
+
+  it("GOT.81-fix1: clicking Confirm twice quickly sends exactly one startSpecSession request, and disables Confirm/Cancel while in flight", async () => {
+    let resolveStart!: (value: { from: string; to: string }) => void;
+    const startPromise = new Promise<{ from: string; to: string }>((resolve) => {
+      resolveStart = resolve;
+    });
+    const startSpecSession = vi.fn().mockReturnValue(startPromise);
+    const getTask = vi.fn().mockResolvedValue(needsSpecAggregate());
+    const client = makeFakeClient({
+      getTask,
+      startSpecSession,
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ id: "repo-1", name: "tsk-repo" })]),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Repository") as HTMLSelectElement).value).toBe("repo-1"));
+    fireEvent.click(screen.getByRole("button", { name: "Start spec session" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy());
+
+    const confirmButton = screen.getByRole("button", { name: "Confirm" }) as HTMLButtonElement;
+    const cancelButton = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+    fireEvent.click(cancelButton);
+
+    expect(startSpecSession).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Confirm" }) as HTMLButtonElement).disabled).toBe(true));
+    expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => {
+      resolveStart({ from: "NEEDS_SPEC", to: "SPEC_IN_PROGRESS" });
+      await startPromise;
+    });
+
+    expect(startSpecSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("GOT.81: surfaces the api's error code when starting the session fails", async () => {
+    const startSpecSession = vi
+      .fn()
+      .mockRejectedValue(new ApiError(422, "REPOSITORY_REQUIRED", "A repository is required."));
+    const getTask = vi.fn().mockResolvedValue(needsSpecAggregate());
+    const client = makeFakeClient({
+      getTask,
+      startSpecSession,
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ id: "repo-1", name: "tsk-repo" })]),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Repository") as HTMLSelectElement).value).toBe("repo-1"));
+    fireEvent.click(screen.getByRole("button", { name: "Start spec session" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy());
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    });
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("REPOSITORY_REQUIRED"));
   });
 
   it("does not show the Start spec session button in SPEC_IN_PROGRESS, even with no live spec execution (the route only allows NEEDS_SPEC)", async () => {
