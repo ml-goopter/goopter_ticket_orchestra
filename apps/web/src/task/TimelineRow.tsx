@@ -36,7 +36,16 @@ function previewJson(value: unknown): { text: string; omittedChars: number } {
   if (full.length <= JSON_PREVIEW_LIMIT) {
     return { text: full, omittedChars: 0 };
   }
-  return { text: full.slice(0, JSON_PREVIEW_LIMIT), omittedChars: full.length - JSON_PREVIEW_LIMIT };
+  // Cutting at JSON_PREVIEW_LIMIT can land between the two UTF-16 code units
+  // of an astral character (e.g. an emoji), leaving a lone high surrogate at
+  // the end of the preview. Pull the cut back one code unit in that case so
+  // the preview never ends mid-pair.
+  let cut = JSON_PREVIEW_LIMIT;
+  const lastCode = full.charCodeAt(cut - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    cut -= 1;
+  }
+  return { text: full.slice(0, cut), omittedChars: full.length - cut };
 }
 
 function JsonPreview({ value }: { value: unknown }) {

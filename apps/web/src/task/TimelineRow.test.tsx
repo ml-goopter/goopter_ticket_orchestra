@@ -57,6 +57,31 @@ describe("TimelineRow JSON preview (GOT.65)", () => {
       expect(notice.textContent).toContain(omitted.toLocaleString("en-US"));
       expect(notice.textContent?.toLowerCase()).toContain("truncated");
     });
+
+    it("never splits a surrogate pair when an emoji straddles the preview limit", () => {
+      // Position the blob so the emoji's high surrogate lands exactly at the
+      // preview cut (index 3999 of the stringified JSON, 0-indexed) and its
+      // low surrogate falls just past it, at index 4000.
+      const prefix = JSON.stringify({ blob: "" }, null, 2);
+      const blobStart = prefix.indexOf('""') + 1;
+      const padLength = 4000 - blobStart - 1;
+      const toolInput = { blob: "x".repeat(padLength) + "\u{1F600}" + "y".repeat(50) };
+      const full = JSON.stringify(toolInput, null, 2);
+      expect(full.charCodeAt(3999)).toBeGreaterThanOrEqual(0xd800);
+      expect(full.charCodeAt(3999)).toBeLessThanOrEqual(0xdbff);
+      expect(full.charCodeAt(4000)).toBeGreaterThanOrEqual(0xdc00);
+
+      renderRow(makeItem({ kind: "tool_call", toolName: "read_file", toolInput }));
+
+      const shown = getPre()?.textContent ?? "";
+      const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+      expect(loneSurrogate.test(shown)).toBe(false);
+      expect(full.startsWith(shown)).toBe(true);
+
+      const notice = screen.getByTestId("json-truncated-notice");
+      const omitted = full.length - shown.length;
+      expect(notice.textContent).toContain(omitted.toLocaleString("en-US"));
+    });
   });
 
   describe("generic (unknown event) payload", () => {
