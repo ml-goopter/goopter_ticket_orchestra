@@ -1592,9 +1592,10 @@ export function createRunner(deps: RunnerDeps): Runner {
    * `nudge` when the retry is a protocol one (C26, F3). With `reuse` (C32)
    * the session starts in the failed attempt's worktree the retry took
    * over, and nothing is pushed or prepared. Without it, a retry pushes the
-   * failed attempt's branch first when it ran on this host (C27) and
-   * prepares a new worktree from the remote branch (the default branch
-   * when the remote has none).
+   * failed attempt's branch first when it ran on this host (C27). Every
+   * prepared worktree, a retry's or a new execution's claimed from READY,
+   * starts from the task's remote branch, or from the default branch when
+   * the remote has none (§9.5, GOT.94).
    */
   async function prepareAndRun(
     state: RunState,
@@ -1663,7 +1664,11 @@ export function createRunner(deps: RunnerDeps): Runner {
           })),
           reviewCommand: testCommand,
           runtime: ctx.execution.runtime,
-          ...(retryOf ? { resumeFromRemote: true, fallbackToDefaultBranch: true } : {}),
+          // §9.5: every new worktree starts from the task's pushed branch
+          // when the remote has it, else from the default branch, so a
+          // human retry or a reopen pushes fast-forward (GOT.94).
+          resumeFromRemote: true,
+          fallbackToDefaultBranch: true,
         });
       }
     } catch (err) {

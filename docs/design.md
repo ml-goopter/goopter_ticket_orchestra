@@ -630,7 +630,7 @@ Every 30 seconds the runner updates `task_leases.expires_at = now() + 5 min` for
 
 ### 6.5 Lease sweeper
 
-Every tick: any `task_leases` row with `expires_at < now()` whose execution is `ASSIGNED` or `RUNNING` means a dead worker. Transition the execution to `FAILED` with `end_reason = lease_expired`, delete the lease, and apply the retry policy (9.5). The worktree stays on the dead host. The retry creates a fresh execution with `host = NULL`, which any worker may claim and which starts from a fresh worktree of the pushed branch if one exists, else from the base branch.
+Every tick: any `task_leases` row with `expires_at < now()` whose execution is `ASSIGNED` or `RUNNING` means a dead worker. Transition the execution to `FAILED` with `end_reason = lease_expired`, delete the lease, and apply the retry policy (9.5). The worktree stays on the dead host. The retry creates a fresh execution with `host = NULL`, which any worker may claim, in a fresh worktree whose start point follows §9.5.
 
 ### 6.6 Worktree sweeper
 
@@ -761,7 +761,7 @@ A blocking `raise_issue` does not kill the session. It sets a flag. When the ada
 Start of an implementation execution:
 
 1. `git -C repos/X.git fetch --prune`
-2. `git -C repos/X.git worktree add work/<id> -b agent/<KEY>-<short> origin/<default_branch>`
+2. `git -C repos/X.git worktree add work/<id> -B agent/<KEY>-<short> <start point>`, where the start point is `origin/agent/<KEY>-<short>` when the remote has that branch, else `origin/<default_branch>` (§9.5).
 3. Run `repositories.setup_command` if set. Failure is an infrastructure failure.
 4. Write `.orchestra/context.json` into the worktree with task, spec, decisions, and the review command. Git-ignored via `.git/info/exclude`.
 
@@ -854,7 +854,9 @@ Decided by the runner from how the execution ended, never from agent prose.
 
 CI and review round limits are enforced at the transition (5.3), not here.
 
-`NEEDS_HUMAN` has two user actions: retry, which creates a fresh execution from `READY` with a fresh worktree from the pushed branch, or cancel.
+`NEEDS_HUMAN` has two user actions: retry, which creates a fresh execution from `READY` with a fresh worktree, or cancel.
+
+Start point of a fresh implementation worktree: every implementation execution that prepares a new worktree (a retry started fresh, a human retry from `NEEDS_HUMAN`, the first execution after a reopen, any claim from `READY`) creates `agent/<KEY>-<short>` from `origin/agent/<KEY>-<short>` when the remote has that branch, else from `origin/<default_branch>`. The branch name depends only on the task, so the new execution keeps the commits earlier executions pushed and its own push is a fast-forward. The worker never force-pushes.
 
 ### 9.6 Event types
 
