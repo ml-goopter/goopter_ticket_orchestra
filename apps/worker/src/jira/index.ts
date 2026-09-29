@@ -1,4 +1,5 @@
 export {
+  JIRA_DONE_STATUS_CATEGORY,
   JiraApiError,
   MISSING_JIRA_PRIORITY,
   createJiraClient,
@@ -6,6 +7,7 @@ export {
   renderAdfToPlainText,
   type JiraClient,
   type JiraClientConfig,
+  type JiraIssueStatus,
   type JiraSearchIssue,
 } from "./client.js";
 export {

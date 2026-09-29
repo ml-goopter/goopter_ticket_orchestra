@@ -449,7 +449,7 @@ Index on `(task_id, id)`. Rows older than 90 days for `DONE` tasks may be archiv
 | user_id | uuid fk nullable | null means all users |
 | task_id | uuid fk |  |
 | issue_id | uuid fk nullable |  |
-| kind | enum notification_kind | `issue_raised`, `spec_review_requested`, `needs_human`, `ready_for_merge`, `execution_failed` |
+| kind | enum notification_kind | `issue_raised`, `spec_review_requested`, `needs_human`, `ready_for_merge`, `execution_failed`, `jira_out_of_scope` |
 | title | text |  |
 | read_at | timestamptz nullable |  |
 | created_at | timestamptz |  |
@@ -998,7 +998,11 @@ Both run in the worker on independent intervals with jitter. Both are idempotent
 
 ### 11.1 Jira
 
-Every 60 seconds per project: run `jira_jql` with `ORDER BY created ASC`, page through results, upsert `tasks` by `jira_key`. New keys get `state = NEEDS_SPEC` and a `task.state_changed` event. Existing keys refresh summary and priority only. A ticket that no longer matches the JQL is not touched. A ticket that returns 404 moves the task to `FAILED` with a reason.
+Every 60 seconds per project: run `jira_jql` with `ORDER BY created ASC`, page through results, upsert `tasks` by `jira_key`. New keys get `state = NEEDS_SPEC` and a `task.state_changed` event, except a ticket whose status category is already Done the first time the JQL returns it: that ticket is not imported at all — no task, no notification, no event. Existing keys refresh summary and priority only.
+
+For every other non-terminal task, the poller reads its ticket's status category: Done for a ticket still returned by the JQL, looked up directly for one that is not. A ticket that returns 404 on that lookup moves the task to `FAILED` with a reason. A transient error on the lookup (network, 5xx, rate limit) leaves the task untouched; the next poll tries again.
+
+A ticket that is Done or has stopped matching the JQL cancels the task, with a note giving the reason, when the task is still in a spec state (`NEEDS_SPEC`, `SPEC_IN_PROGRESS`, `SPEC_REVIEW`, `SPEC_APPROVED`). For any other non-terminal state (`BLOCKED`, `READY`, `NEEDS_HUMAN` and later), the same observation is only signalled: one `jira_out_of_scope` notification plus one timeline note, and only once per change — a ticket that stays Done or out of the JQL across polls does not repeat the notification. The ticket coming back open and back in the JQL adds a note but no notification, so work is not silently un-flagged; a later close or drop from the JQL signals again. A reopened ticket never resurrects a task already cancelled for having closed or left the JQL.
 
 Comments are fetched on demand when a spec session starts and when an implementation execution starts, not on the poll.
 
