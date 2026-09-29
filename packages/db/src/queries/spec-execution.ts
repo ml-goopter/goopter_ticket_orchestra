@@ -241,16 +241,6 @@ const specRepositoryName = sql<string | null>`coalesce(
   (select r.name from ${repositories} r where r.project_id = ${tasks.projectId} order by r.name, r.id limit 1)
 )`;
 
-/**
- * C41's repository rule as a scalar id on a query with `tasks` in scope:
- * the id `resolveSpecRepository` returns. The §6.1 command claim uses it
- * to route `start_spec_session` by container mode (§9.9).
- */
-export const specRepositoryId = sql<string | null>`coalesce(
-  ${tasks.repositoryId},
-  (select r.id from ${repositories} r where r.project_id = ${tasks.projectId} order by r.name, r.id limit 1)
-)`;
-
 function approvedSpecQuery(db: DbOrTx, host: string, executionId?: string) {
   return db
     .select({

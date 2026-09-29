@@ -21,7 +21,6 @@ import { specificationRevisions, tasks } from "../schema/tasks.js";
 import { users } from "../schema/users.js";
 import type { DbOrTx } from "../transition.js";
 import { containerModeMatches } from "./scheduler.js";
-import { specRepositoryId } from "./spec-execution.js";
 import type {
   ExecutionRow,
   ProjectRow,
@@ -72,12 +71,14 @@ const FRESH_SESSION_COMMAND_TYPES: readonly CommandType[] = [
  *
  * §9.9 Scheduling (C4b): a command that would place a container-mode agent
  * session on this worker needs `containerModeMatches`, as the §6.3 claim
- * does. That is a `start_spec_session` whose spec repository (C41) has
- * `agent_container = true`, and a fresh-session command on a released
- * implementation execution whose task's repository has it. A worker
- * without `docker` leaves them unclaimed for a docker worker; with none,
- * they wait. The filters read tasks, executions, repositories and the
- * worker row in subqueries, so the statement still locks only commands.
+ * does. That is a `start_spec_session` whose task's repository (the spec
+ * repository since GOT.80) has `agent_container = true`, and a
+ * fresh-session command on a released implementation execution whose
+ * task's repository has it. A worker without `docker` leaves them
+ * unclaimed for a docker worker; with none, they wait unclaimed and no
+ * handler runs. The filters read tasks, executions, repositories and the
+ * worker row in subqueries, so the statement still locks only commands;
+ * each handler re-checks under its task lock before it places a session.
  */
 export async function claimExecutionCommands(
   db: DbOrTx,
@@ -94,7 +95,7 @@ export async function claimExecutionCommands(
   const containerSpecStart = db
     .select({ one: sql`1` })
     .from(tasks)
-    .innerJoin(repositories, eq(repositories.id, specRepositoryId))
+    .innerJoin(repositories, eq(repositories.id, tasks.repositoryId))
     .where(
       and(
         eq(tasks.id, executionCommands.taskId),

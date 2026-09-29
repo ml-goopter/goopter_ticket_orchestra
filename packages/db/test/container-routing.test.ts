@@ -189,23 +189,27 @@ describe("start_spec_session claim (§9.9 Scheduling)", () => {
     expect(await claim(workers.docker!)).toEqual([b]);
   });
 
-  it("with no task repository, follows the project's first repository by name (C41)", async () => {
-    // Container-mode first by name.
-    const p1 = await insertProject(`CRA${++seq}`);
-    await insertRepository(p1, "a-ctr", true);
-    await insertRepository(p1, "b-host", false);
-    const t1 = await seedTaskOn(null, "SPEC_IN_PROGRESS", p1);
-    const c1 = await insertCommand(t1, null, "start_spec_session");
-    expect(await claim(workers.plain!)).toEqual([]);
-    expect(await claim(workers.docker!)).toEqual([c1]);
+  it("routes by the task's own repository only, not the project's others (GOT.80)", async () => {
+    // A host-mode task in a project whose only other repository is container-mode.
+    const p = await insertProject(`CRA${++seq}`);
+    const ctr = await insertRepository(p, "a-ctr", true);
+    const hostRepo = await insertRepository(p, "b-host", false);
+    const onHost = await seedTaskOn(hostRepo, "SPEC_IN_PROGRESS", p);
+    const c1 = await insertCommand(onHost, null, "start_spec_session");
+    expect(await claim(workers.plain!)).toEqual([c1]);
 
-    // Host-mode first by name, a container-mode one after it.
-    const p2 = await insertProject(`CRB${++seq}`);
-    await insertRepository(p2, "b-ctr", true);
-    await insertRepository(p2, "a-host", false);
-    const t2 = await seedTaskOn(null, "SPEC_IN_PROGRESS", p2);
-    const c2 = await insertCommand(t2, null, "start_spec_session");
-    expect(await claim(workers.plain!)).toEqual([c2]);
+    const onCtr = await seedTaskOn(ctr, "SPEC_IN_PROGRESS", p);
+    const c2 = await insertCommand(onCtr, null, "start_spec_session");
+    expect(await claim(workers.plain!)).toEqual([]);
+    expect(await claim(workers.docker!)).toEqual([c2]);
+  });
+
+  it("a task with no repository claims as before, even beside container-mode repositories (the handler skips it)", async () => {
+    const p = await insertProject(`CRB${++seq}`);
+    await insertRepository(p, "a-ctr", true);
+    const t = await seedTaskOn(null, "SPEC_IN_PROGRESS", p);
+    const c = await insertCommand(t, null, "start_spec_session");
+    expect(await claim(workers.plain!)).toEqual([c]);
   });
 
   it("a project with no repository still claims as before (the handler skips it)", async () => {

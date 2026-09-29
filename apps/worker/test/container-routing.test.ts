@@ -221,11 +221,28 @@ function specHandlers(runner: FakeSpecRunner): CommandHandlers {
   return handlers;
 }
 
-async function consumeSpec(host: string, workerId: string, runner: FakeSpecRunner): Promise<void> {
-  await createConsumeCommandsPhase(specHandlers(runner)).run(tickContext(host, workerId));
+/**
+ * Ids of the commands the consume phase handed to a handler, i.e. claimed.
+ * A command the claim leaves for a docker worker never reaches one, so a
+ * worker without docker does not claim and unclaim it every tick.
+ */
+function recording(handlers: CommandHandlers, seen: string[]): CommandHandlers {
+  return {
+    ...handlers,
+    handlerFor: (type) => {
+      const handler = handlers.handlerFor(type);
+      return handler && ((command, ctx) => (seen.push(command.id), handler(command, ctx)));
+    },
+  };
 }
 
-/** A SPEC_IN_PROGRESS task; its repository is `taskRepository` or none (C41). */
+async function consumeSpec(host: string, workerId: string, runner: FakeSpecRunner): Promise<string[]> {
+  const seen: string[] = [];
+  await createConsumeCommandsPhase(recording(specHandlers(runner), seen)).run(tickContext(host, workerId));
+  return seen;
+}
+
+/** A SPEC_IN_PROGRESS task on `taskRepository`, one of the project's `repos`. */
 async function seedSpecTask(
   repos: Array<{ name: string; agentContainer: boolean }>,
   taskRepository: string | null,
@@ -255,8 +272,8 @@ describe("start_spec_session placement (§9.9 Scheduling)", () => {
     const id = await enqueue(taskId, null, "start_spec_session", {});
 
     const plain = fakeSpecRunner();
-    await consumeSpec(PLAIN_HOST, plainWorkerId, plain);
-    await consumeSpec(PLAIN_HOST, plainWorkerId, plain);
+    expect(await consumeSpec(PLAIN_HOST, plainWorkerId, plain)).toEqual([]);
+    expect(await consumeSpec(PLAIN_HOST, plainWorkerId, plain)).toEqual([]);
     let row = await command(id);
     expect(row.claimedAt).toBeNull();
     expect(row.completedAt).toBeNull();
@@ -272,18 +289,21 @@ describe("start_spec_session placement (§9.9 Scheduling)", () => {
     expect(docker.started).toEqual([{ executionId: created!.id, taskId }]);
   });
 
-  it("follows the project's first repository by name when the task has none (C41)", async () => {
+  it("routes by the task's own repository, not the project's others (GOT.80)", async () => {
     const taskId = await seedSpecTask(
       [
-        { name: "b-host", agentContainer: false },
         { name: "a-ctr", agentContainer: true },
+        { name: "b-host", agentContainer: false },
       ],
-      null,
+      "b-host",
     );
     const id = await enqueue(taskId, null, "start_spec_session", {});
-    await consumeSpec(PLAIN_HOST, plainWorkerId, fakeSpecRunner());
-    expect((await command(id)).claimedAt).toBeNull();
-    expect(await executionsOf(taskId)).toEqual([]);
+    const plain = fakeSpecRunner();
+    await consumeSpec(PLAIN_HOST, plainWorkerId, plain);
+    expect((await command(id)).completedAt).not.toBeNull();
+    const [created] = await executionsOf(taskId);
+    expect(created).toMatchObject({ state: "ASSIGNED", host: PLAIN_HOST, workerId: plainWorkerId });
+    expect(plain.started).toHaveLength(1);
   });
 
   it("a handler on a worker without docker that holds a container-mode start unclaims it without creating an execution", async () => {
@@ -432,8 +452,10 @@ function issueHandlers(runner: Runner): CommandHandlers {
   return handlers;
 }
 
-async function consumeIssues(host: string, workerId: string, runner: Runner): Promise<void> {
-  await createConsumeCommandsPhase(issueHandlers(runner)).run(tickContext(host, workerId));
+async function consumeIssues(host: string, workerId: string, runner: Runner): Promise<string[]> {
+  const seen: string[] = [];
+  await createConsumeCommandsPhase(recording(issueHandlers(runner), seen)).run(tickContext(host, workerId));
+  return seen;
 }
 
 interface Released {
@@ -554,8 +576,8 @@ describe("fresh-session fallback placement (C21, §9.9 Scheduling)", () => {
     });
 
     const plain = makeRunner(PLAIN_HOST, plainWorkerId, false);
-    await consumeIssues(PLAIN_HOST, plainWorkerId, plain.runner);
-    await consumeIssues(PLAIN_HOST, plainWorkerId, plain.runner);
+    expect(await consumeIssues(PLAIN_HOST, plainWorkerId, plain.runner)).toEqual([]);
+    expect(await consumeIssues(PLAIN_HOST, plainWorkerId, plain.runner)).toEqual([]);
     let cmd = await command(id);
     expect(cmd.claimedAt).toBeNull();
     expect(cmd.completedAt).toBeNull();
