@@ -5,6 +5,7 @@ import {
   eq,
   exists,
   inArray,
+  isNotNull,
   isNull,
   not,
   notExists,
@@ -167,6 +168,12 @@ export async function getClaimWorker(
  * repository's `max_concurrent_worktrees`, by at most the spec turns in
  * flight, each only until its turn ends. No claim lands while a count is at
  * its limit.
+ *
+ * GOT.82: a worker that crashes mid-turn leaves a `RUNNING` spec execution's
+ * token set with no agent left to ever finish the turn and revoke it, which
+ * would otherwise hold a slot on this host forever. `revokeRunningSpecTokensOnHost`
+ * clears it once, at the next startup of that host, before anything accepts
+ * work, so such a token outlives its crash by no more than the restart gap.
  */
 export const holdsCapacity = (): SQL =>
   and(
@@ -192,6 +199,40 @@ export async function countSlotHoldingExecutions(
     .from(executions)
     .where(and(eq(executions.host, host), holdsCapacity()));
   return row?.n ?? 0;
+}
+
+/**
+ * Clears `tools_token_hash` on `host`'s `spec` executions that are
+ * `RUNNING` (GOT.82, see the race bound on `holdsCapacity` above). Called
+ * once at worker startup, before the runner, scheduler phases and
+ * agent-tools server accept work, so a token a crashed turn left behind
+ * stops holding a worker slot and its worktree; the execution itself is
+ * left `RUNNING`, exactly the state a spec session between turns already
+ * has (§9.3), and its next resume issues a fresh token the normal way.
+ * Scoped to `host`, `role = "spec"` and `state = "RUNNING"`: never touches
+ * another host's executions, an implementation execution, or a row that
+ * already has no token. One statement against `executions` only, so it
+ * takes no lock beyond what Postgres already takes on the rows it writes,
+ * adding nothing to the worker-then-task-then-execution order. Returns the
+ * number of rows revoked, for the startup log line.
+ */
+export async function revokeRunningSpecTokensOnHost(
+  db: DbOrTx,
+  host: string,
+): Promise<number> {
+  const rows = await db
+    .update(executions)
+    .set({ toolsTokenHash: null })
+    .where(
+      and(
+        eq(executions.host, host),
+        eq(executions.role, "spec"),
+        eq(executions.state, "RUNNING"),
+        isNotNull(executions.toolsTokenHash),
+      ),
+    )
+    .returning({ id: executions.id });
+  return rows.length;
 }
 
 /** `coalesce(tasks.runtime_override, repositories.default_runtime)` (§7.3). */

@@ -6,6 +6,7 @@ import { projects, repositories } from "../schema/projects.js";
 import { tasks } from "../schema/tasks.js";
 import { users } from "../schema/users.js";
 import type { DbOrTx } from "../transition.js";
+import { holdsCapacity } from "./scheduler.js";
 // `ProjectRow`, `RepositoryRow` (task-aggregate.ts) and `AgentWorkerRow`
 // (workers.ts) already exist with this exact shape; reusing them (rather
 // than redeclaring `typeof projects.$inferSelect` etc. here) avoids the
@@ -394,17 +395,18 @@ export async function updateAdminUser(
 export interface AgentWorkerWithSlots extends AgentWorkerRow {
   /** `now` minus `last_heartbeat_at`, in whole seconds. */
   heartbeatAgeSeconds: number;
-  /** `max_concurrent` minus the count of `ASSIGNED`/`RUNNING` executions on that host. */
+  /** `max_concurrent` minus the count of slot-holding executions on that host (`holdsCapacity`). */
   freeSlots: number;
 }
 
-/** States that hold a worker slot (design.md §6). */
-const ACTIVE_EXECUTION_STATES = ["ASSIGNED", "RUNNING"] as const;
-
 /**
  * One row per `agent_workers`, with `heartbeat_age_seconds` and
- * `free_slots` computed against `now` (design.md §12.5). The active-execution
- * count is one grouped query rather than one query per worker.
+ * `free_slots` computed against `now` (design.md §12.5). The slot-holding
+ * count uses `holdsCapacity` (design.md §6.3, GOT.56/GOT.82), the same rule
+ * the scheduler's claim uses, so this display matches what a claim sees: an
+ * idle spec session between turns (`RUNNING` with no agent-tools token)
+ * does not count as a used slot. One grouped query rather than one query
+ * per worker.
  */
 export async function listWorkersWithSlots(
   db: DbOrTx,
@@ -426,12 +428,7 @@ export async function listWorkersWithSlots(
       count: sql<number>`count(*)::int`,
     })
     .from(executions)
-    .where(
-      and(
-        inArray(executions.host, hosts),
-        inArray(executions.state, [...ACTIVE_EXECUTION_STATES]),
-      ),
-    )
+    .where(and(inArray(executions.host, hosts), holdsCapacity()))
     .groupBy(executions.host);
 
   const activeByHost = new Map(counts.map((c) => [c.host, c.count]));
