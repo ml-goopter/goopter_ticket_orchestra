@@ -442,6 +442,7 @@ function recordingOps(
             if (result.tipMoved !== true) removed.push(executionId);
             return result;
           },
+          removeBareClone: (recorded) => repo.removeBareClone(recorded),
         }),
       );
     },
@@ -452,6 +453,7 @@ function recordingOps(
       if (result.pushed) pushes.push(input.branch);
       return result;
     },
+    listBareClones: () => target.listBareClones(),
   };
 }
 
@@ -516,6 +518,7 @@ function trackedOps(inner: WorktreeOps = recordingOps()): WorktreeOps {
         }
       });
     },
+    listBareClones: () => inner.listBareClones(),
   };
 }
 
@@ -1992,5 +1995,269 @@ describe("approved spec worktrees (GOT.37 C46)", () => {
     expect(existsSync(s.worktreePath)).toBe(true);
     expect(ops.removed).toEqual([]);
     expect((await execution(s.executionId)).worktreePath).toBe(s.worktreePath);
+  });
+});
+
+describe("deleted repository clones under repos/ (GOT.63)", () => {
+  const reposDir = () => path.join(workspaceRoot, "repos");
+  const clonePath = (name: string) => path.join(reposDir(), `${name}.git`);
+
+  /** A repository row in a fresh project, no clone created for it. */
+  async function insertRepository(name: string): Promise<string> {
+    const n = ++seq;
+    const [project] = await db
+      .insert(projects)
+      .values({ key: `WTSR${n}`, name: `wt sweep repo ${n}`, jiraJql: `project = WTSR${n}` })
+      .returning({ id: projects.id });
+    const [row] = await db
+      .insert(repositories)
+      .values({
+        projectId: project!.id,
+        name,
+        gitUrl: remote,
+        defaultBranch: "main",
+        defaultRuntime: "claude",
+      })
+      .returning({ id: repositories.id });
+    return row!.id;
+  }
+
+  /**
+   * The bare clone at repos/<name>.git with a live worktree in it at
+   * work/orphan-<name>, and no database row at all.
+   */
+  async function seedCloneInUse(name: string): Promise<string> {
+    const prepared = await manager.prepareSpec({
+      executionId: `orphan-${name}`,
+      repository: { name, gitUrl: remote, defaultBranch: "main" },
+    });
+    return prepared.worktreePath;
+  }
+
+  /** The bare clone at repos/<name>.git, no worktree, no database row. */
+  async function seedBareClone(name: string): Promise<void> {
+    const worktreePath = await seedCloneInUse(name);
+    await manager.remove(worktreePath, { repositoryName: name, branch: null });
+  }
+
+  const keptInUse = (name: string) =>
+    expect.objectContaining({
+      level: "warn",
+      msg: "bare clone kept, worktrees still use it",
+      fields: expect.objectContaining({ name }),
+    });
+
+  it("removes a clone whose name has no repository row in any project", async () => {
+    await seedBareClone("deleted_repo");
+    expect(existsSync(clonePath("deleted_repo"))).toBe(true);
+
+    await sweep();
+
+    expect(existsSync(clonePath("deleted_repo"))).toBe(false);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "info",
+        msg: "deleted repository's bare clone removed",
+        fields: expect.objectContaining({ name: "deleted_repo" }),
+      }),
+    );
+  });
+
+  it("keeps a clone whose name another project's repository still uses", async () => {
+    await seedBareClone("shared_repo");
+    const deleted = await insertRepository("shared_repo");
+    await insertRepository("shared_repo");
+    await raw("delete from repositories where id = $1", [deleted]);
+
+    await sweep();
+
+    expect(existsSync(clonePath("shared_repo"))).toBe(true);
+    expect(records.filter((r) => r.msg === "deleted repository's bare clone removed")).toEqual(
+      [],
+    );
+  });
+
+  it("keeps the clone of a repository that still exists", async () => {
+    await insertRepository("kept_repo");
+    await seedBareClone("kept_repo");
+
+    await sweep();
+
+    expect(existsSync(clonePath("kept_repo"))).toBe(true);
+    expect(records.filter((r) => r.msg === "deleted repository's bare clone removed")).toEqual(
+      [],
+    );
+  });
+
+  it("ignores a repos/ entry that is not a bare clone", async () => {
+    await fs.mkdir(reposDir(), { recursive: true });
+    await fs.mkdir(path.join(reposDir(), "not_a_clone"));
+    await fs.writeFile(path.join(reposDir(), "readme.txt"), "hi");
+
+    await sweep();
+
+    expect(existsSync(path.join(reposDir(), "not_a_clone"))).toBe(true);
+    expect(existsSync(path.join(reposDir(), "readme.txt"))).toBe(true);
+    expect(records.filter((r) => r.level === "error" || r.level === "warn")).toEqual([]);
+  });
+
+  it("never follows a symlinked repos/ entry; skips and logs it", async () => {
+    await fs.mkdir(reposDir(), { recursive: true });
+    const target = path.join(tmp, "elsewhere.git");
+    await fs.mkdir(target, { recursive: true });
+    await fs.writeFile(path.join(target, "marker.txt"), "keep");
+    const link = path.join(reposDir(), "linked_repo.git");
+    await fs.symlink(target, link, "dir");
+
+    await sweep();
+
+    expect(existsSync(link)).toBe(true);
+    expect(existsSync(path.join(target, "marker.txt"))).toBe(true);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        msg: "repos entry is a symlink, skipped",
+        fields: expect.objectContaining({ name: "linked_repo" }),
+      }),
+    );
+  });
+
+  it("keeps a clone re-created during the sweep, caught by the post-lock recheck", async () => {
+    await seedBareClone("recreated_repo");
+    const ops = recordingOps();
+    const locking: WorktreeOps = {
+      ...ops,
+      async withRepositoryLock(repositoryName, fn) {
+        if (repositoryName === "recreated_repo") {
+          // A recreation lands between the unlocked list and the lock.
+          await insertRepository("recreated_repo");
+        }
+        return ops.withRepositoryLock(repositoryName, fn);
+      },
+    };
+
+    await sweep({ worktrees: locking });
+
+    expect(existsSync(clonePath("recreated_repo"))).toBe(true);
+    expect(records.filter((r) => r.msg === "deleted repository's bare clone removed")).toEqual(
+      [],
+    );
+  });
+
+  it("a removal failure is logged and the rest of the sweep continues", async () => {
+    await seedBareClone("explode_repo");
+    await seedBareClone("removable_repo");
+    const ops = recordingOps();
+    const failing: WorktreeOps = {
+      ...ops,
+      withRepositoryLock(repositoryName, fn) {
+        if (repositoryName === "explode_repo") {
+          return Promise.reject(new Error("rm exploded"));
+        }
+        return ops.withRepositoryLock(repositoryName, fn);
+      },
+    };
+
+    await sweep({ worktrees: failing });
+
+    expect(existsSync(clonePath("explode_repo"))).toBe(true);
+    expect(existsSync(clonePath("removable_repo"))).toBe(false);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "error",
+        msg: "bare clone removal failed",
+        fields: expect.objectContaining({ name: "explode_repo", err: "rm exploded" }),
+      }),
+    );
+  });
+
+  it("F1: keeps a renamed repository's old clone while a live worktree with unpushed work points into it", async () => {
+    const s = await seedWithWorktree({ taskState: "IMPLEMENTING", state: "RUNNING" });
+    const commit = commitIn(s.worktreePath, "unpushed.txt");
+    // PATCH /repositories/:id renaming a repository its tasks still use.
+    await raw("update repositories set name = $1 where name = $2", ["renamed_repo", REPO_NAME]);
+
+    await sweep();
+
+    expect(existsSync(bareClone())).toBe(true);
+    expect(git(s.worktreePath, "rev-parse", "HEAD")).toBe(commit);
+    expect(records).toContainEqual(keptInUse(REPO_NAME));
+    expect(records.filter((r) => r.msg === "deleted repository's bare clone removed")).toEqual(
+      [],
+    );
+  });
+
+  it("F1: keeps the old clone while an execution row records a worktree the clone's worktrees/ still lists", async () => {
+    const s = await seedWithWorktree({ taskState: "IMPLEMENTING", state: "RUNNING" });
+    // The directory is gone without a `git worktree prune`: only the
+    // execution row and the clone's admin entry still know the worktree.
+    await fs.rm(s.worktreePath, { recursive: true, force: true });
+    await raw("update repositories set name = $1 where name = $2", ["renamed_repo", REPO_NAME]);
+
+    await sweep();
+
+    expect(existsSync(bareClone())).toBe(true);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        msg: "bare clone kept, worktrees still use it",
+        fields: expect.objectContaining({ name: REPO_NAME, worktrees: [s.worktreePath] }),
+      }),
+    );
+  });
+
+  it("F3: keeps an otherwise unreferenced clone while a work/ worktree points into it, and warns", async () => {
+    const worktreePath = await seedCloneInUse("unreferenced_repo");
+
+    await sweep();
+
+    expect(existsSync(clonePath("unreferenced_repo"))).toBe(true);
+    expect(gitOk(worktreePath, "status")).toBe(true);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        msg: "bare clone kept, worktrees still use it",
+        fields: expect.objectContaining({ name: "unreferenced_repo", worktrees: [worktreePath] }),
+      }),
+    );
+  });
+
+  it("F2: keeps a clone whose directory name matches a repository name only case-insensitively", async () => {
+    await seedBareClone("casey");
+    await insertRepository("Casey");
+    const ops = recordingOps();
+    const locked: string[] = [];
+    const recording: WorktreeOps = {
+      ...ops,
+      withRepositoryLock(repositoryName, fn) {
+        locked.push(repositoryName);
+        return ops.withRepositoryLock(repositoryName, fn);
+      },
+    };
+
+    await sweep({ worktrees: recording });
+
+    expect(existsSync(clonePath("casey"))).toBe(true);
+    // Kept by the unlocked list itself, not only by the post-lock recheck.
+    expect(locked).not.toContain("casey");
+    expect(records.filter((r) => r.msg === "deleted repository's bare clone removed")).toEqual(
+      [],
+    );
+  });
+
+  it("F2: the post-lock recheck matches a recreated name case-insensitively", async () => {
+    await seedBareClone("recased_repo");
+    const ops = recordingOps();
+    const locking: WorktreeOps = {
+      ...ops,
+      async withRepositoryLock(repositoryName, fn) {
+        if (repositoryName === "recased_repo") await insertRepository("Recased_Repo");
+        return ops.withRepositoryLock(repositoryName, fn);
+      },
+    };
+
+    await sweep({ worktrees: locking });
+
+    expect(existsSync(clonePath("recased_repo"))).toBe(true);
   });
 });

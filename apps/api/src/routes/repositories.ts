@@ -198,7 +198,7 @@ export default async function repositoriesRoutes(
     }
   });
 
-  app.patch<{ Params: { id: string } }>("/:id", async (request) => {
+  app.patch<{ Params: { id: string } }>("/:id", async (request, reply) => {
     const parsed = PatchRepositorySchema.safeParse(request.body);
     if (!parsed.success) {
       throw new AppError(400, "VALIDATION_ERROR", validationMessage(parsed.error));
@@ -214,7 +214,7 @@ export default async function repositoriesRoutes(
       }
     }
     try {
-      const row = await updateRepository(app.db, request.params.id, {
+      const result = await updateRepository(app.db, request.params.id, {
         ...(parsed.data.project_id !== undefined
           ? { projectId: parsed.data.project_id }
           : {}),
@@ -250,8 +250,18 @@ export default async function repositoriesRoutes(
           ? { agentImage: parsed.data.agent_image }
           : {}),
       });
-      if (!row) throw notFound(request.params.id);
-      return toResponse(row);
+      if (result.status === "not_found") throw notFound(request.params.id);
+      if (result.status === "blocked") {
+        reply.code(409);
+        return {
+          error: {
+            code: "REPOSITORY_IN_USE",
+            message: `Cannot rename: ${result.taskCount} task(s) reference this repository.`,
+            task_count: result.taskCount,
+          },
+        };
+      }
+      return toResponse(result.row);
     } catch (err) {
       if (err instanceof UniqueViolationError) throw conflict();
       throw err;

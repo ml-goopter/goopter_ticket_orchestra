@@ -1030,6 +1030,111 @@ describe("admin routes", () => {
     });
   });
 
+  describe("PATCH /api/repositories/:id rename guard (GOT.63-fix2, D7)", () => {
+    it("renames a repository with no referencing tasks", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "RENA1" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "rena1-old",
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+        payload: { name: "rena1-new" },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().name).toBe("rena1-new");
+    });
+
+    it("returns 409 with the reason and task count, applying nothing, when a task references the repository", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "RENA2" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "rena2-old",
+      });
+      await seedTask(testDb.db, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "RENA2-1",
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+        payload: { name: "rena2-new", default_branch: "develop" },
+      });
+      expect(res.statusCode).toBe(409);
+      const body = res.json();
+      expect(body.error.code).toBe("REPOSITORY_IN_USE");
+      expect(body.error.task_count).toBe(1);
+      expect(typeof body.error.message).toBe("string");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+      });
+      const getBody = getRes.json();
+      expect(getBody.name).toBe("rena2-old");
+      expect(getBody.default_branch).toBe("main");
+    });
+
+    it("allows a PATCH sending the unchanged name even with referencing tasks", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "RENA3" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "rena3-repo",
+      });
+      await seedTask(testDb.db, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "RENA3-1",
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+        payload: { name: "rena3-repo", default_branch: "develop" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.name).toBe("rena3-repo");
+      expect(body.default_branch).toBe("develop");
+    });
+
+    it("allows a PATCH touching only other fields even with referencing tasks", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "RENA4" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "rena4-repo",
+      });
+      await seedTask(testDb.db, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "RENA4-1",
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+        payload: { default_branch: "develop" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.name).toBe("rena4-repo");
+      expect(body.default_branch).toBe("develop");
+    });
+  });
+
   describe("users (AC3)", () => {
     it("creates a user who can then log in, and never leaks password_hash", async () => {
       const app = await withAuthedApp();

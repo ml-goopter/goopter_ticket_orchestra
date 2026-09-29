@@ -307,12 +307,138 @@ describe("insertRepository / listRepositories / getRepositoryById (AC6)", () => 
     expect(fetched?.agentContainer).toBe(true);
     expect(fetched?.agentImage).toBe("orchestra/agent:custom");
 
-    const updated = await updateRepository(h.db, repo.id, {
+    const result = await updateRepository(h.db, repo.id, {
       agentContainer: false,
       agentImage: null,
     });
-    expect(updated?.agentContainer).toBe(false);
-    expect(updated?.agentImage).toBeNull();
+    if (result.status !== "updated") throw new Error("expected updated");
+    expect(result.row.agentContainer).toBe(false);
+    expect(result.row.agentImage).toBeNull();
+  });
+});
+
+describe("updateRepository rename guard (GOT.63-fix2, D7)", () => {
+  it("renames a repository with no referencing tasks", async () => {
+    const project = await insertProject(h.db, projectInput("RENR1"));
+    const repo = await insertRepository(h.db, repoInput(project.id, "renr1-old"));
+
+    const result = await updateRepository(h.db, repo.id, { name: "renr1-new" });
+
+    expect(result).toEqual({
+      status: "updated",
+      row: expect.objectContaining({ id: repo.id, name: "renr1-new" }),
+    });
+  });
+
+  it("refuses a rename while a task references the repository, applying nothing", async () => {
+    const fixtures = await seedFixtures(h.db, "RENR2");
+    await seedTask(h.db, fixtures, { jiraKey: "RENR2-1", state: "NEEDS_SPEC" });
+    await seedTask(h.db, fixtures, { jiraKey: "RENR2-2", state: "NEEDS_SPEC" });
+    const before = await getRepositoryById(h.db, fixtures.repositoryId);
+
+    const result = await updateRepository(h.db, fixtures.repositoryId, {
+      name: "renr2-new-name",
+      defaultBranch: "develop",
+    });
+
+    expect(result).toEqual({ status: "blocked", taskCount: 2 });
+    const after = await getRepositoryById(h.db, fixtures.repositoryId);
+    expect(after?.name).toBe(before?.name);
+    expect(after?.defaultBranch).toBe(before?.defaultBranch);
+  });
+
+  it("allows a patch sending the unchanged name even with referencing tasks", async () => {
+    const fixtures = await seedFixtures(h.db, "RENR3");
+    await seedTask(h.db, fixtures, { jiraKey: "RENR3-1", state: "NEEDS_SPEC" });
+    const before = await getRepositoryById(h.db, fixtures.repositoryId);
+
+    const result = await updateRepository(h.db, fixtures.repositoryId, {
+      name: before!.name,
+      defaultBranch: "develop",
+    });
+
+    expect(result).toEqual({
+      status: "updated",
+      row: expect.objectContaining({
+        name: before!.name,
+        defaultBranch: "develop",
+      }),
+    });
+  });
+
+  it("allows a patch touching only other fields even with referencing tasks", async () => {
+    const fixtures = await seedFixtures(h.db, "RENR4");
+    await seedTask(h.db, fixtures, { jiraKey: "RENR4-1", state: "NEEDS_SPEC" });
+
+    const result = await updateRepository(h.db, fixtures.repositoryId, {
+      defaultBranch: "develop",
+    });
+
+    expect(result).toEqual({
+      status: "updated",
+      row: expect.objectContaining({ defaultBranch: "develop" }),
+    });
+  });
+
+  it("returns not_found for an unknown id", async () => {
+    const result = await updateRepository(
+      h.db,
+      "00000000-0000-0000-0000-000000000000",
+      { name: "does-not-matter" },
+    );
+    expect(result).toEqual({ status: "not_found" });
+  });
+
+  it("is race-safe: a rename blocks behind an uncommitted referencing task insert, then sees it and blocks instead of renaming (AC4, F3)", async () => {
+    const project = await insertProject(h.db, projectInput("RENR5"));
+    const repo = await insertRepository(h.db, repoInput(project.id, "renr5-old"));
+
+    let taskInserted!: () => void;
+    const taskInsertedPromise = new Promise<void>((resolve) => {
+      taskInserted = resolve;
+    });
+    let releaseInsertTx!: () => void;
+    const releaseInsertTxPromise = new Promise<void>((resolve) => {
+      releaseInsertTx = resolve;
+    });
+
+    // The insert's FK check takes a FOR KEY SHARE lock on the repository row
+    // and holds it for the life of this transaction, uncommitted.
+    const insertTxPromise = h.db.transaction(async (tx) => {
+      await insertTaskRow(tx, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "RENR5-1",
+      });
+      taskInserted();
+      await releaseInsertTxPromise;
+    });
+    insertTxPromise.catch(() => {});
+
+    await taskInsertedPromise;
+
+    let renameSettled = false;
+    const renamePromise = updateRepository(h.db, repo.id, {
+      name: "renr5-new",
+    }).then((result) => {
+      renameSettled = true;
+      return result;
+    });
+    renamePromise.catch(() => {});
+
+    // updateRepository's own `SELECT ... FOR UPDATE` on the repository row
+    // conflicts with the insert transaction's FOR KEY SHARE lock: it must
+    // still be pending while that transaction holds the lock uncommitted.
+    await sleep(200);
+    expect(renameSettled).toBe(false);
+
+    releaseInsertTx();
+    await insertTxPromise;
+
+    const result = await renamePromise;
+    expect(result).toEqual({ status: "blocked", taskCount: 1 });
+    const after = await getRepositoryById(h.db, repo.id);
+    expect(after?.name).toBe("renr5-old");
   });
 });
 

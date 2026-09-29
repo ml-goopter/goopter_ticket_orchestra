@@ -1110,3 +1110,182 @@ describe("WorktreeManager recorded worktree paths (C33)", () => {
     });
   }
 });
+
+describe("WorktreeManager.listBareClones (GOT.63)", () => {
+  it("lists a real bare clone as a directory entry, name without .git", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+
+    expect(await manager.listBareClones()).toEqual([
+      { name: repository.name, isSymlink: false },
+    ]);
+  });
+
+  it("returns nothing when repos/ does not exist yet", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    expect(await manager.listBareClones()).toEqual([]);
+  });
+
+  it("ignores an entry under repos/ that does not end in .git", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+    const reposDir = path.join(workspaceRoot, "repos");
+    await fs.mkdir(path.join(reposDir, "not-a-clone"));
+    await fs.writeFile(path.join(reposDir, "readme.txt"), "hi");
+
+    expect(await manager.listBareClones()).toEqual([
+      { name: repository.name, isSymlink: false },
+    ]);
+  });
+
+  it("reports a symlinked repos/ entry without following it", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+    const reposDir = path.join(workspaceRoot, "repos");
+    const linkTarget = path.join(tmp, "elsewhere.git");
+    await fs.mkdir(linkTarget);
+    await fs.symlink(linkTarget, path.join(reposDir, "linked_repo.git"), "dir");
+
+    const clones = await manager.listBareClones();
+    expect(clones).toContainEqual({ name: repository.name, isSymlink: false });
+    expect(clones).toContainEqual({ name: "linked_repo", isSymlink: true });
+    expect(clones).toHaveLength(2);
+  });
+});
+
+describe("WorktreeManager.withRepositoryLock removeBareClone (GOT.63)", () => {
+  /** Prepares `work/<executionId>`, then removes it and prunes git's record. */
+  async function cloneWithoutWorktrees(manager: WorktreeManager): Promise<void> {
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    await manager.remove(prepared.worktreePath, {
+      repositoryName: repository.name,
+      branch: prepared.branch,
+    });
+  }
+
+  it("deletes the bare clone directory entirely", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await cloneWithoutWorktrees(manager);
+    expect(existsSync(bareClonePath())).toBe(true);
+
+    const result = await manager.withRepositoryLock(repository.name, (repo) =>
+      repo.removeBareClone([]),
+    );
+
+    expect(result).toEqual({ removed: true, usedBy: [] });
+    expect(existsSync(bareClonePath())).toBe(false);
+    expect(await manager.listBareClones()).toEqual([]);
+  });
+
+  it("succeeds when the bare clone is already gone", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await expect(
+      manager.withRepositoryLock(repository.name, (repo) => repo.removeBareClone([])),
+    ).resolves.toEqual({ removed: true, usedBy: [] });
+  });
+
+  it("F1: keeps the clone while a work/ worktree's .git points into it", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    writeFileSyncIn(prepared.worktreePath, "unpushed.txt", "x");
+    git(prepared.worktreePath, "add", "unpushed.txt");
+    git(prepared.worktreePath, "commit", "-q", "-m", "unpushed");
+
+    const result = await manager.withRepositoryLock(repository.name, (repo) =>
+      repo.removeBareClone([]),
+    );
+
+    expect(result).toEqual({ removed: false, usedBy: [prepared.worktreePath] });
+    expect(existsSync(bareClonePath())).toBe(true);
+    expect(gitOk(prepared.worktreePath, "status")).toBe(true);
+  });
+
+  it("F1: keeps the clone when the worktree's admin entry was pruned but its .git still points in", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    await fs.rm(path.join(bareClonePath(), "worktrees"), { recursive: true, force: true });
+
+    const result = await manager.withRepositoryLock(repository.name, (repo) =>
+      repo.removeBareClone([]),
+    );
+
+    expect(result).toEqual({ removed: false, usedBy: [prepared.worktreePath] });
+    expect(existsSync(bareClonePath())).toBe(true);
+  });
+
+  it("F1: keeps the clone when a recorded worktree's directory is gone but the clone's worktrees/ entry still names it", async () => {
+    // The workspace root is reached through a symlink, so the recorded path
+    // and git's own (canonical) record of it differ as strings.
+    const real = path.join(tmp, "real-root");
+    await fs.mkdir(real);
+    const linked = path.join(tmp, "linked-root");
+    await fs.symlink(real, linked, "dir");
+    const root = path.join(linked, "workspace");
+    const manager = new WorktreeManager({ workspaceRoot: root });
+    const prepared = await manager.prepareImplementation(implInput("exec-1"));
+    // Deleted without `git worktree prune`: only git's admin entry and the
+    // execution row still know the worktree.
+    await fs.rm(prepared.worktreePath, { recursive: true, force: true });
+    const clone = path.join(root, "repos", `${repository.name}.git`);
+
+    const result = await manager.withRepositoryLock(repository.name, (repo) =>
+      repo.removeBareClone([prepared.worktreePath]),
+    );
+
+    expect(result).toEqual({ removed: false, usedBy: [prepared.worktreePath] });
+    expect(existsSync(clone)).toBe(true);
+  });
+
+  it("removes the clone when a recorded path is not one of its worktrees", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await cloneWithoutWorktrees(manager);
+
+    const result = await manager.withRepositoryLock(repository.name, (repo) =>
+      repo.removeBareClone([path.join(workspaceRoot, "work", "exec-1")]),
+    );
+
+    expect(result).toEqual({ removed: true, usedBy: [] });
+    expect(existsSync(bareClonePath())).toBe(false);
+  });
+
+  it("a work/ worktree of another clone does not keep this one", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await cloneWithoutWorktrees(manager);
+    const other = { ...repository, name: "other_repo" };
+    const kept = await manager.prepareSpec({ executionId: "exec-other", repository: other });
+
+    const result = await manager.withRepositoryLock(repository.name, (repo) =>
+      repo.removeBareClone([kept.worktreePath]),
+    );
+
+    expect(result).toEqual({ removed: true, usedBy: [] });
+    expect(existsSync(bareClonePath())).toBe(false);
+    expect(existsSync(path.join(workspaceRoot, "repos", "other_repo.git"))).toBe(true);
+    expect(gitOk(kept.worktreePath, "status")).toBe(true);
+  });
+});
+
+describe("WorktreeManager repository lock key (GOT.63 F2)", () => {
+  it("serialises names that differ only by case", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const first = manager.withRepositoryLock("Casey", async () => {
+      order.push("Casey start");
+      await gate;
+      order.push("Casey end");
+    });
+    const second = manager.withRepositoryLock("casey", async () => {
+      order.push("casey start");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await Promise.all([first, second]);
+
+    expect(order).toEqual(["Casey start", "Casey end", "casey start"]);
+  });
+});

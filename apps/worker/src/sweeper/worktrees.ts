@@ -4,11 +4,14 @@ import {
   clearExecutionWorktree,
   listApprovedSpecWorktrees,
   listContainerExecutions,
+  listExecutionWorktreePaths,
+  listRepositoryNames,
   listWorktreeCandidates,
   lockApprovedSpecWorktree,
   lockContainerExecution,
   lockWorktreeCandidate,
   markWorktreeEvicted,
+  repositoryNameExists,
   type ApprovedSpecWorktree,
   type ContainerExecution,
   type Db,
@@ -24,7 +27,7 @@ import {
 } from "../containers/index.js";
 import type { Logger } from "../logger.js";
 import type { Phase } from "../tick.js";
-import { WorktreeManager } from "../worktrees/manager.js";
+import { WorktreeManager, type BareCloneEntry } from "../worktrees/manager.js";
 
 /** §6.6 rules one and two: finished worktrees are kept for 24 hours. */
 export const FINISHED_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -32,7 +35,10 @@ export const FINISHED_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const IDLE_EVICTION_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** The `WorktreeManager` methods the sweeper uses. */
-export type WorktreeOps = Pick<WorktreeManager, "withRepositoryLock" | "pushIfAhead">;
+export type WorktreeOps = Pick<
+  WorktreeManager,
+  "withRepositoryLock" | "pushIfAhead" | "listBareClones"
+>;
 
 /** Percentage (0-100) of the filesystem holding `workspaceRoot` in use. */
 export type DiskUsage = (workspaceRoot: string) => Promise<number>;
@@ -204,6 +210,19 @@ async function removeContainerGuarded(
  * while holding a row lock, so the order is not inverted anywhere. The
  * orphan pass takes the task row, then the execution row, and no
  * repository lock.
+ *
+ * GOT.63's deleted-repository clone pass (`sweepDeletedRepositoryClones`,
+ * below) takes no row lock at all, task, execution or otherwise: a
+ * `repositories` row has no worktree candidate hanging off it for this
+ * sweep to lock. It takes only the worktree manager's per-repository lock,
+ * keyed on the clone's directory name, then unlocked reads of
+ * `repositoryNameExists` and `listExecutionWorktreePaths` as its recheck,
+ * then the worktree-metadata check and the filesystem removal, all before
+ * releasing that lock. Because it holds no database lock at any
+ * point, it cannot invert against anything above; it can only ever wait
+ * behind, or make wait, a `prepareImplementation`, `prepareSpec` or
+ * `pushIfAhead` call on the same repository name, which is exactly the
+ * serialisation that lock exists for.
  *
  * No docker call runs inside a transaction or under the repository lock, so
  * a slow or hung daemon never holds a row or a repository. The container
@@ -444,6 +463,8 @@ export async function sweepWorktrees(
 
   if (containers) await sweepOrphanContainers({ db, logger }, containers, options.isLive);
 
+  await sweepDeletedRepositoryClones(db, worktrees, logger);
+
   // Rule four.
   const threshold = input.diskHighWaterPct;
   try {
@@ -542,6 +563,82 @@ async function sweepOrphanContainers(
       }
     } catch (err) {
       logger.warn({ ...fields, err: errMessage(err) }, "agent container removal failed");
+    }
+  }
+}
+
+/**
+ * GOT.63, one pass: a bare clone directory under `repos/` whose name
+ * matches no repository row, in any project and ignoring case, is a
+ * removal candidate (design.md D7 keys the clone on name alone).
+ *
+ * A missing row does not mean nothing uses the clone. PATCH
+ * /repositories/:id can rename a repository that tasks still use, leaving
+ * their worktrees under `work/` pointing into the old-name clone, and a
+ * worktree can outlive every row that named it. So the clone is kept, and
+ * a warning logged, while any worktree still uses it: a directory under
+ * `work/`, or an execution's recorded `worktree_path` under `work/`, whose
+ * `.git` resolves into the clone or which the clone's `worktrees/` admin
+ * directory records (`LockedRepository.removeBareClone`).
+ *
+ * Lists `repos/` once, unlocked, logs and skips any symlinked entry there
+ * without following it, and keeps a directory a current repository still
+ * names. For the rest it takes the worktree manager's per-repository lock,
+ * keyed on the directory's name (case-insensitively, as every caller's
+ * is), and under it re-reads `repositoryNameExists`, then the executions'
+ * `worktree_path`s, then checks git's worktree metadata and removes: a
+ * repository recreated with that name, and being cloned or fetched under
+ * that same lock, is never deleted. No database row lock is held at any
+ * point in this pass, only that in-process lock. A clone that fails to
+ * remove is logged and the rest of the sweep continues. Never throws.
+ */
+async function sweepDeletedRepositoryClones(
+  db: Db,
+  worktrees: WorktreeOps,
+  logger: Logger,
+): Promise<void> {
+  let clones: BareCloneEntry[];
+  try {
+    clones = await worktrees.listBareClones();
+  } catch (err) {
+    logger.error({ err: errMessage(err) }, "bare clone list failed");
+    return;
+  }
+
+  const candidates: string[] = [];
+  for (const clone of clones) {
+    if (clone.isSymlink) {
+      logger.warn({ name: clone.name }, "repos entry is a symlink, skipped");
+      continue;
+    }
+    candidates.push(clone.name);
+  }
+  if (candidates.length === 0) return;
+
+  let names: Set<string>;
+  try {
+    names = await listRepositoryNames(db);
+  } catch (err) {
+    logger.error({ err: errMessage(err) }, "repository name list failed");
+    return;
+  }
+
+  // F2: on a case-insensitive filesystem repository `Casey` uses `casey.git`.
+  const inUse = new Set([...names].map((n) => n.toLowerCase()));
+  for (const name of candidates) {
+    if (inUse.has(name.toLowerCase())) continue;
+    try {
+      const outcome = await worktrees.withRepositoryLock(name, async (repo) => {
+        if (await repositoryNameExists(db, name)) return null;
+        return repo.removeBareClone(await listExecutionWorktreePaths(db));
+      });
+      if (outcome?.removed) {
+        logger.info({ name }, "deleted repository's bare clone removed");
+      } else if (outcome && outcome.usedBy.length > 0) {
+        logger.warn({ name, worktrees: outcome.usedBy }, "bare clone kept, worktrees still use it");
+      }
+    } catch (err) {
+      logger.error({ name, err: errMessage(err) }, "bare clone removal failed");
     }
   }
 }
