@@ -46,6 +46,7 @@ import {
   hashToken,
   type ExecutionRegistry,
 } from "../src/agent-tools/index.js";
+import { renewExecutionLease } from "../src/agent-tools/lease.js";
 import { loadConfig } from "../src/config.js";
 import type { LogFields, Logger } from "../src/logger.js";
 import { createDefaultPhases } from "../src/phases/index.js";
@@ -121,11 +122,19 @@ afterAll(async () => {
 
 let runner: Runner | undefined;
 
+/**
+ * GOT.78: TRUNCATE locks the tables it names in order, then the cascaded
+ * ones, and cascades reach `tasks` and `executions` before `task_leases`. A
+ * lease renewal locks `task_leases`, then `executions`. Naming `task_leases`
+ * first gives the reset the renewal's order, so a renewal still in flight
+ * from the previous test cannot deadlock it (40P01).
+ */
+const RESET_TABLES_SQL =
+  "truncate table task_leases, projects, agent_workers, audit_events, users restart identity cascade";
+
 beforeEach(async () => {
   records.length = 0;
-  await db.$client.unsafe(
-    "truncate table projects, agent_workers, audit_events, users restart identity cascade",
-  );
+  await db.$client.unsafe(RESET_TABLES_SQL);
 });
 
 afterEach(async () => {
@@ -1711,5 +1720,195 @@ describe("shutdown (§15.2)", () => {
     // No state change on shutdown: the lease sweeper owns what happens next.
     expect((await execution(s.executionId)).state).toBe("RUNNING");
     await expectCleanedUp(h, s.executionId);
+  });
+});
+
+describe("no lease renewal outlives the run (§6.4, GOT.78)", () => {
+  let holder: { release: () => void; done: Promise<unknown> } | undefined;
+
+  // A failed assertion must not leave the row held into the next test.
+  afterEach(async () => {
+    holder?.release();
+    await holder?.done;
+    holder = undefined;
+  });
+
+  /**
+   * Holds the lease row in another transaction, so every renewal of
+   * `executionId` waits on it until `release()`.
+   */
+  async function holdLeaseRow(executionId: string) {
+    let holding!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>((r) => (holding = r));
+    const released = new Promise<void>((r) => (release = r));
+    const done = db.$client.begin(async (sql) => {
+      await sql`select 1 from task_leases where execution_id = ${executionId} for update`;
+      holding();
+      await released;
+    });
+    await held;
+    holder = { release, done };
+    return holder;
+  }
+
+  const renewalsWaiting = async (): Promise<number> => {
+    const [row] = await db.$client.unsafe<{ n: number }[]>(
+      `select count(*)::int as n from pg_stat_activity
+        where query ilike 'update "task_leases"%' and state = 'active' and wait_event_type = 'Lock'`,
+    );
+    return row!.n;
+  };
+  const renewalsActive = async (): Promise<number> => {
+    const [row] = await db.$client.unsafe<{ n: number }[]>(
+      `select count(*)::int as n from pg_stat_activity
+        where query ilike 'update "task_leases"%' and state = 'active'`,
+    );
+    return row!.n;
+  };
+
+  /**
+   * Every blocked renewal holds a pooled connection (10 by default), so the
+   * period is long enough that only a few pile up behind the held row.
+   */
+  const RENEW_MS = 200;
+
+  /** How long a settled promise gets to show it: the old code took a few ms. */
+  const SETTLE_WINDOW_MS = 300;
+  const settledWithin = (p: Promise<unknown>): Promise<boolean> =>
+    Promise.race([p.then(() => true), sleep(SETTLE_WINDOW_MS).then(() => false)]);
+
+  it("start() does not resolve while a renewal started during the run is in flight", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId, leaseRenewMs: RENEW_MS });
+    let sessionUp!: () => void;
+    const up = new Promise<void>((r) => (sessionUp = r));
+    let endBody!: () => void;
+    const bodyMayEnd = new Promise<void>((r) => (endBody = r));
+    let adapterDone = false;
+    h.adapter.script = async function* ({ executionId }) {
+      try {
+        yield { type: "session", sessionId: "sess-l1" };
+        sessionUp();
+        await bodyMayEnd;
+        await completeViaTool(executionId);
+        yield { type: "turn_done", finalText: "done" };
+      } finally {
+        adapterDone = true;
+      }
+    };
+    const run = h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+    await up;
+    const lease = await holdLeaseRow(s.executionId);
+    await waitFor(async () => ((await renewalsWaiting()) > 0 ? true : undefined), {
+      everyMs: 20,
+      what: "a renewal to wait on the lease row",
+    });
+
+    endBody();
+    await waitFor(async () => (adapterDone ? true : undefined), { everyMs: 20, what: "the session to end" });
+    expect((await execution(s.executionId)).state).toBe("COMPLETED");
+    expect(await settledWithin(run)).toBe(false);
+    // finalize has not run either: it follows the lease wrapper.
+    expect((await execution(s.executionId)).toolsTokenHash).not.toBeNull();
+
+    lease.release();
+    await lease.done;
+    await run;
+    expect(await renewalsActive()).toBe(0);
+    await expectCleanedUp(h, s.executionId);
+  });
+
+  it("shutdown() does not resolve while a renewal of an aborted run is in flight", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId, leaseRenewMs: RENEW_MS });
+    let sessionUp!: () => void;
+    const up = new Promise<void>((r) => (sessionUp = r));
+    h.adapter.script = async function* ({ signal }) {
+      yield { type: "session", sessionId: "sess-l2" };
+      sessionUp();
+      await aborted(signal);
+    };
+    void h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+    await up;
+    await waitFor(async () =>
+      (await execution(s.executionId)).state === "RUNNING" ? true : undefined,
+    );
+    const before = await leaseExpiry(s.executionId);
+    const lease = await holdLeaseRow(s.executionId);
+    await waitFor(async () => ((await renewalsWaiting()) > 0 ? true : undefined), {
+      everyMs: 20,
+      what: "a renewal to wait on the lease row",
+    });
+
+    const stopping = h.runner.shutdown(10_000);
+    expect(h.adapter.signals[0]!.aborted).toBe(true);
+    expect(await settledWithin(stopping)).toBe(false);
+
+    lease.release();
+    await lease.done;
+    await stopping;
+    // Every renewal has settled: none is running, and the held one landed.
+    expect(await renewalsActive()).toBe(0);
+    expect((await leaseExpiry(s.executionId))!.getTime()).toBeGreaterThan(before!.getTime());
+    expect((await execution(s.executionId)).state).toBe("RUNNING");
+    await expectCleanedUp(h, s.executionId);
+  });
+});
+
+describe("test reset lock order (GOT.78)", () => {
+  /** Resolves once a backend running `queryPrefix` waits on a relation lock. */
+  const lockWait = (queryPrefix: string, relation?: string) =>
+    waitFor(
+      async () => {
+        const rows = await db.$client.unsafe<{ rel: string }[]>(
+          `select l.relation::regclass::text as rel
+             from pg_locks l join pg_stat_activity a on a.pid = l.pid
+            where a.query ilike $1 and l.locktype = 'relation' and not l.granted`,
+          [`${queryPrefix}%`],
+        );
+        const row = rows.find((r) => relation === undefined || r.rel === relation);
+        return row ? true : undefined;
+      },
+      { everyMs: 20, what: `${queryPrefix} to wait on a lock` },
+    );
+
+  // A lease renewal can still be in flight when the next test's reset runs:
+  // before GOT.78 the runner left its interval renewal running past the run,
+  // and a run that outlives `shutdown(timeoutMs)` still renews. The renewal
+  // locks task_leases, then executions (its EXISTS subquery). The reset must
+  // lock them in the same order or the two deadlock (40P01).
+  it("the reset and a lease renewal still in flight do not deadlock", async () => {
+    const s = await seedClaimed();
+    let holding!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>((r) => (holding = r));
+    const released = new Promise<void>((r) => (release = r));
+    // Holds ACCESS SHARE on executions, so the reset queues there: the point
+    // where, under load, it overtook the renewal between its two locks.
+    const holder = db.$client.begin(async (sql) => {
+      await sql`select 1 from executions limit 1`;
+      holding();
+      await released;
+    });
+    await held;
+
+    const outcome = (p: PromiseLike<unknown>) =>
+      Promise.resolve(p).then(
+        () => "ok",
+        (err: unknown) => {
+          // Drizzle wraps the driver's error in `cause`.
+          const e = err as { code?: string; cause?: { code?: string } };
+          return e.code ?? e.cause?.code ?? String(err);
+        },
+      );
+    const reset = outcome(db.$client.unsafe(RESET_TABLES_SQL));
+    await lockWait("truncate", "executions");
+    const renewal = outcome(renewExecutionLease(db, s.executionId, new Date()));
+    await lockWait('update "task_leases"');
+
+    release();
+    await holder;
+    expect(await Promise.all([reset, renewal])).toEqual(["ok", "ok"]);
   });
 });
