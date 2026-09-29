@@ -585,3 +585,25 @@ export async function seedNotification(
   if (!row) throw new Error("seedNotification: insert returned no row");
   return row.id;
 }
+
+/**
+ * Resolves once at least `n` backends in the test database are blocked on
+ * a lock, so a race test knows the second side has reached the contended
+ * row before it releases the first side.
+ */
+export async function waitForLockWaiters(
+  testDb: TestDb,
+  n: number,
+  timeoutMs = 10000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const [row] = await testDb.sql<{ count: number }[]>`
+      select count(*)::int as count from pg_stat_activity
+      where wait_event_type = 'Lock' and datname = current_database()
+    `;
+    if ((row?.count ?? 0) >= n) return;
+    if (Date.now() > deadline) throw new Error("waitForLockWaiters timed out");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}

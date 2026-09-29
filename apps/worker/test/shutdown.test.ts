@@ -4,6 +4,11 @@ import { fileURLToPath } from "node:url";
 import { agentWorkers } from "@orchestra/db";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startTestDb, waitFor, type TestDb } from "./harness.js";
+import {
+  killAllTrackedWorkersAndAssertNoneSurvive,
+  killWorkerTree,
+  spawnWorkerProcess,
+} from "./worker-process.js";
 
 const tsxCli = fileURLToPath(
   new URL("./dist/cli.mjs", import.meta.resolve("tsx/package.json")),
@@ -12,7 +17,6 @@ const entry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 const workerDir = fileURLToPath(new URL("..", import.meta.url));
 
 let testDb: TestDb;
-const spawned: ChildProcess[] = [];
 
 /** A loopback port that was free a moment ago, so the child's tools server can bind it. */
 function freePort(): Promise<number> {
@@ -36,7 +40,7 @@ async function startWorker(
   host: string,
   env: Record<string, string> = { AGENT_CONTAINER_IMAGE: ABSENT_AGENT_IMAGE },
 ): Promise<ChildProcess> {
-  const child = spawn(process.execPath, [tsxCli, entry], {
+  const child = spawnWorkerProcess(process.execPath, [tsxCli, entry], {
     cwd: workerDir,
     stdio: ["ignore", "pipe", "pipe"],
     env: {
@@ -49,7 +53,6 @@ async function startWorker(
       ...env,
     },
   });
-  spawned.push(child);
   return child;
 }
 
@@ -68,7 +71,10 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  for (const child of spawned) if (child.exitCode === null) child.kill("SIGKILL");
+  // Force-kills every worker this file spawned, including the grandchild
+  // tsx spawns to actually run the entry point, and asserts (GOT.92) that
+  // none survives -- whatever the tests above did or didn't clean up.
+  await killAllTrackedWorkersAndAssertNoneSurvive();
   await testDb?.stop();
 });
 
@@ -96,7 +102,7 @@ describe("worker entry point (design.md §15.2)", () => {
     expect(row.maxConcurrent).toBe(2);
 
     const exited = exitOf(child);
-    child.kill("SIGTERM");
+    killWorkerTree(child, "SIGTERM");
 
     const result = await Promise.race([
       exited,
@@ -148,19 +154,18 @@ describe("worker entry point (design.md §15.2)", () => {
       );
 
       const exited = exitOf(child);
-      child.kill("SIGTERM");
+      killWorkerTree(child, "SIGTERM");
       expect(await exited).toEqual({ code: 0, signal: null });
     },
   );
 
   it("fails fast with a named variable when DATABASE_URL is missing", async () => {
     const stderr: string[] = [];
-    const child = spawn(process.execPath, [tsxCli, entry], {
+    const child = spawnWorkerProcess(process.execPath, [tsxCli, entry], {
       cwd: workerDir,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, DATABASE_URL: "" },
     });
-    spawned.push(child);
     child.stderr?.on("data", (c) => stderr.push(String(c)));
     child.stdout?.on("data", (c) => stderr.push(String(c)));
 

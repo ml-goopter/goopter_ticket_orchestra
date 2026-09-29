@@ -5,7 +5,9 @@ import {
   repositories,
   sessions,
   tasks,
+  updateAdminUser,
   users,
+  type Db,
 } from "@orchestra/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -14,6 +16,7 @@ import {
   createClock,
   seedUser,
   startTestDb,
+  waitForLockWaiters,
   type Clock,
   type TestDb,
 } from "./harness.js";
@@ -1027,6 +1030,111 @@ describe("admin routes", () => {
     });
   });
 
+  describe("PATCH /api/repositories/:id rename guard (GOT.63-fix2, D7)", () => {
+    it("renames a repository with no referencing tasks", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "RENA1" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "rena1-old",
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+        payload: { name: "rena1-new" },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().name).toBe("rena1-new");
+    });
+
+    it("returns 409 with the reason and task count, applying nothing, when a task references the repository", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "RENA2" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "rena2-old",
+      });
+      await seedTask(testDb.db, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "RENA2-1",
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+        payload: { name: "rena2-new", default_branch: "develop" },
+      });
+      expect(res.statusCode).toBe(409);
+      const body = res.json();
+      expect(body.error.code).toBe("REPOSITORY_IN_USE");
+      expect(body.error.task_count).toBe(1);
+      expect(typeof body.error.message).toBe("string");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+      });
+      const getBody = getRes.json();
+      expect(getBody.name).toBe("rena2-old");
+      expect(getBody.default_branch).toBe("main");
+    });
+
+    it("allows a PATCH sending the unchanged name even with referencing tasks", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "RENA3" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "rena3-repo",
+      });
+      await seedTask(testDb.db, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "RENA3-1",
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+        payload: { name: "rena3-repo", default_branch: "develop" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.name).toBe("rena3-repo");
+      expect(body.default_branch).toBe("develop");
+    });
+
+    it("allows a PATCH touching only other fields even with referencing tasks", async () => {
+      const app = await withAuthedApp();
+      const project = await seedProject(testDb.db, { key: "RENA4" });
+      const repo = await seedRepository(testDb.db, {
+        projectId: project.id,
+        name: "rena4-repo",
+      });
+      await seedTask(testDb.db, {
+        projectId: project.id,
+        repositoryId: repo.id,
+        jiraKey: "RENA4-1",
+      });
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/repositories/${repo.id}`,
+        headers: { cookie },
+        payload: { default_branch: "develop" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.name).toBe("rena4-repo");
+      expect(body.default_branch).toBe("develop");
+    });
+  });
+
   describe("users (AC3)", () => {
     it("creates a user who can then log in, and never leaks password_hash", async () => {
       const app = await withAuthedApp();
@@ -1110,35 +1218,19 @@ describe("admin routes", () => {
       expect(res.statusCode).toBe(400);
     });
 
-    it("rejects a `disabled` field with 400 and writes nothing, but display_name still updates (R3, AC5)", async () => {
+    it("PATCH still applies display_name on its own, unaffected by disabled (AC5)", async () => {
       const app = await withAuthedApp();
       const createRes = await app.inject({
         method: "POST",
         url: "/api/users",
         headers: { cookie },
         payload: {
-          email: "notoggle@example.com",
+          email: "renameonly@example.com",
           password: "a very long password",
-          display_name: "No Toggle",
+          display_name: "Before",
         },
       });
       const created = createRes.json();
-
-      const patchRes = await app.inject({
-        method: "PATCH",
-        url: `/api/users/${created.id}`,
-        headers: { cookie },
-        payload: { disabled: true },
-      });
-      expect(patchRes.statusCode).toBe(400);
-
-      const getRes = await app.inject({
-        method: "GET",
-        url: `/api/users/${created.id}`,
-        headers: { cookie },
-      });
-      expect(getRes.json().disabled_at).toBeNull();
-      expect(getRes.json().display_name).toBe("No Toggle");
 
       const renameRes = await app.inject({
         method: "PATCH",
@@ -1149,6 +1241,357 @@ describe("admin routes", () => {
       expect(renameRes.statusCode).toBe(200);
       expect(renameRes.json().display_name).toBe("Still Works");
       expect(renameRes.json().disabled_at).toBeNull();
+    });
+
+    it("rejects an empty display_name on PATCH with 400 (disabled keeps its own validation)", async () => {
+      const app = await withAuthedApp();
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/users",
+        headers: { cookie },
+        payload: {
+          email: "badpatch@example.com",
+          password: "a very long password",
+          display_name: "Fine",
+        },
+      });
+      const created = createRes.json();
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/users/${created.id}`,
+        headers: { cookie },
+        payload: { display_name: "" },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("disables and re-enables a user, gating login and rejecting an in-flight session (D-GOT.61)", async () => {
+      const app = await withAuthedApp();
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/users",
+        headers: { cookie },
+        payload: {
+          email: "togglable@example.com",
+          password: "a very long password",
+          display_name: "Togglable",
+        },
+      });
+      const created = createRes.json();
+
+      const loginRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "togglable@example.com", password: "a very long password" },
+      });
+      const targetCookie = extractCookie(loginRes.headers["set-cookie"]);
+
+      const meBeforeRes = await app.inject({
+        method: "GET",
+        url: "/api/auth/me",
+        headers: { cookie: targetCookie },
+      });
+      expect(meBeforeRes.statusCode).toBe(200);
+
+      const disableRes = await app.inject({
+        method: "PATCH",
+        url: `/api/users/${created.id}`,
+        headers: { cookie },
+        payload: { disabled: true },
+      });
+      expect(disableRes.statusCode).toBe(200);
+      expect(disableRes.json().disabled_at).not.toBeNull();
+      expect(disableRes.json()).not.toHaveProperty("password_hash");
+
+      // The disabled user's already-issued session stops authorizing on its
+      // very next request -- no session row was deleted, the auth
+      // preHandler checked disabled_at live.
+      const meAfterDisableRes = await app.inject({
+        method: "GET",
+        url: "/api/auth/me",
+        headers: { cookie: targetCookie },
+      });
+      expect(meAfterDisableRes.statusCode).toBe(401);
+
+      const loginAfterDisableRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: {
+          email: "togglable@example.com",
+          password: "a very long password",
+        },
+      });
+      // Same 401 body as a wrong password (design.md §13, AC2).
+      expect(loginAfterDisableRes.statusCode).toBe(401);
+
+      const enableRes = await app.inject({
+        method: "PATCH",
+        url: `/api/users/${created.id}`,
+        headers: { cookie },
+        payload: { disabled: false },
+      });
+      expect(enableRes.statusCode).toBe(200);
+      expect(enableRes.json().disabled_at).toBeNull();
+
+      const loginAfterEnableRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: {
+          email: "togglable@example.com",
+          password: "a very long password",
+        },
+      });
+      expect(loginAfterEnableRes.statusCode).toBe(200);
+
+      // Re-enabling does not resurrect the old (pre-disable) session.
+      const meWithOldCookieRes = await app.inject({
+        method: "GET",
+        url: "/api/auth/me",
+        headers: { cookie: targetCookie },
+      });
+      expect(meWithOldCookieRes.statusCode).toBe(401);
+    });
+
+    it("a login past password verification when a disable commits is refused and leaves no session (GOT.61 F1)", async () => {
+      const app = await withAuthedApp();
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/users",
+        headers: { cookie },
+        payload: {
+          email: "login-race@example.com",
+          password: "a very long password",
+          display_name: "Login Race",
+        },
+      });
+      const targetId: string = createRes.json().id;
+
+      let disabled!: () => void;
+      const disabledPromise = new Promise<void>((resolve) => (disabled = resolve));
+      let release!: () => void;
+      const releasePromise = new Promise<void>((resolve) => (release = resolve));
+
+      // The real disable, held open uncommitted: `updateAdminUser` runs in
+      // a savepoint of this outer transaction, so its row locks stay held
+      // until the barrier releases the outer commit.
+      const disableTx = testDb.db.transaction(async (tx) => {
+        const result = await updateAdminUser(
+          tx as unknown as Db,
+          targetId,
+          { disabled: true },
+          clock.now(),
+        );
+        expect(result.status).toBe("ok");
+        disabled();
+        await releasePromise;
+      });
+      disableTx.catch(() => {});
+      await disabledPromise;
+
+      // The login reads the still-enabled row, verifies the password, and
+      // reaches its session insert while the disable is uncommitted.
+      const login = app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "login-race@example.com", password: "a very long password" },
+      });
+      await waitForLockWaiters(testDb, 1);
+
+      release();
+      await disableTx;
+      const loginRes = await login;
+
+      expect(loginRes.statusCode).toBe(401);
+      expect(loginRes.json().error.code).toBe("INVALID_CREDENTIALS");
+      expect(loginRes.headers["set-cookie"]).toBeUndefined();
+      const remaining = await testDb.sql<{ count: number }[]>`
+        select count(*)::int as count from sessions where user_id = ${targetId}
+      `;
+      expect(remaining[0]!.count).toBe(0);
+    });
+
+    it("disabling an already-disabled user is a no-op: disabled_at is unchanged", async () => {
+      const app = await withAuthedApp();
+      const createRes = await app.inject({
+        method: "POST",
+        url: "/api/users",
+        headers: { cookie },
+        payload: {
+          email: "idempotent@example.com",
+          password: "a very long password",
+          display_name: "Idempotent",
+        },
+      });
+      const created = createRes.json();
+
+      const firstDisableRes = await app.inject({
+        method: "PATCH",
+        url: `/api/users/${created.id}`,
+        headers: { cookie },
+        payload: { disabled: true },
+      });
+      const firstDisabledAt = firstDisableRes.json().disabled_at;
+
+      const secondDisableRes = await app.inject({
+        method: "PATCH",
+        url: `/api/users/${created.id}`,
+        headers: { cookie },
+        payload: { disabled: true },
+      });
+      expect(secondDisableRes.statusCode).toBe(200);
+      expect(secondDisableRes.json().disabled_at).toBe(firstDisabledAt);
+    });
+
+    it("refuses to disable the caller's own account with 409", async () => {
+      const app = await withAuthedApp();
+      await app.inject({
+        method: "POST",
+        url: "/api/users",
+        headers: { cookie },
+        payload: {
+          email: "second-admin@example.com",
+          password: "a very long password",
+          display_name: "Second Admin",
+        },
+      });
+
+      const meRes = await app.inject({
+        method: "GET",
+        url: "/api/auth/me",
+        headers: { cookie },
+      });
+      const selfId = meRes.json().id;
+
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/api/users/${selfId}`,
+        headers: { cookie },
+        payload: { disabled: true },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error.code).toBe("CANNOT_DISABLE_SELF");
+
+      const getRes = await app.inject({
+        method: "GET",
+        url: `/api/users/${selfId}`,
+        headers: { cookie },
+      });
+      expect(getRes.json().disabled_at).toBeNull();
+    });
+
+    it("refuses to disable the last enabled user with 409, distinct from self-disable", async () => {
+      const app = await withAuthedApp();
+
+      // Two more users, A and B. Disable the seeded admin from A's session
+      // (not self-disable, and two others -- A and B -- stay enabled).
+      // A and B are now the only two enabled users, and neither request
+      // below targets its own caller, so a 409 here can only be the
+      // last-enabled-user check, not CANNOT_DISABLE_SELF.
+      await app.inject({
+        method: "POST",
+        url: "/api/users",
+        headers: { cookie },
+        payload: { email: "race-a@example.com", password: "a very long password", display_name: "A" },
+      });
+      await app.inject({
+        method: "POST",
+        url: "/api/users",
+        headers: { cookie },
+        payload: { email: "race-b@example.com", password: "a very long password", display_name: "B" },
+      });
+
+      async function loginCookie(email: string): Promise<string> {
+        const res = await app.inject({
+          method: "POST",
+          url: "/api/auth/login",
+          payload: { email, password: "a very long password" },
+        });
+        return extractCookie(res.headers["set-cookie"]);
+      }
+      const cookieA = await loginCookie("race-a@example.com");
+      const cookieB = await loginCookie("race-b@example.com");
+
+      const meRes = await app.inject({ method: "GET", url: "/api/auth/me", headers: { cookie } });
+      const seededAdminId = meRes.json().id;
+      const disableSeededAdminRes = await app.inject({
+        method: "PATCH",
+        url: `/api/users/${seededAdminId}`,
+        headers: { cookie: cookieA },
+        payload: { disabled: true },
+      });
+      expect(disableSeededAdminRes.statusCode).toBe(200);
+
+      const meARes = await app.inject({ method: "GET", url: "/api/auth/me", headers: { cookie: cookieA } });
+      const meBRes = await app.inject({ method: "GET", url: "/api/auth/me", headers: { cookie: cookieB } });
+      const idA = meARes.json().id;
+      const idB = meBRes.json().id;
+
+      // Barrier: hold `FOR SHARE` on both rows from a separate connection
+      // before either request starts. Both requests then pass auth and
+      // block inside their disable transaction -- with the `FOR UPDATE`,
+      // on the enabled-rows select before deciding; without it, only on
+      // the final `UPDATE users`, after both have already decided -- so
+      // releasing the barrier starts a genuine race either way.
+      let locked!: () => void;
+      const lockedPromise = new Promise<void>((resolve) => (locked = resolve));
+      let release!: () => void;
+      const releasePromise = new Promise<void>((resolve) => (release = resolve));
+      const blocker = testDb.sql.begin(async (tx) => {
+        await tx`select 1 from users where id in (${idA}, ${idB}) for share`;
+        locked();
+        await releasePromise;
+      });
+      blocker.catch(() => {});
+      await lockedPromise;
+
+      const patchAtoB = app.inject({
+        method: "PATCH",
+        url: `/api/users/${idB}`,
+        headers: { cookie: cookieA },
+        payload: { disabled: true },
+      });
+      const patchBtoA = app.inject({
+        method: "PATCH",
+        url: `/api/users/${idA}`,
+        headers: { cookie: cookieB },
+        payload: { disabled: true },
+      });
+      await waitForLockWaiters(testDb, 2);
+
+      release();
+      await blocker;
+      const [resAtoB, resBtoA] = await Promise.all([patchAtoB, patchBtoA]);
+
+      // Exactly one side wins (200); the other is refused with 409
+      // LAST_ENABLED_USER. Both passed auth before the barrier lifted, so
+      // the loser can only be the invariant refusal. (Not a status-code
+      // sort: the winner is identified by its status instead.)
+      const attempts = [
+        { res: resAtoB, cookie: cookieA },
+        { res: resBtoA, cookie: cookieB },
+      ];
+      const winners = attempts.filter((a) => a.res.statusCode === 200);
+      const losers = attempts.filter((a) => a.res.statusCode !== 200);
+      expect(winners).toHaveLength(1);
+      expect(losers).toHaveLength(1);
+      expect(losers[0]!.res.statusCode).toBe(409);
+      expect(losers[0]!.res.json().error.code).toBe("LAST_ENABLED_USER");
+
+      // `cookie` (the seeded admin's own session) no longer authorizes:
+      // disabling the seeded admin earlier in this test deleted it. The
+      // winner's session is still live (it is the one user left enabled),
+      // so it lists instead.
+      const listRes = await app.inject({
+        method: "GET",
+        url: "/api/users",
+        headers: { cookie: winners[0]!.cookie },
+      });
+      const disabledAmongAB = listRes
+        .json()
+        .filter((u: { id: string }) => u.id === idA || u.id === idB)
+        .filter((u: { disabled_at: string | null }) => u.disabled_at !== null);
+      expect(disabledAmongAB).toHaveLength(1);
     });
   });
 

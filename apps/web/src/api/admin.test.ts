@@ -367,7 +367,7 @@ describe("createAdminApi", () => {
       });
     });
 
-    it("patchUser() sends only display_name, never a disabled field", async () => {
+    it("patchUser() sends only display_name when disabled is omitted", async () => {
       const request = vi.fn().mockResolvedValue(userJson({ display_name: "Renamed" }));
       const api = createAdminApi(request);
 
@@ -378,6 +378,29 @@ describe("createAdminApi", () => {
       });
     });
 
+    it("patchUser() sends disabled: true (GOT.61)", async () => {
+      const request = vi.fn().mockResolvedValue(userJson({ disabled_at: "2026-01-01T00:00:00.000Z" }));
+      const api = createAdminApi(request);
+
+      const result = await api.patchUser("user-1", { disabled: true });
+
+      expect(request).toHaveBeenCalledWith("PATCH", "/users/user-1", {
+        body: { disabled: true },
+      });
+      expect(result.disabledAt).toBe("2026-01-01T00:00:00.000Z");
+    });
+
+    it("patchUser() sends disabled: false", async () => {
+      const request = vi.fn().mockResolvedValue(userJson());
+      const api = createAdminApi(request);
+
+      await api.patchUser("user-1", { disabled: false });
+
+      expect(request).toHaveBeenCalledWith("PATCH", "/users/user-1", {
+        body: { disabled: false },
+      });
+    });
+
     it("surfaces a duplicate-email 409 with its code", async () => {
       const request = vi.fn().mockRejectedValue(Object.assign(new Error("dup"), { code: "CONFLICT", status: 409, name: "ApiError" }));
       const api = createAdminApi(request);
@@ -385,6 +408,18 @@ describe("createAdminApi", () => {
       await expect(
         api.createUser({ email: "dup@example.com", password: "a very long password", displayName: "Dup" }),
       ).rejects.toMatchObject({ code: "CONFLICT" });
+    });
+
+    it("getCurrentUser() hits GET /auth/me and maps the camelCase response (GOT.61)", async () => {
+      const request = vi
+        .fn()
+        .mockResolvedValue({ id: "current-admin", email: "me@example.com", displayName: "Me" });
+      const api = createAdminApi(request);
+
+      const me = await api.getCurrentUser!();
+
+      expect(request).toHaveBeenCalledWith("GET", "/auth/me");
+      expect(me).toEqual({ id: "current-admin", email: "me@example.com", displayName: "Me" });
     });
   });
 

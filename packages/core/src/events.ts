@@ -1,7 +1,11 @@
 /**
  * `execution_events.type` values (design.md §9.6). `task.state_changed` is
  * written by `transition()` for every task move; `usage.recorded` is written
- * whenever an `execution_usage` row is inserted.
+ * whenever an `execution_usage` row is inserted. `spec.message` (GOT.57 D1)
+ * is the user's side of a spec builder chat turn, written by `POST
+ * /tasks/:id/spec/messages` alongside its `send_message` command; its
+ * payload is `{ text, author_user_id }`, distinct from `issue.message` and
+ * never carried on `agent.message`.
  */
 export const EXECUTION_EVENT_TYPES = [
   "execution.queued",
@@ -24,6 +28,7 @@ export const EXECUTION_EVENT_TYPES = [
   "spec.approved",
   "spec.sent_back",
   "spec.revised",
+  "spec.message",
   "issue.created",
   "issue.message",
   "issue.resolved",

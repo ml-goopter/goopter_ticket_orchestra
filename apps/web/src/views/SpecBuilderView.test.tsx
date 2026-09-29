@@ -583,6 +583,73 @@ describe("SpecBuilderView", () => {
     expect(screen.queryByTestId("chat-message")).toBeNull();
   });
 
+  it("renders a live spec.message as a right-aligned user bubble, ordered among agent bubbles by event order (AC3)", async () => {
+    const client = makeFakeClient({ getTask: vi.fn().mockResolvedValue(aggregateInProgress()) });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({ id: 1, executionId: "exec-spec-1", type: "agent.message", payload: { text: "Agent hello" } }),
+        "1",
+      );
+    });
+    await act(async () => {
+      currentSource().emit(
+        "spec.message",
+        makeTimelineEvent({
+          id: 2,
+          executionId: "exec-spec-1",
+          type: "spec.message",
+          payload: { text: "User reply", author_user_id: "user-1" },
+        }),
+        "2",
+      );
+    });
+    await act(async () => {
+      currentSource().emit(
+        "agent.message",
+        makeTimelineEvent({ id: 3, executionId: "exec-spec-1", type: "agent.message", payload: { text: "Agent again" } }),
+        "3",
+      );
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId("chat-message")).toHaveLength(3));
+    const bubbles = screen.getAllByTestId("chat-message");
+    expect(bubbles.map((node) => node.textContent)).toEqual(["Agent hello", "User reply", "Agent again"]);
+
+    const userBubble = bubbles[1]!.closest("li");
+    expect(userBubble?.className).toContain("spec-builder__bubble--user");
+    const agentBubble = bubbles[0]!.closest("li");
+    expect(agentBubble?.className).toContain("spec-builder__bubble--agent");
+    expect(agentBubble?.className).not.toContain("spec-builder__bubble--user");
+  });
+
+  it("loads spec.message events from the chat backlog on mount, interleaved with agent messages in event order (AC2)", async () => {
+    const backlog = [
+      makeTimelineEvent({ id: 5, executionId: "exec-spec-1", type: "agent.message", payload: { text: "Agent backlog" } }),
+      makeTimelineEvent({
+        id: 6,
+        executionId: "exec-spec-1",
+        type: "spec.message",
+        payload: { text: "User backlog", author_user_id: "user-1" },
+      }),
+    ];
+    const getTimeline = vi.fn().mockResolvedValue({ events: backlog, nextAfter: 6 });
+    const client = makeFakeClient({ getTask: vi.fn().mockResolvedValue(aggregateInProgress()), getTimeline });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getAllByTestId("chat-message")).toHaveLength(2));
+    expect(screen.getAllByTestId("chat-message").map((node) => node.textContent)).toEqual([
+      "Agent backlog",
+      "User backlog",
+    ]);
+    const userBubble = screen.getAllByTestId("chat-message")[1]!.closest("li");
+    expect(userBubble?.className).toContain("spec-builder__bubble--user");
+  });
+
   it("refetches and replaces the form with highlights on spec.proposed, preserving unsaved edits behind a confirm prompt", async () => {
     const initialRevision = makeRevision({ content: validSpecContent });
     const revisedContent: SpecContent = { ...validSpecContent, objective: "A different objective" };

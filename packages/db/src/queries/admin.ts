@@ -1,10 +1,10 @@
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Runtime } from "@orchestra/core";
 import type { Db } from "../client.js";
 import { agentWorkers, executions } from "../schema/executions.js";
 import { projects, repositories } from "../schema/projects.js";
 import { tasks } from "../schema/tasks.js";
-import { users } from "../schema/users.js";
+import { sessions, users } from "../schema/users.js";
 import type { DbOrTx } from "../transition.js";
 import { holdsCapacity } from "./scheduler.js";
 // `ProjectRow`, `RepositoryRow` (task-aggregate.ts) and `AgentWorkerRow`
@@ -212,28 +212,68 @@ export async function getRepositoryById(
 
 export type UpdateRepositoryInput = Partial<InsertRepositoryInput>;
 
-/** Patches a subset of a repository's columns. Returns `null` if `id` is unknown. */
+export type UpdateRepositoryResult =
+  | { status: "not_found" }
+  | { status: "blocked"; taskCount: number }
+  | { status: "updated"; row: RepositoryRow };
+
+/**
+ * Patches a subset of a repository's columns. Refuses a rename (`patch.name`
+ * different from the row's current name) while any task references the
+ * repository (tracker GOT.63-fix2): the bare clone lives at
+ * `repos/<repository.name>.git` (D7), so a rename with tasks still in
+ * flight would strand that clone under the old name, and the eviction sweep
+ * would then fail to find the branch in a new-name clone and drop the
+ * worktree. A patch that leaves `name` unset or unchanged, or a rename with
+ * no referencing tasks, is unaffected.
+ *
+ * Locks the repository row `FOR UPDATE` before counting, same order as
+ * `deleteRepository`: a concurrent `INSERT INTO tasks (repository_id, ...)`
+ * takes a `FOR KEY SHARE` lock on this row and blocks behind ours, so it can
+ * never land after this call has already decided there were none.
+ */
 export async function updateRepository(
-  db: DbOrTx,
+  db: Db,
   id: string,
   patch: UpdateRepositoryInput,
-): Promise<RepositoryRow | null> {
-  if (Object.keys(patch).length === 0) {
-    return getRepositoryById(db, id);
-  }
-  try {
-    const [row] = await db
-      .update(repositories)
-      .set(patch)
+): Promise<UpdateRepositoryResult> {
+  return db.transaction(async (tx) => {
+    const [row] = await tx
+      .select()
+      .from(repositories)
       .where(eq(repositories.id, id))
-      .returning();
-    return row ?? null;
-  } catch (err) {
-    if (isUniqueViolation(err)) {
-      throw new UniqueViolationError("repository", ["projectId", "name"]);
+      .for("update");
+    if (!row) return { status: "not_found" as const };
+
+    const isRename = patch.name !== undefined && patch.name !== row.name;
+    if (isRename) {
+      const [countRow] = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(tasks)
+        .where(eq(tasks.repositoryId, id));
+      const taskCount = countRow?.count ?? 0;
+      if (taskCount > 0) return { status: "blocked" as const, taskCount };
     }
-    throw err;
-  }
+
+    if (Object.keys(patch).length === 0) {
+      return { status: "updated" as const, row };
+    }
+
+    try {
+      const [updated] = await tx
+        .update(repositories)
+        .set(patch)
+        .where(eq(repositories.id, id))
+        .returning();
+      if (!updated) return { status: "not_found" as const };
+      return { status: "updated" as const, row: updated };
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        throw new UniqueViolationError("repository", ["projectId", "name"]);
+      }
+      throw err;
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -367,25 +407,88 @@ export async function getAdminUserById(
 
 export interface UpdateAdminUserInput {
   displayName?: string;
-  /** `undefined` leaves `disabled_at` untouched; `null` clears it. */
-  disabledAt?: Date | null;
+  /**
+   * `undefined` leaves `disabled_at` untouched. `true` disables (design.md
+   * §13); `false` re-enables (clears `disabled_at`).
+   */
+  disabled?: boolean;
 }
 
-/** Patches `display_name` and/or `disabled_at`. Returns `null` if `id` is unknown. */
+export type UpdateAdminUserResult =
+  | { status: "ok"; row: AdminUserRow }
+  | { status: "not_found" }
+  /** Disabling this user would leave zero enabled users (design.md §13). */
+  | { status: "last_enabled_user" };
+
+/**
+ * Patches `display_name` and/or `disabled` (design.md §13). Disabling sets
+ * `disabled_at` to `now`, but only the first time: re-disabling an
+ * already-disabled user is a no-op on the timestamp, and enabling clears
+ * it. The self-disable check lives in the route (it needs the caller's
+ * session, which this layer never sees); this function only enforces the
+ * data invariant that at least one user stays enabled.
+ *
+ * That invariant is enforced by locking every currently-enabled row `FOR
+ * UPDATE` before deciding: two admins racing to disable the last two
+ * enabled users cannot both succeed. The second transaction blocks on
+ * this select until the first commits or rolls back, and under READ
+ * COMMITTED a blocked `FOR UPDATE` re-evaluates its `WHERE` against the
+ * first transaction's committed row, so the row the first one disabled no
+ * longer matches `disabled_at IS NULL` by the time the second is
+ * unblocked.
+ *
+ * A disable also deletes every one of the user's `sessions` rows in the
+ * same transaction: the auth preHandler additionally checks `disabled_at`
+ * live on every request (belt and suspenders for a session this delete
+ * somehow missed), but deleting here is what makes re-enabling not
+ * resurrect a session that was live at disable time.
+ */
 export async function updateAdminUser(
-  db: DbOrTx,
+  db: Db,
   id: string,
   patch: UpdateAdminUserInput,
-): Promise<AdminUserRow | null> {
-  if (Object.keys(patch).length === 0) {
-    return getAdminUserById(db, id);
-  }
-  const [row] = await db
-    .update(users)
-    .set(patch)
-    .where(eq(users.id, id))
-    .returning(adminUserColumns);
-  return row ?? null;
+  now: Date,
+): Promise<UpdateAdminUserResult> {
+  return db.transaction(async (tx) => {
+    let disabledAtPatch: Date | null | undefined;
+
+    if (patch.disabled === true) {
+      const enabledRows = await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(isNull(users.disabledAt))
+        .orderBy(asc(users.id))
+        .for("update"); // Lock in stable order to prevent deadlock on concurrent disables.
+      if (enabledRows.some((row) => row.id === id)) {
+        if (enabledRows.length <= 1) {
+          return { status: "last_enabled_user" as const };
+        }
+        disabledAtPatch = now;
+        await tx.delete(sessions).where(eq(sessions.userId, id));
+      }
+      // Else: `id` is unknown (falls through to not_found below) or
+      // already disabled (idempotent -- disabled_at is left untouched, and
+      // any session that outlived a prior disable was already deleted then).
+    } else if (patch.disabled === false) {
+      disabledAtPatch = null;
+    }
+
+    const setClause: { displayName?: string; disabledAt?: Date | null } = {};
+    if (patch.displayName !== undefined) setClause.displayName = patch.displayName;
+    if (disabledAtPatch !== undefined) setClause.disabledAt = disabledAtPatch;
+
+    if (Object.keys(setClause).length === 0) {
+      const row = await getAdminUserById(tx, id);
+      return row ? { status: "ok" as const, row } : { status: "not_found" as const };
+    }
+
+    const [row] = await tx
+      .update(users)
+      .set(setClause)
+      .where(eq(users.id, id))
+      .returning(adminUserColumns);
+    return row ? { status: "ok" as const, row } : { status: "not_found" as const };
+  });
 }
 
 // ---------------------------------------------------------------------------

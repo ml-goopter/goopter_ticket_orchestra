@@ -78,7 +78,7 @@ export interface AdminUser {
   id: string;
   email: string;
   displayName: string;
-  /** Set by the CLI or a future route; no admin route sets this today. */
+  /** Set by the CLI or `PATCH /users/:id` with `disabled: true` (design.md §13). */
   disabledAt: string | null;
   createdAt: string;
 }
@@ -90,13 +90,26 @@ export interface CreateUserInput {
 }
 
 /**
- * `apps/api/src/routes/users.ts`'s `PatchUserSchema` accepts only
- * `display_name`: a prior review round dropped `disabled` from the route
- * ("the design does not specify an api route for disabling users"), so
- * there is no field here for it either (GOT.29 descope, coordinator C40).
+ * `disabled: true` sets `disabled_at`; `false` clears it (design.md §13,
+ * GOT.61). Only the keys present are sent -- see `patchUser` below.
  */
 export interface PatchUserInput {
   displayName?: string;
+  disabled?: boolean;
+}
+
+/**
+ * The `GET /auth/me` shape (design.md §12.1, §13), duplicated from
+ * `client.ts`'s `User` rather than imported, same reasoning as
+ * `buildQuery` below: this module stays independent of `client.ts`'s
+ * exports. `UsersPanel.tsx` uses this (not `SessionProvider`) to find the
+ * caller's own row (GOT.61) -- `AdminView.tsx` mounts panels outside any
+ * `SessionProvider` in its own tests.
+ */
+export interface CurrentAdminUser {
+  id: string;
+  email: string;
+  displayName: string;
 }
 
 export interface Worker {
@@ -125,6 +138,13 @@ export interface AdminApi {
   listUsers(): Promise<AdminUser[]>;
   createUser(input: CreateUserInput): Promise<AdminUser>;
   patchUser(id: string, patch: PatchUserInput): Promise<AdminUser>;
+  /**
+   * `GET /auth/me` (design.md §12.1). Used by `UsersPanel.tsx` to gate
+   * self-disable (GOT.61). Optional so the other panels' own `AdminApi`
+   * object-literal fakes (`ProjectsPanel.test.tsx` and siblings, outside
+   * this task) do not need updating for a method they never call.
+   */
+  getCurrentUser?(): Promise<CurrentAdminUser>;
   listWorkers(): Promise<Worker[]>;
 }
 
@@ -202,6 +222,13 @@ const AdminUserSchema = z.object({
   display_name: z.string(),
   disabled_at: z.string().nullable(),
   created_at: z.string(),
+});
+
+/** camelCase, unlike the other schemas here: `apps/api/src/routes/auth.ts`'s `/me` returns `request.user` as-is. */
+const CurrentAdminUserSchema = z.object({
+  id: z.string(),
+  email: z.string(),
+  displayName: z.string(),
 });
 
 const WorkerSchema = z.object({
@@ -405,8 +432,13 @@ export function createAdminApi(request: ApiClient["request"]): AdminApi {
     patchUser: async (id, patch) => {
       const body: Record<string, unknown> = {};
       if (patch.displayName !== undefined) body.display_name = patch.displayName;
+      if (patch.disabled !== undefined) body.disabled = patch.disabled;
       const json = await request<unknown>("PATCH", `/users/${id}`, { body });
       return mapAdminUser(AdminUserSchema.parse(json));
+    },
+    getCurrentUser: async () => {
+      const json = await request<unknown>("GET", "/auth/me");
+      return CurrentAdminUserSchema.parse(json);
     },
     listWorkers: async () => {
       const json = await request<unknown>("GET", "/workers");

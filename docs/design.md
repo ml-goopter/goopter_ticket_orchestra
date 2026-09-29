@@ -865,7 +865,7 @@ execution.queued  execution.assigned  execution.started  execution.resumed
 execution.heartbeat  execution.waiting  execution.completed  execution.failed
 execution.cancelled  worktree.prepared  worktree.evicted
 agent.message.delta  agent.message  agent.tool_call  agent.note
-spec.proposed  spec.review_requested  spec.approved  spec.sent_back  spec.revised
+spec.proposed  spec.review_requested  spec.approved  spec.sent_back  spec.revised  spec.message
 issue.created  issue.message  issue.resolved
 review.started  review.result
 pull_request.created  ci.started  ci.failed  ci.passed  pull_request.merged  pull_request.closed
@@ -873,6 +873,8 @@ task.state_changed  usage.recorded
 ```
 
 `task.state_changed` is written by `transition()` for every task move, so the timeline can render state changes inline.
+
+`spec.message` records the user's side of a spec chat turn, with payload `{ text, author_user_id }`. The api writes it in the same transaction as the `send_message` command, and the spec builder renders it as the user's bubble.
 
 ### 9.7 Cost capture
 
@@ -1088,10 +1090,12 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 | --- | --- |
 | GET, POST, PATCH | `/projects`, `/projects/:id` |
 | GET, POST, PATCH | `/repositories`, `/repositories/:id` |
-| GET, POST, PATCH | `/users`, `/users/:id` (create requires an existing session; the first user is created by CLI) |
+| GET, POST, PATCH | `/users`, `/users/:id` (create requires an existing session; the first user is created by CLI; `PATCH` also takes `disabled: boolean` -- true sets `disabled_at`, false clears it. Refused with 409 for the caller's own account and for the last enabled user.) |
 | GET | `/workers` |
 | GET | `/notifications`, POST `/notifications/:id/read` |
 | GET | `/costs?group=project | task | runtime&from=&to=` |
+
+`PATCH /repositories/:id` refuses a rename (a `name` different from the current one) with `409 REPOSITORY_IN_USE` while any task references the repository, and applies nothing else in that request either. The bare clone lives at `repos/<repository.name>.git` (D7); a rename with tasks still in flight would strand that clone under the old name, so the eviction sweep can no longer find the branch and would drop the worktree. A rename with no referencing tasks, or a patch that leaves `name` unset or unchanged, is unaffected.
 
 ### 12.6 Real-time
 
@@ -1112,6 +1116,7 @@ Email and password.
 - No self-registration. First user via `pnpm --filter api users:add <email>`, further users via the admin route.
 - Login creates a `sessions` row and sets a cookie: `HttpOnly`, `Secure`, `SameSite=Lax`, value signed with `SESSION_SECRET`. Idle expiry 30 days, refreshed on each request.
 - Every authenticated user can do everything. Roles are out of scope.
+- A disabled user (`users.disabled_at` set) cannot log in -- `/auth/login` returns the same invalid-credentials response as a wrong password, so a caller cannot tell a disabled account from an unknown one. Every existing session of that user is deleted when it is disabled, and the auth check also rejects `disabled_at IS NOT NULL` live on each request, so a session already in flight stops authorizing on its next request too. Its open SSE streams are ended as soon as the disable commits, and a login that races the disable creates no session. Re-enabling clears `disabled_at` but does not restore the deleted sessions.
 - Rate limit on `/auth/login`: 10 per minute per IP.
 - Agents never authenticate to the api. They authenticate to agent-tools with the per-execution token.
 
