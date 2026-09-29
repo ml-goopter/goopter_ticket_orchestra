@@ -4,7 +4,8 @@ import {
   systemPromptFor,
   SPEC_SYSTEM_PROMPT,
   IMPLEMENTATION_SYSTEM_PROMPT,
-  IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES,
+  IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE,
+  DELEGATION_PROTOCOL,
   REVIEW_SYSTEM_PROMPT,
 } from "./index.js";
 
@@ -28,24 +29,45 @@ describe("systemPromptFor (design.md §9.2)", () => {
     expect(systemPromptFor("review")).toBe(REVIEW_SYSTEM_PROMPT);
   });
 
-  it("returns the no-mistakes variant for implementation when requested", () => {
-    const withNoMistakes = systemPromptFor("implementation", { noMistakes: true });
-    expect(withNoMistakes).toBe(IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES);
-    expect(withNoMistakes).not.toBe(IMPLEMENTATION_SYSTEM_PROMPT);
-    expect(withNoMistakes).toContain("no-mistakes");
-  });
+  describe("delegation section (Claude runtime only)", () => {
+    it("returns the Claude variant for runtime claude", () => {
+      expect(systemPromptFor("implementation", { runtime: "claude" })).toBe(
+        IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE,
+      );
+    });
 
-  it("ignores noMistakes for spec and review", () => {
-    expect(systemPromptFor("spec", { noMistakes: true })).toBe(SPEC_SYSTEM_PROMPT);
-    expect(systemPromptFor("review", { noMistakes: true })).toBe(REVIEW_SYSTEM_PROMPT);
+    it("the Claude variant has the section after the tool contract and before the review protocol", () => {
+      const prompt = IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE;
+      const delegation = prompt.indexOf(DELEGATION_PROTOCOL);
+      expect(delegation).toBeGreaterThan(prompt.indexOf("## Agent-tools contract"));
+      expect(delegation).toBeLessThan(prompt.indexOf("## Review protocol"));
+    });
+
+    it("routes hard, medium and simple units to opus, sonnet and haiku and forbids fable", () => {
+      expect(DELEGATION_PROTOCOL).toContain("Hard, model `opus`");
+      expect(DELEGATION_PROTOCOL).toContain("Medium, model `sonnet`");
+      expect(DELEGATION_PROTOCOL).toContain("Simple, model `haiku`");
+      expect(DELEGATION_PROTOCOL).toContain("Never pass `fable`.");
+      expect(DELEGATION_PROTOCOL).toContain("At most two subagents at once.");
+    });
+
+    it("leaves the prompt unchanged for runtime codex or no runtime", () => {
+      expect(systemPromptFor("implementation", { runtime: "codex" })).toBe(IMPLEMENTATION_SYSTEM_PROMPT);
+      expect(IMPLEMENTATION_SYSTEM_PROMPT).not.toContain(DELEGATION_PROTOCOL);
+    });
+
+    it("ignores runtime for spec and review", () => {
+      expect(systemPromptFor("spec", { runtime: "claude" })).toBe(SPEC_SYSTEM_PROMPT);
+      expect(systemPromptFor("review", { runtime: "claude" })).toBe(REVIEW_SYSTEM_PROMPT);
+    });
   });
 
   it.each(ROLES)("matches the %s snapshot", (role) => {
     expect(promptFor(role)).toMatchSnapshot();
   });
 
-  it("matches the implementation no-mistakes snapshot", () => {
-    expect(systemPromptFor("implementation", { noMistakes: true })).toMatchSnapshot();
+  it("matches the implementation Claude snapshot", () => {
+    expect(systemPromptFor("implementation", { runtime: "claude" })).toMatchSnapshot();
   });
 
   describe("tool-name coverage against the agentTools registry (design.md §8)", () => {

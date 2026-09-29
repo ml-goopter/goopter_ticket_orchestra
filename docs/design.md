@@ -182,7 +182,7 @@ Unique on `(project_id, name)`.
 | --- | --- | --- |
 | id | uuid pk |  |
 | project_id | uuid fk |  |
-| repository_id | uuid fk nullable | set during spec building |
+| repository_id | uuid fk nullable | set (and locked) when the first spec session starts, GOT.80 D2/D3; approval never changes it |
 | jira_key | text unique | `GOOP-421` |
 | jira_summary | text | refreshed on each poll |
 | jira_priority | int | lower is more urgent |
@@ -658,7 +658,7 @@ export interface StartRequest {
   allowedTools: ToolPolicy;           // 'implementation' | 'spec' | 'review'
   mcp: { url: string; token: string };
   env: Record<string, string>;
-  maxBudgetUsd?: number;
+  maxBudgetUsd?: number;              // projects.max_budget_usd, a per-execution cap (user decision 2026-09-29)
 }
 
 export interface ResumeRequest extends Omit<StartRequest, 'systemPrompt'> {
@@ -776,7 +776,6 @@ System prompt, static per role, covers:
 - who the agent is and what it may not do (no product decisions, no editing the spec, no force push, no merging)
 - the agent-tools contract: when to call which tool, that a blocking `raise_issue` means stop
 - the review protocol for the implementation role: after tests pass, run `orchestra-review`, read its findings JSON, fix valid findings, add a regression test per fixed finding, run it again, repeat until `clean` or the tool says stop, then commit, push, `gh pr create`, and call `report_pr_created`
-- if the repository has `no-mistakes` initialized, run that pipeline instead of the manual review loop and report each of its review rounds through `report_review_result`
 - the resume contract: on resume, the prompt begins with a header saying what happened since the last turn
 
 User prompt, assembled per start or resume:
@@ -1063,12 +1062,12 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 
 | method | route | notes |
 | --- | --- | --- |
-| POST | `/tasks/:id/spec/session` | enqueue `start_spec_session`, task → `SPEC_IN_PROGRESS` |
+| POST | `/tasks/:id/spec/session` | `{ repository_id? }`, enqueue `start_spec_session`, task → `SPEC_IN_PROGRESS`. First start (from `NEEDS_SPEC`) requires `repository_id` belonging to the task's project and locks it on the task (GOT.80 D2/D3). A restart (from `SPEC_IN_PROGRESS`) may omit it or repeat the locked one; any other value against an already-locked repository is `409 REPOSITORY_LOCKED`. A restart of a task with no repository locked yet (created before D2) may instead supply one now, validated the same way as the first start and then locked (GOT.80 F2) |
 | POST | `/tasks/:id/spec/messages` | `{ text }`, enqueue `send_message` on the spec execution |
-| PUT | `/tasks/:id/spec/draft` | manual edit of draft `content` |
+| PUT | `/tasks/:id/spec/draft` | manual edit of draft `content`; a non-empty `repository` different from the task's locked repository is `422 REPOSITORY_LOCKED` |
 | POST | `/tasks/:id/spec/request-review` | task → `SPEC_REVIEW` |
 | POST | `/tasks/:id/spec/send-back` | task → `SPEC_IN_PROGRESS` |
-| POST | `/tasks/:id/spec/approve` | `{ runtime? }`, validates content, creates approval, supersedes previous, mirrors dependencies, transitions |
+| POST | `/tasks/:id/spec/approve` | `{ runtime? }`, validates content against the task's locked repository (a mismatch is `422 SPEC_INVALID`), creates approval, supersedes previous, mirrors dependencies, transitions. Never changes the task's repository (GOT.80 D2) |
 | POST | `/tasks/:id/spec/revise` | from `SPEC_APPROVED` or `READY` only, creates a draft, task → `SPEC_IN_PROGRESS` |
 
 ### 12.4 Issues
@@ -1250,7 +1249,7 @@ Jira received the spec-approved, PR-opened and CI-passed comments on both ticket
 | D11 | Two state machines, task and execution. One transition function writes audit events. |
 | D12 | User chooses clarification or spec revision when resolving. Revision routes to `SPEC_IN_PROGRESS` and resumes with the new revision and a diff. |
 | D13 | Worker classifies failures by how the execution ended. Limits: 3 infra, 2 protocol, 3 CI rounds, 3 review rounds. Lease TTL 5 minutes. |
-| D14 | Review is a phase inside the implementation execution, run by a fresh-context subagent through `orchestra-review`. `no-mistakes` used when present, not required. Order: implement, review loop, push, PR, CI. |
+| D14 | Review is a phase inside the implementation execution, run by a fresh-context subagent through `orchestra-review`. Order: implement, review loop, push, PR, CI. |
 | D15 | Postgres `LISTEN/NOTIFY` fanned out over SSE. |
 | D16 | Postgres, api, web in compose. Worker native on the host with capability tags. Secrets from the environment. |
 | D17 | Cost per execution: tokens and USD on `executions`, per-round rows in `execution_usage`, Codex priced from a config table. |

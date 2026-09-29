@@ -28,8 +28,9 @@ import {
   type Db,
 } from "@orchestra/db";
 import {
+  DELEGATION_PROTOCOL,
   IMPLEMENTATION_SYSTEM_PROMPT,
-  IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES,
+  IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE,
 } from "@orchestra/prompts";
 import {
   afterAll,
@@ -355,10 +356,13 @@ interface Harness {
 function makeRunner(
   options: {
     prepareError?: Error;
-    noMistakes?: boolean;
+    /** Leaves a stale marker directory in the prepared worktree, to prove it is ignored. */
+    staleMarkerDir?: boolean;
     quietTimeoutMs?: number;
     leaseRenewMs?: number;
     adapters?: RunnerDeps["adapters"];
+    /** The runtime the fake adapter is registered under. Defaults to `claude`. */
+    adapterRuntime?: Runtime;
     /** Runs inside `prepareImplementation`, before it returns. */
     onPrepare?: (input: PrepareImplementationInput) => Promise<void>;
     /** A real manager to delegate to instead of the fake one. */
@@ -384,8 +388,8 @@ function makeRunner(
         await options.onPrepare?.(input);
         const worktreePath = path.join(workRoot, "work", input.executionId);
         await fs.mkdir(worktreePath, { recursive: true });
-        if (options.noMistakes) {
-          await fs.mkdir(path.join(worktreePath, ".no-mistakes"), { recursive: true });
+        if (options.staleMarkerDir) {
+          await fs.mkdir(path.join(worktreePath, ".stale-marker"), { recursive: true });
         }
         return { worktreePath, branch: `agent/${input.task.jiraKey}-abcdef12` };
       },
@@ -401,7 +405,7 @@ function makeRunner(
         return { branchDeleted: false };
       },
     },
-    adapters: options.adapters ?? { claude: adapter },
+    adapters: options.adapters ?? { [options.adapterRuntime ?? "claude"]: adapter },
     pricing: PRICING,
     toolsUrl: () => TOOLS_URL,
     githubToken: "gh-token",
@@ -1553,7 +1557,7 @@ describe("prompts and request (§9.2, AC10)", () => {
   it("builds the prompt from spec and decisions, picks the system prompt, model and PATH, and never stores the token", async () => {
     const s = await seedClaimed({ model: null });
     await seedDecision(s, "Receipt language is device-local");
-    const h = makeRunner({ workerId: s.workerId, noMistakes: true });
+    const h = makeRunner({ workerId: s.workerId });
     h.adapter.script = async function* ({ token, executionId }) {
       yield { type: "session", sessionId: "sess-p" };
       yield { type: "text", delta: `my token is ${token}` };
@@ -1570,7 +1574,7 @@ describe("prompts and request (§9.2, AC10)", () => {
     expect(req.prompt).toContain("Receipt language is device-local");
     expect(req.prompt).toMatch(/## Ticket\nRUN-\d+: Receipt language/);
     expect(req.prompt).toContain("Setup command: npm ci");
-    expect(req.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT_NO_MISTAKES);
+    expect(req.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE);
     expect(req.model).toBeUndefined();
     expect(req.allowedTools).toBe("implementation");
     expect(req.maxBudgetUsd).toBeUndefined();
@@ -1594,7 +1598,7 @@ describe("prompts and request (§9.2, AC10)", () => {
     expect((await eventTypes(s.executionId))).toContain("agent.message.delta");
   });
 
-  it("without .no-mistakes uses the standard prompt and passes a configured model", async () => {
+  it("the system prompt is identical whether or not a stray marker directory exists in the worktree, and passes a configured model", async () => {
     const s = await seedClaimed();
     const h = makeRunner({ workerId: s.workerId });
     h.adapter.script = async function* ({ executionId }) {
@@ -1605,8 +1609,35 @@ describe("prompts and request (§9.2, AC10)", () => {
 
     await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
 
-    expect(h.adapter.starts[0]!.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT);
+    expect(h.adapter.starts[0]!.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT_CLAUDE);
     expect(h.adapter.starts[0]!.model).toBe("claude-opus-test");
+
+    const s2 = await seedClaimed();
+    const h2 = makeRunner({ workerId: s2.workerId, staleMarkerDir: true });
+    h2.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-r" };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "" };
+    };
+
+    await h2.runner.start({ executionId: s2.executionId, taskId: s2.taskId });
+
+    expect(h2.adapter.starts[0]!.systemPrompt).toBe(h.adapter.starts[0]!.systemPrompt);
+  });
+
+  it("a codex execution gets the implementation prompt without the delegation section", async () => {
+    const s = await seedClaimed({ runtime: "codex" });
+    const h = makeRunner({ workerId: s.workerId, adapterRuntime: "codex" });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-codex" };
+      await completeViaTool(executionId);
+      yield { type: "turn_done", finalText: "" };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    expect(h.adapter.starts[0]!.systemPrompt).toBe(IMPLEMENTATION_SYSTEM_PROMPT);
+    expect(h.adapter.starts[0]!.systemPrompt).not.toContain(DELEGATION_PROTOCOL);
   });
 });
 

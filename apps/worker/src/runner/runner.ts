@@ -37,6 +37,7 @@ import {
   resolveSpecRepository,
   restoreEvictedWorktree as restoreEvictedWorktreeRow,
   setExecutionPlacement,
+  workerMatchesRepositoryContainerMode,
   setExecutionSessionId,
   setExecutionWorktree,
   sumSessionUsageByModel,
@@ -121,9 +122,6 @@ export const END_DETAIL_MAX_CHARS = 4_000;
 
 /** Tool-name prefix of the agent-tools server; those calls record themselves. */
 export const ORCHESTRA_TOOL_PREFIX = "mcp__orchestra__";
-
-/** `.no-mistakes` at the worktree root selects the no-mistakes prompt (§9.2). */
-export const NO_MISTAKES_MARKER = ".no-mistakes";
 
 /**
  * `packages/review-wrapper/bin`, prepended to the agent's PATH (GOT.40 Q7).
@@ -1699,10 +1697,9 @@ export function createRunner(deps: RunnerDeps): Runner {
       return;
     }
 
-    const noMistakes = await pathExists(
-      path.join(prepared.worktreePath, NO_MISTAKES_MARKER),
-    );
-    const systemPrompt = systemPromptFor("implementation", { noMistakes });
+    const systemPrompt = systemPromptFor("implementation", {
+      runtime: ctx.execution.runtime,
+    });
     const startPrompt = await implementationUserPrompt(ctx, spec, prepared.branch, log);
     const prompt = retryOf
       ? `${freshRetryHeader(retryOf.attempt, retryOf.endReason ?? "an unknown failure", reuse !== null, nudge)}\n\n${startPrompt}`
@@ -2098,6 +2095,8 @@ export function createRunner(deps: RunnerDeps): Runner {
       let expectedWorkerId = execution.workerId;
       if (fresh !== null) {
         freshSpec = freshContext(ctx);
+        // freshContext refused NO_SESSION without a repository.
+        const repositoryId = ctx.repository!.id;
         await deps.hooks?.beforeFallbackPin?.(executionId);
         // C21: pin here before touching the worktree, so two workers
         // handling commands for the same released execution never both
@@ -2111,6 +2110,12 @@ export function createRunner(deps: RunnerDeps): Runner {
           const pinned = (await loadRunnerContext(tx, executionId))?.execution;
           if (pinned?.host != null) {
             refuse("OTHER_HOST", "execution was pinned to a host since the context loaded");
+          }
+          // §9.9 Scheduling: a container-mode execution is pinned only on a
+          // docker-capable worker. The handler unclaims on OTHER_HOST and the
+          // §6.1 claim then leaves the command for a docker worker.
+          if (!(await workerMatchesRepositoryContainerMode(tx, repositoryId, workerId))) {
+            refuse("OTHER_HOST", "container-mode execution needs a worker with the docker capability");
           }
           await pinExecutionToHost(tx, executionId, { workerId, host });
         });
@@ -2298,7 +2303,6 @@ export function createRunner(deps: RunnerDeps): Runner {
       const done = track(state, log, () =>
         withLease(state, ctx, log, false, async () => {
           if (!(await containerReady())) return;
-          const noMistakes = await pathExists(path.join(cwd, NO_MISTAKES_MARKER));
           const prompt = buildPrompt(
             await implementationUserPrompt(ctx, spec, ctx.execution.branch, log),
           );
@@ -2311,7 +2315,9 @@ export function createRunner(deps: RunnerDeps): Runner {
               adapter!.start(
                 {
                   cwd,
-                  systemPrompt: systemPromptFor("implementation", { noMistakes }),
+                  systemPrompt: systemPromptFor("implementation", {
+                    runtime: ctx.execution.runtime,
+                  }),
                   prompt,
                   model: modelFor(ctx),
                   allowedTools: "implementation",

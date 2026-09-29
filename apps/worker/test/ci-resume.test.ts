@@ -762,7 +762,7 @@ describe("consume_commands outcomes (C20)", () => {
     handlers.registerCommandHandler("send_message", handler);
     const ctx: TickContext = {
       db,
-      workerId: "unused",
+      workerId: seeded!.workerId,
       config: loadConfig({ DATABASE_URL: "postgres://localhost/unused", WORKER_HOST: HOST }),
       now: NOW,
       tick: 1,

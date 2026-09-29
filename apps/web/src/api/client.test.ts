@@ -275,18 +275,18 @@ describe("createApiClient", () => {
     expect(url).toBe("/api/repositories?project=p1");
   });
 
-  it("startSpecSession(id) posts to /tasks/:id/spec/session with no body and validates the response", async () => {
+  it("startSpecSession(id, repositoryId) posts { repository_id } to /tasks/:id/spec/session and validates the response", async () => {
     const body = { from: "NEEDS_SPEC", to: "SPEC_IN_PROGRESS" };
     const fetchMock = vi.fn().mockResolvedValue(fakeResponse(200, body));
     const client = createApiClient({ baseUrl: "/api", fetch: fetchMock });
 
-    const result = await client.startSpecSession("task-1");
+    const result = await client.startSpecSession("task-1", "repo-1");
 
     expect(result).toEqual(body);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/tasks/task-1/spec/session");
     expect(init.method).toBe("POST");
-    expect(init.body).toBeUndefined();
+    expect(init.body).toBe(JSON.stringify({ repository_id: "repo-1" }));
   });
 
   it("postSpecMessage(id, text) posts { text } to /tasks/:id/spec/messages and validates the response", async () => {

@@ -29,6 +29,7 @@ import type { DbOrTx, Tx } from "../transition.js";
 export interface LockedSpecTask {
   state: TaskState;
   projectId: string;
+  repositoryId: string | null;
   approvedRevisionId: string | null;
 }
 
@@ -46,6 +47,7 @@ export async function lockTaskForSpec(
     .select({
       state: tasks.state,
       projectId: tasks.projectId,
+      repositoryId: tasks.repositoryId,
       approvedRevisionId: tasks.approvedRevisionId,
     })
     .from(tasks)
@@ -200,40 +202,80 @@ export async function updateDraftRevisionContent(
 
 export interface ProjectRepository {
   id: string;
+  projectId: string;
   name: string;
   defaultRuntime: Runtime;
 }
 
+const projectRepositoryColumns = {
+  id: repositories.id,
+  projectId: repositories.projectId,
+  name: repositories.name,
+  defaultRuntime: repositories.defaultRuntime,
+};
+
 /**
- * The repository named `name` within `projectId` (unique on `(project_id,
- * name)`), or `null`. Locks the row `FOR UPDATE` (GOT.52 F2): approval later
- * writes this id onto the task's `repository_id` FK in the same transaction,
- * so the lookup takes the same `FOR UPDATE` `deleteRepository` takes before
- * it counts referencing tasks. That serialises the two: whichever
- * transaction's lookup/delete lands first blocks the other until it commits
- * or rolls back, so a delete can never commit between this read and
- * approval's write (which would otherwise surface as an uncaught FK
- * violation, 23503, mapped to a 500). Callers must hold `tx` open across
- * that later write for the lock to do anything.
+ * The repository `id`, or `null`. Unlocked: used where the caller only
+ * reads (GOT.80 D3's project-membership check at spec-session start, and
+ * the D2 repository-name match check `PUT /spec/draft` and `propose_spec`
+ * run against the task's already-locked repository). Approval's lookup
+ * takes the row lock instead (`lockRepositoryById`).
  */
-export async function findProjectRepositoryByName(
+export async function findRepositoryById(
+  db: DbOrTx,
+  id: string,
+): Promise<ProjectRepository | null> {
+  const [row] = await db
+    .select(projectRepositoryColumns)
+    .from(repositories)
+    .where(eq(repositories.id, id))
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * The repository `id`, locked `FOR UPDATE` (GOT.52 F2). Once a spec session
+ * starts, a task's repository is fixed (GOT.80 D2), so approval only reads
+ * it by id; it never writes `tasks.repository_id`. That read still must
+ * serialise against a concurrent `deleteRepository`, which takes the same
+ * lock before it counts referencing tasks: whichever transaction's lock
+ * lands first blocks the other until it commits or rolls back, so a delete
+ * can never commit mid-approval (which would otherwise surface as an
+ * uncaught FK violation, 23503, mapped to a 500, on some other write, or let
+ * approval succeed against a repository already gone).
+ */
+export async function lockRepositoryById(
   tx: Tx,
-  projectId: string,
-  name: string,
+  id: string,
 ): Promise<ProjectRepository | null> {
   const [row] = await tx
-    .select({
-      id: repositories.id,
-      name: repositories.name,
-      defaultRuntime: repositories.defaultRuntime,
-    })
+    .select(projectRepositoryColumns)
     .from(repositories)
-    .where(
-      and(eq(repositories.projectId, projectId), eq(repositories.name, name)),
-    )
+    .where(eq(repositories.id, id))
     .limit(1)
     .for("update");
   return row ?? null;
+}
+
+/**
+ * Sets `tasks.repository_id` outside `transition()` (GOT.80 F2): a restart
+ * of a task left over from before D2 locked the repository at session
+ * start, whose `repository_id` is still null. The task's state does not
+ * move on a restart, so there is no trigger to route this through
+ * `transition()`. The caller already holds the task row locked
+ * (`lockTaskForSpec`) and the repository row locked (`lockRepositoryById`),
+ * the same order the first start uses (F1).
+ */
+export async function setTaskRepositoryId(
+  tx: Tx,
+  taskId: string,
+  repositoryId: string,
+  now: Date,
+): Promise<void> {
+  await tx
+    .update(tasks)
+    .set({ repositoryId, updatedAt: now })
+    .where(eq(tasks.id, taskId));
 }
 
 export interface ApproveRevisionInput {
