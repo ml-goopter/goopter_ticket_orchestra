@@ -449,7 +449,7 @@ Index on `(task_id, id)`. Rows older than 90 days for `DONE` tasks may be archiv
 | user_id | uuid fk nullable | null means all users |
 | task_id | uuid fk |  |
 | issue_id | uuid fk nullable |  |
-| kind | enum notification_kind | `issue_raised`, `spec_review_requested`, `needs_human`, `ready_for_merge`, `execution_failed` |
+| kind | enum notification_kind | `issue_raised`, `spec_review_requested`, `needs_human`, `ready_for_merge`, `execution_failed`, `jira_out_of_scope` |
 | title | text |  |
 | read_at | timestamptz nullable |  |
 | created_at | timestamptz |  |
