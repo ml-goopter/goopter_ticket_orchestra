@@ -848,12 +848,28 @@ describe("POST /api/tasks/:id/reopen (GOT.55)", () => {
   it("F1: reopens a task with an approved revision and a draft to NEEDS_SPEC, and the draft stays present and editable", async () => {
     const taskId = await seedTaskViaHarness(fx, {
       jiraKey: "TSK-64",
-      state: "CANCELLED",
+      state: "SPEC_APPROVED",
       priority: 64,
     });
     const approvedId = await seedRevision(h.db, taskId, 1, "approved", {});
-    const draftId = await seedRevision(h.db, taskId, 2, "draft", {});
     await h.sql`update tasks set approved_revision_id = ${approvedId} where id = ${taskId}`;
+
+    const reviseRes = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/spec/revise`,
+      headers: { cookie },
+    });
+    expect(reviseRes.statusCode).toBe(200);
+    expect(reviseRes.json()).toMatchObject({ from: "SPEC_APPROVED", to: "SPEC_IN_PROGRESS" });
+    const draftId = reviseRes.json().revisionId as string;
+
+    const cancelRes = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/cancel`,
+      headers: { cookie },
+    });
+    expect(cancelRes.statusCode).toBe(200);
+    expect(cancelRes.json()).toEqual({ from: "SPEC_IN_PROGRESS", to: "CANCELLED" });
 
     const reopenRes = await app.inject({
       method: "POST",
