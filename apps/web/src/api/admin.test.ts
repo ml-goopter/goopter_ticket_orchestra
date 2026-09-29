@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { createAdminApi } from "./admin.js";
+import { ApiError } from "./client.js";
+import { createAdminApi, DeleteBlockedError } from "./admin.js";
 
 function projectJson(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -164,6 +165,40 @@ describe("createAdminApi", () => {
 
       await expect(api.listProjects()).rejects.toThrow();
     });
+
+    it("deleteProject() DELETEs /projects/:id and resolves on success", async () => {
+      const request = vi.fn().mockResolvedValue(undefined);
+      const api = createAdminApi(request);
+
+      await api.deleteProject("proj-1");
+
+      expect(request).toHaveBeenCalledWith("DELETE", "/projects/proj-1");
+    });
+
+    it("deleteProject() maps a 409 REFERENCED_BY_TASKS into a DeleteBlockedError with the task count", async () => {
+      const request = vi.fn().mockRejectedValue(
+        new ApiError(409, "REFERENCED_BY_TASKS", "Cannot delete: 3 task(s) reference this project or its repositories."),
+      );
+      const api = createAdminApi(request);
+
+      const error = await api.deleteProject("proj-1").catch((err: unknown) => err);
+
+      expect(error).toBeInstanceOf(DeleteBlockedError);
+      expect((error as DeleteBlockedError).taskCount).toBe(3);
+      expect((error as DeleteBlockedError).message).toBe(
+        "Cannot delete: 3 task(s) reference this project or its repositories.",
+      );
+    });
+
+    it("deleteProject() propagates a 404 as an ApiError, like other not-found handling", async () => {
+      const request = vi.fn().mockRejectedValue(new ApiError(404, "NOT_FOUND", "project proj-404 not found"));
+      const api = createAdminApi(request);
+
+      const error = await api.deleteProject("proj-404").catch((err: unknown) => err);
+
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).status).toBe(404);
+    });
   });
 
   describe("repositories", () => {
@@ -269,6 +304,38 @@ describe("createAdminApi", () => {
       await expect(api.patchRepository("repo-1", { testCommand: "pnpm test && rm -rf /" })).rejects.toMatchObject({
         code: "VALIDATION_ERROR",
       });
+    });
+
+    it("deleteRepository() DELETEs /repositories/:id and resolves on success", async () => {
+      const request = vi.fn().mockResolvedValue(undefined);
+      const api = createAdminApi(request);
+
+      await api.deleteRepository("repo-1");
+
+      expect(request).toHaveBeenCalledWith("DELETE", "/repositories/repo-1");
+    });
+
+    it("deleteRepository() maps a 409 REFERENCED_BY_TASKS into a DeleteBlockedError with the task count", async () => {
+      const request = vi
+        .fn()
+        .mockRejectedValue(new ApiError(409, "REFERENCED_BY_TASKS", "Cannot delete: 1 task(s) reference this repository."));
+      const api = createAdminApi(request);
+
+      const error = await api.deleteRepository("repo-1").catch((err: unknown) => err);
+
+      expect(error).toBeInstanceOf(DeleteBlockedError);
+      expect((error as DeleteBlockedError).taskCount).toBe(1);
+      expect((error as DeleteBlockedError).message).toBe("Cannot delete: 1 task(s) reference this repository.");
+    });
+
+    it("deleteRepository() propagates a 404 as an ApiError, like other not-found handling", async () => {
+      const request = vi.fn().mockRejectedValue(new ApiError(404, "NOT_FOUND", "repository repo-404 not found"));
+      const api = createAdminApi(request);
+
+      const error = await api.deleteRepository("repo-404").catch((err: unknown) => err);
+
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).status).toBe(404);
     });
   });
 

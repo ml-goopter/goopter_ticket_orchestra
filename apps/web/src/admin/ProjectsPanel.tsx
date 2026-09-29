@@ -202,6 +202,8 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<CreateProjectInput | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<{ id: string; message: string } | null>(null);
   const [editErrors, setEditErrors] = useState<FieldErrors>({});
   const [editError, setEditError] = useState<string | null>(null);
 
@@ -265,6 +267,28 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
       await fetchProjects();
     } catch (err) {
       setEditError(describeApiError(err, "Failed to update the project."));
+    }
+  }
+
+  /**
+   * Confirm names the project and states its repositories go with it (D2:
+   * deleting a project with repositories but no tasks also deletes those
+   * repositories). Cancelling the browser confirm does nothing, matching
+   * `TaskDetailView.tsx`'s cancel-task pattern.
+   */
+  async function handleDelete(project: Project) {
+    if (!window.confirm(`Delete project ${project.key}? Its repositories will be deleted with it.`)) {
+      return;
+    }
+    setDeletingId(project.id);
+    setDeleteError(null);
+    try {
+      await adminApi.deleteProject(project.id);
+      await fetchProjects();
+    } catch (err) {
+      setDeleteError({ id: project.id, message: describeApiError(err, "Failed to delete the project.") });
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -356,10 +380,32 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
                     <td>
                       <button type="button" className="admin-table__action" onClick={() => startEdit(project)}>
                         Edit
+                      </button>{" "}
+                      <button
+                        type="button"
+                        className="admin-table__action"
+                        aria-label={`Delete ${project.key}`}
+                        disabled={deletingId === project.id}
+                        onClick={() => void handleDelete(project)}
+                      >
+                        Delete
                       </button>
                     </td>
                   </tr>
                 ),
+              )}
+              {deleteError && (
+                <tr key={`${deleteError.id}-delete-error`}>
+                  <td colSpan={9}>
+                    <p
+                      className="alert alert--error"
+                      role="alert"
+                      data-testid={`delete-error-${deleteError.id}`}
+                    >
+                      {deleteError.message}
+                    </p>
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>
