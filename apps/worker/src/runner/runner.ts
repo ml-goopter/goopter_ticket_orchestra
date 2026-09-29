@@ -210,6 +210,14 @@ export interface RunnerDeps {
   timings?: Partial<RunnerTimings>;
   now?: () => Date;
   /**
+   * Test seam for the quiet/flush/blocking timers in `runSession`'s local
+   * `after()`/`cancel()` helpers (§9.3, §9.4). Both default to the global
+   * setTimeout/clearTimeout; a test can inject its own to drive the quiet
+   * timer deterministically instead of racing real time.
+   */
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
+  /**
    * Container mode (design.md §9.9, D20): set only on a worker with the
    * `docker` capability. An execution whose repository has
    * `agent_container = true` runs every agent process, and `setup_command`,
@@ -517,6 +525,8 @@ export function createRunner(deps: RunnerDeps): Runner {
   const { db, registry, logger, workerId, host, pricing } = deps;
   const now = deps.now ?? (() => new Date());
   const timings: RunnerTimings = { ...DEFAULT_RUNNER_TIMINGS, ...deps.timings };
+  const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+  const clearTimer = deps.clearTimer ?? ((handle: unknown) => clearTimeout(handle as NodeJS.Timeout));
   const reviewWrapperBin = deps.reviewWrapperBin ?? DEFAULT_REVIEW_WRAPPER_BIN;
   const testCommandFor =
     deps.testCommandFor ?? ((ctx: RunnerContext) => ctx.repository?.testCommand ?? null);
@@ -908,23 +918,23 @@ export function createRunner(deps: RunnerDeps): Runner {
       }
       state.stop("gone");
     };
-    const timeouts = new Set<NodeJS.Timeout>();
+    const timeouts = new Set<unknown>();
     const intervals = new Set<NodeJS.Timeout>();
-    let quietTimer: NodeJS.Timeout | undefined;
-    let flushTimer: NodeJS.Timeout | undefined;
-    let blockingTimer: NodeJS.Timeout | undefined;
+    let quietTimer: unknown;
+    let flushTimer: unknown;
+    let blockingTimer: unknown;
 
-    const after = (ms: number, fn: () => void): NodeJS.Timeout => {
-      const t = setTimeout(() => {
+    const after = (ms: number, fn: () => void): unknown => {
+      const t = setTimer(() => {
         timeouts.delete(t);
         fn();
       }, ms);
       timeouts.add(t);
       return t;
     };
-    const cancel = (t: NodeJS.Timeout | undefined): void => {
-      if (!t) return;
-      clearTimeout(t);
+    const cancel = (t: unknown): void => {
+      if (t === undefined) return;
+      clearTimer(t);
       timeouts.delete(t);
     };
 
@@ -1126,7 +1136,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       cancel(quietTimer);
       cancel(flushTimer);
       cancel(blockingTimer);
-      for (const t of timeouts) clearTimeout(t);
+      for (const t of timeouts) clearTimer(t);
       for (const i of intervals) clearInterval(i);
       await writes.drain();
     }
