@@ -212,28 +212,68 @@ export async function getRepositoryById(
 
 export type UpdateRepositoryInput = Partial<InsertRepositoryInput>;
 
-/** Patches a subset of a repository's columns. Returns `null` if `id` is unknown. */
+export type UpdateRepositoryResult =
+  | { status: "not_found" }
+  | { status: "blocked"; taskCount: number }
+  | { status: "updated"; row: RepositoryRow };
+
+/**
+ * Patches a subset of a repository's columns. Refuses a rename (`patch.name`
+ * different from the row's current name) while any task references the
+ * repository (tracker GOT.63-fix2): the bare clone lives at
+ * `repos/<repository.name>.git` (D7), so a rename with tasks still in
+ * flight would strand that clone under the old name, and the eviction sweep
+ * would then fail to find the branch in a new-name clone and drop the
+ * worktree. A patch that leaves `name` unset or unchanged, or a rename with
+ * no referencing tasks, is unaffected.
+ *
+ * Locks the repository row `FOR UPDATE` before counting, same order as
+ * `deleteRepository`: a concurrent `INSERT INTO tasks (repository_id, ...)`
+ * takes a `FOR KEY SHARE` lock on this row and blocks behind ours, so it can
+ * never land after this call has already decided there were none.
+ */
 export async function updateRepository(
-  db: DbOrTx,
+  db: Db,
   id: string,
   patch: UpdateRepositoryInput,
-): Promise<RepositoryRow | null> {
-  if (Object.keys(patch).length === 0) {
-    return getRepositoryById(db, id);
-  }
-  try {
-    const [row] = await db
-      .update(repositories)
-      .set(patch)
+): Promise<UpdateRepositoryResult> {
+  return db.transaction(async (tx) => {
+    const [row] = await tx
+      .select()
+      .from(repositories)
       .where(eq(repositories.id, id))
-      .returning();
-    return row ?? null;
-  } catch (err) {
-    if (isUniqueViolation(err)) {
-      throw new UniqueViolationError("repository", ["projectId", "name"]);
+      .for("update");
+    if (!row) return { status: "not_found" as const };
+
+    const isRename = patch.name !== undefined && patch.name !== row.name;
+    if (isRename) {
+      const [countRow] = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(tasks)
+        .where(eq(tasks.repositoryId, id));
+      const taskCount = countRow?.count ?? 0;
+      if (taskCount > 0) return { status: "blocked" as const, taskCount };
     }
-    throw err;
-  }
+
+    if (Object.keys(patch).length === 0) {
+      return { status: "updated" as const, row };
+    }
+
+    try {
+      const [updated] = await tx
+        .update(repositories)
+        .set(patch)
+        .where(eq(repositories.id, id))
+        .returning();
+      if (!updated) return { status: "not_found" as const };
+      return { status: "updated" as const, row: updated };
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        throw new UniqueViolationError("repository", ["projectId", "name"]);
+      }
+      throw err;
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------

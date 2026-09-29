@@ -1091,6 +1091,8 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 | GET | `/notifications`, POST `/notifications/:id/read` |
 | GET | `/costs?group=project | task | runtime&from=&to=` |
 
+`PATCH /repositories/:id` refuses a rename (a `name` different from the current one) with `409 REPOSITORY_IN_USE` while any task references the repository, and applies nothing else in that request either. The bare clone lives at `repos/<repository.name>.git` (D7); a rename with tasks still in flight would strand that clone under the old name, so the eviction sweep can no longer find the branch and would drop the worktree. A rename with no referencing tasks, or a patch that leaves `name` unset or unchanged, is unaffected.
+
 ### 12.6 Real-time
 
 The worker calls `NOTIFY orchestra, '<json>'` with `{ task_id, event_id }` after each `execution_events` insert. The api holds one dedicated `LISTEN` connection. Subscribers:
