@@ -1323,4 +1323,129 @@ describe("SpecBuilderView", () => {
     const sendButton = screen.getByRole("button", { name: "Send" }) as HTMLButtonElement;
     expect(sendButton.title).toBe("The task is not in progress.");
   });
+
+  it("titles the Save Draft button with the disabled reason when disabled and no title when enabled (GOT.66)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "DONE" },
+          revisions: [makeRevision()],
+        }),
+      ),
+    });
+    const { unmount } = renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("DONE"));
+    const saveDraftButton = screen.getByRole("button", { name: "Save Draft" }) as HTMLButtonElement;
+    expect(saveDraftButton.disabled).toBe(true);
+    expect(saveDraftButton.title).toContain("drafts can only be saved while in progress");
+    unmount();
+
+    const enabledClient = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision()] })),
+    });
+    renderSpecBuilder(enabledClient);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("SPEC_IN_PROGRESS"));
+    const enabledSaveDraftButton = screen.getByRole("button", { name: "Save Draft" }) as HTMLButtonElement;
+    expect(enabledSaveDraftButton.disabled).toBe(false);
+    expect(enabledSaveDraftButton.title).toBe("");
+  });
+
+  it("titles the Request Review button with the disabled reason when disabled and no title when enabled (GOT.66)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "DONE" },
+          revisions: [makeRevision()],
+        }),
+      ),
+    });
+    const { unmount } = renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("DONE"));
+    const requestReviewButton = screen.getByRole("button", { name: "Request Review" }) as HTMLButtonElement;
+    expect(requestReviewButton.disabled).toBe(true);
+    expect(requestReviewButton.title).toContain("review can only be requested while in progress");
+    unmount();
+
+    const enabledClient = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision()] })),
+    });
+    renderSpecBuilder(enabledClient);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("SPEC_IN_PROGRESS"));
+    const enabledRequestReviewButton = screen.getByRole("button", { name: "Request Review" }) as HTMLButtonElement;
+    expect(enabledRequestReviewButton.disabled).toBe(false);
+    expect(enabledRequestReviewButton.title).toBe("");
+  });
+
+  it("titles the Send Back button with the disabled reason when disabled and no title when enabled (GOT.66)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "SPEC_IN_PROGRESS" },
+          revisions: [makeRevision()],
+        }),
+      ),
+    });
+    const { unmount } = renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("SPEC_IN_PROGRESS"));
+    const sendBackButton = screen.getByRole("button", { name: "Send Back" }) as HTMLButtonElement;
+    expect(sendBackButton.disabled).toBe(true);
+    expect(sendBackButton.title).toContain("can only send back from review");
+    unmount();
+
+    const base = makeTaskAggregate();
+    const enabledClient = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "SPEC_REVIEW" },
+          latestExecutions: { spec: { ...base.executions[0]!, state: "RUNNING" }, implementation: null },
+          revisions: [makeRevision()],
+        }),
+      ),
+    });
+    renderSpecBuilder(enabledClient);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("SPEC_REVIEW"));
+    const enabledSendBackButton = screen.getByRole("button", { name: "Send Back" }) as HTMLButtonElement;
+    expect(enabledSendBackButton.disabled).toBe(false);
+    expect(enabledSendBackButton.title).toBe("");
+  });
+
+  it("titles the Approve button with the disabled reason when disabled and no title when enabled (GOT.66)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "SPEC_IN_PROGRESS" },
+          revisions: [makeRevision()],
+        }),
+      ),
+    });
+    const { unmount } = renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("SPEC_IN_PROGRESS"));
+    const approveButton = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
+    expect(approveButton.disabled).toBe(true);
+    expect(approveButton.title).toContain("can only approve from review");
+    unmount();
+
+    const enabledClient = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          task: { ...makeTaskAggregate().task, state: "SPEC_REVIEW" },
+          revisions: [makeRevision({ content: validSpecContent })],
+        }),
+      ),
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ name: "tsk-repo" })]),
+    });
+    renderSpecBuilder(enabledClient);
+
+    await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("SPEC_REVIEW"));
+    const enabledApproveButton = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
+    expect(enabledApproveButton.disabled).toBe(false);
+    expect(enabledApproveButton.title).toBe("");
+  });
 });
