@@ -601,3 +601,36 @@ export async function lockContainerExecution(
     .for("update", { skipLocked: true });
   return row ?? null;
 }
+
+// -------------------------------------------- deleted repository clones
+
+/**
+ * Every current `repositories.name`, across every project (design.md D7:
+ * the worker keys the bare clone directory on name alone, but the column is
+ * only unique per project, GOT.63). Read without locks: the worktree
+ * sweeper's deleted-repository pass uses this set to decide which `repos/`
+ * entries are even candidates, then re-checks each one it means to remove
+ * with `repositoryNameExists` after taking the worktree manager's
+ * per-repository lock.
+ */
+export async function listRepositoryNames(db: DbOrTx): Promise<Set<string>> {
+  const rows = await db.select({ name: repositories.name }).from(repositories);
+  return new Set(rows.map((row) => row.name));
+}
+
+/**
+ * True when some repository, in any project, currently has `name` (GOT.63).
+ * The worktree sweeper's authoritative check, run with no row lock
+ * immediately before a bare clone named `name` is removed and after the
+ * worktree manager's per-repository lock is taken: a repository recreated
+ * with that name after the unlocked `listRepositoryNames` read, whether or
+ * not it is mid-clone or mid-fetch under the same lock, is never deleted.
+ */
+export async function repositoryNameExists(db: DbOrTx, name: string): Promise<boolean> {
+  const [row] = await db
+    .select({ one: sql`1` })
+    .from(repositories)
+    .where(eq(repositories.name, name))
+    .limit(1);
+  return row !== undefined;
+}

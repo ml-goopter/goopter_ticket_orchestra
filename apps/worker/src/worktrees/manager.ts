@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -119,6 +120,25 @@ export interface LockedRepository {
     worktreePath: string,
     options: Omit<RemoveOptions, "repositoryName">,
   ): Promise<RemoveResult>;
+  /**
+   * Deletes the bare clone directory itself, not a worktree under it
+   * (GOT.63: the worktree sweeper's deleted-repository pass). Missing
+   * already is not an error.
+   */
+  removeBareClone(): Promise<void>;
+}
+
+/** One entry `listBareClones` finds directly under `repos/` (GOT.63). */
+export interface BareCloneEntry {
+  /** The directory or symlink name with its trailing `.git` stripped. */
+  name: string;
+  /**
+   * True when this entry is a symlink, never followed: a bare clone the
+   * manager creates is always a real directory, so a symlink here is
+   * something else on disk and the caller must skip and log it rather than
+   * removing whatever it points at.
+   */
+  isSymlink: boolean;
 }
 
 export interface PushIfAheadInput {
@@ -472,7 +492,13 @@ export class WorktreeManager {
    *
    * The worktree sweeper takes this lock before it opens the transaction
    * that locks the task and execution rows, so it never waits for the lock
-   * while holding those rows.
+   * while holding those rows. GOT.63's deleted-repository clone pass takes
+   * this same lock but opens no transaction and takes no row lock at all:
+   * it re-reads whether a repository still has this name with a plain,
+   * unlocked select, immediately before `removeBareClone`, so the check and
+   * the removal race no database row, only whatever else takes this
+   * in-process lock (a concurrent `prepareImplementation` or `pushIfAhead`
+   * on the same name).
    */
   async withRepositoryLock<T>(
     repositoryName: string,
@@ -486,8 +512,37 @@ export class WorktreeManager {
             ...options,
             repositoryName,
           }),
+        removeBareClone: () => fs.rm(barePath, { recursive: true, force: true }),
       }),
     );
+  }
+
+  /**
+   * Entries directly under `<workspaceRoot>/repos` whose name ends in
+   * `.git` (GOT.63): a real directory is a bare clone this manager (or an
+   * earlier one on this host) created; anything else with that suffix
+   * (a symlink in particular) is reported but never followed, its target
+   * never inspected. An entry with no `.git` suffix is not a clone and is
+   * not returned at all. Missing `repos/` yields no entries. Takes no lock:
+   * the caller re-checks under `withRepositoryLock` before removing.
+   */
+  async listBareClones(): Promise<BareCloneEntry[]> {
+    const reposDir = path.join(this.workspaceRoot, "repos");
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(reposDir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+    const clones: BareCloneEntry[] = [];
+    for (const entry of entries) {
+      if (!entry.name.endsWith(".git")) continue;
+      const isSymlink = entry.isSymbolicLink();
+      if (!isSymlink && !entry.isDirectory()) continue;
+      clones.push({ name: entry.name.slice(0, -".git".length), isSymlink });
+    }
+    return clones;
   }
 
   /**

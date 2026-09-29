@@ -1110,3 +1110,65 @@ describe("WorktreeManager recorded worktree paths (C33)", () => {
     });
   }
 });
+
+describe("WorktreeManager.listBareClones (GOT.63)", () => {
+  it("lists a real bare clone as a directory entry, name without .git", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+
+    expect(await manager.listBareClones()).toEqual([
+      { name: repository.name, isSymlink: false },
+    ]);
+  });
+
+  it("returns nothing when repos/ does not exist yet", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    expect(await manager.listBareClones()).toEqual([]);
+  });
+
+  it("ignores an entry under repos/ that does not end in .git", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+    const reposDir = path.join(workspaceRoot, "repos");
+    await fs.mkdir(path.join(reposDir, "not-a-clone"));
+    await fs.writeFile(path.join(reposDir, "readme.txt"), "hi");
+
+    expect(await manager.listBareClones()).toEqual([
+      { name: repository.name, isSymlink: false },
+    ]);
+  });
+
+  it("reports a symlinked repos/ entry without following it", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+    const reposDir = path.join(workspaceRoot, "repos");
+    const linkTarget = path.join(tmp, "elsewhere.git");
+    await fs.mkdir(linkTarget);
+    await fs.symlink(linkTarget, path.join(reposDir, "linked_repo.git"), "dir");
+
+    const clones = await manager.listBareClones();
+    expect(clones).toContainEqual({ name: repository.name, isSymlink: false });
+    expect(clones).toContainEqual({ name: "linked_repo", isSymlink: true });
+    expect(clones).toHaveLength(2);
+  });
+});
+
+describe("WorktreeManager.withRepositoryLock removeBareClone (GOT.63)", () => {
+  it("deletes the bare clone directory entirely", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await manager.prepareImplementation(implInput("exec-1"));
+    expect(existsSync(bareClonePath())).toBe(true);
+
+    await manager.withRepositoryLock(repository.name, (repo) => repo.removeBareClone());
+
+    expect(existsSync(bareClonePath())).toBe(false);
+    expect(await manager.listBareClones()).toEqual([]);
+  });
+
+  it("succeeds when the bare clone is already gone", async () => {
+    const manager = new WorktreeManager({ workspaceRoot });
+    await expect(
+      manager.withRepositoryLock(repository.name, (repo) => repo.removeBareClone()),
+    ).resolves.toBeUndefined();
+  });
+});

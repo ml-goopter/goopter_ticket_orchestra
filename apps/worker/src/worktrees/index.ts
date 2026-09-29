@@ -6,6 +6,7 @@ export {
 export {
   WorktreeManager,
   workingBranchName,
+  type BareCloneEntry,
   type PrepareImplementationInput,
   type PrepareSpecInput,
   type PreparedWorktree,
