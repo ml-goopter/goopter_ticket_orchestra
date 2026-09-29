@@ -77,6 +77,7 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | fixes | GOT.66 | web: test the disabled-action titles on the task and spec pages | #82 |
 | fixes | GOT.94 | worker: a new implementation execution starts from the pushed task branch | #83 |
 | fixes | GOT.67 | worker tests: drive the runner's quiet timer deterministically | #84 |
+| fixes | GOT.93 | tasks: refuse to reopen a task whose Jira ticket was recorded out of scope | #85 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 

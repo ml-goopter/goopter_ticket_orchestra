@@ -143,6 +143,26 @@ export async function listNonTerminalJiraTasks(
   return rows.map((row) => ({ ...row, jiraScope: toJiraScope(row.jiraScope) }));
 }
 
+/**
+ * The latest Jira scope recorded on `taskId` by a jira-poller `agent.note`,
+ * or null when the poller has never recorded one (GOT.93). Used by
+ * `POST /tasks/:id/reopen` (design.md §5.1, §12.2) to refuse reopening a
+ * `CANCELLED` task whose last recorded scope is `closed` or `left_jql`: the
+ * poller stops checking a cancelled task, so nothing would ever notice the
+ * ticket coming back in scope if reopen were allowed. Call it inside the
+ * same transaction as the caller's task row lock, after that lock.
+ */
+export async function getLatestJiraScope(
+  db: DbOrTx,
+  taskId: string,
+): Promise<JiraScope | null> {
+  const [row] = await db
+    .select({ jiraScope: latestJiraScopeSql(db) })
+    .from(tasks)
+    .where(eq(tasks.id, taskId));
+  return toJiraScope(row?.jiraScope ?? null);
+}
+
 export interface ApplyJiraScopeInput {
   taskId: string;
   jiraKey: string;
