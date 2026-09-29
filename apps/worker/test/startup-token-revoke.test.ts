@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createServer, type AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -9,6 +9,11 @@ import {
   waitFor,
   type TestDb,
 } from "./harness.js";
+import {
+  killAllTrackedWorkersAndAssertNoneSurvive,
+  killWorkerTree,
+  spawnWorkerProcess,
+} from "./worker-process.js";
 
 /**
  * GOT.82: worker startup revokes stale spec-execution agent-tools tokens
@@ -24,7 +29,6 @@ const entry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 const workerDir = fileURLToPath(new URL("..", import.meta.url));
 
 let testDb: TestDb;
-const spawned: ChildProcess[] = [];
 
 /** A loopback port that was free a moment ago, so the child's tools server can bind it. */
 function freePort(): Promise<number> {
@@ -48,7 +52,7 @@ async function startWorker(host: string): Promise<{
   child: ChildProcess;
   output: string[];
 }> {
-  const child = spawn(process.execPath, [tsxCli, entry], {
+  const child = spawnWorkerProcess(process.execPath, [tsxCli, entry], {
     cwd: workerDir,
     stdio: ["ignore", "pipe", "pipe"],
     env: {
@@ -61,7 +65,6 @@ async function startWorker(host: string): Promise<{
       AGENT_CONTAINER_IMAGE: ABSENT_AGENT_IMAGE,
     },
   });
-  spawned.push(child);
   const output: string[] = [];
   child.stderr?.on("data", (c) => output.push(String(c)));
   child.stdout?.on("data", (c) => output.push(String(c)));
@@ -73,7 +76,10 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  for (const child of spawned) if (child.exitCode === null) child.kill("SIGKILL");
+  // Force-kills every worker this file spawned, including the grandchild
+  // tsx spawns to actually run the entry point, and asserts (GOT.92) that
+  // none survives -- whatever the tests above did or didn't clean up.
+  await killAllTrackedWorkersAndAssertNoneSurvive();
   await testDb?.stop();
 });
 
@@ -141,6 +147,6 @@ describe("worker startup stale spec-token revocation (GOT.82)", () => {
     expect(revokeIdx).toBeGreaterThan(-1);
     expect(startedIdx).toBeGreaterThan(revokeIdx);
 
-    child.kill("SIGTERM");
+    killWorkerTree(child, "SIGTERM");
   });
 });
