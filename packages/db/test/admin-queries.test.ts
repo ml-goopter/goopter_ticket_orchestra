@@ -788,4 +788,60 @@ describe("updateAdminUser (GOT.61)", () => {
     const disabledCount = [rowA, rowB].filter((r) => r?.disabledAt !== null).length;
     expect(disabledCount).toBe(1);
   });
+
+  it("concurrent disables of two different users succeed without deadlock when at least three are enabled", async () => {
+    const idA = await insertTestUser(h.db, { email: "admu9-a@example.com" });
+    const idB = await insertTestUser(h.db, { email: "admu9-b@example.com" });
+    const idC = await insertTestUser(h.db, { email: "admu9-c@example.com" });
+
+    let firstDecided!: () => void;
+    const firstDecidedPromise = new Promise<void>((resolve) => (firstDecided = resolve));
+    let releaseFirst!: () => void;
+    const releaseFirstPromise = new Promise<void>((resolve) => (releaseFirst = resolve));
+
+    let resultA: UpdateAdminUserResult | undefined;
+    let errorA: Error | undefined;
+    const firstTx = h.db.transaction(async (tx) => {
+      try {
+        resultA = await updateAdminUser(tx as unknown as Db, idA, { disabled: true }, now);
+        firstDecided();
+        await releaseFirstPromise;
+      } catch (e) {
+        errorA = e as Error;
+        throw e;
+      }
+    });
+    firstTx.catch(() => {});
+    await firstDecidedPromise;
+    expect(resultA?.status).toBe("ok");
+
+    let resultB: UpdateAdminUserResult | undefined;
+    let errorB: Error | undefined;
+    const secondTx = h.db.transaction(async (tx) => {
+      try {
+        resultB = await updateAdminUser(tx as unknown as Db, idB, { disabled: true }, now);
+      } catch (e) {
+        errorB = e as Error;
+        throw e;
+      }
+    });
+    secondTx.catch(() => {});
+    await waitFor(async () => resultB !== undefined || (await lockWaiters()) >= 1, 5000);
+
+    releaseFirst();
+    await firstTx;
+    await secondTx;
+
+    expect(resultA?.status).toBe("ok");
+    expect(resultB?.status).toBe("ok");
+    expect(errorA).toBeUndefined();
+    expect(errorB).toBeUndefined();
+
+    const rowA = await getAdminUserById(h.db, idA);
+    const rowB = await getAdminUserById(h.db, idB);
+    const rowC = await getAdminUserById(h.db, idC);
+    expect(rowA?.disabledAt).not.toBeNull();
+    expect(rowB?.disabledAt).not.toBeNull();
+    expect(rowC?.disabledAt).toBeNull();
+  });
 });

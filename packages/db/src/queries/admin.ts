@@ -417,7 +417,8 @@ export async function updateAdminUser(
         .select({ id: users.id })
         .from(users)
         .where(isNull(users.disabledAt))
-        .for("update");
+        .orderBy(asc(users.id))
+        .for("update"); // Lock in stable order to prevent deadlock on concurrent disables.
       if (enabledRows.some((row) => row.id === id)) {
         if (enabledRows.length <= 1) {
           return { status: "last_enabled_user" as const };
