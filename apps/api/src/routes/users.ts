@@ -24,14 +24,13 @@ const CreateUserSchema = z
   .strict();
 
 /**
- * `.strict()` rejects a `disabled` field with 400 rather than silently
- * ignoring it: no api route sets `disabled_at` (R3, design.md §12.5 lists
- * the route but not this field; users.disable is out of scope pending a
- * design decision).
+ * `disabled: true` sets `disabled_at`; `false` clears it (design.md §13).
+ * The route below refuses to disable the caller or the last enabled user.
  */
 const PatchUserSchema = z
   .object({
     display_name: z.string().min(1, "display_name is required"),
+    disabled: z.boolean(),
   })
   .strict()
   .partial();
@@ -100,12 +99,34 @@ export default async function usersRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) {
       throw new AppError(400, "VALIDATION_ERROR", validationMessage(parsed.error));
     }
-    const row = await updateAdminUser(app.db, request.params.id, {
-      ...(parsed.data.display_name !== undefined
-        ? { displayName: parsed.data.display_name }
-        : {}),
-    });
-    if (!row) throw notFound(request.params.id);
-    return toResponse(row);
+    if (parsed.data.disabled === true && request.params.id === request.user!.id) {
+      throw new AppError(
+        409,
+        "CANNOT_DISABLE_SELF",
+        "You cannot disable your own account.",
+      );
+    }
+    const result = await updateAdminUser(
+      app.db,
+      request.params.id,
+      {
+        ...(parsed.data.display_name !== undefined
+          ? { displayName: parsed.data.display_name }
+          : {}),
+        ...(parsed.data.disabled !== undefined
+          ? { disabled: parsed.data.disabled }
+          : {}),
+      },
+      app.now(),
+    );
+    if (result.status === "not_found") throw notFound(request.params.id);
+    if (result.status === "last_enabled_user") {
+      throw new AppError(
+        409,
+        "LAST_ENABLED_USER",
+        "Cannot disable the last enabled user.",
+      );
+    }
+    return toResponse(result.row);
   });
 }

@@ -1086,7 +1086,7 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 | --- | --- |
 | GET, POST, PATCH | `/projects`, `/projects/:id` |
 | GET, POST, PATCH | `/repositories`, `/repositories/:id` |
-| GET, POST, PATCH | `/users`, `/users/:id` (create requires an existing session; the first user is created by CLI) |
+| GET, POST, PATCH | `/users`, `/users/:id` (create requires an existing session; the first user is created by CLI; `PATCH` also takes `disabled: boolean` -- true sets `disabled_at`, false clears it. Refused with 409 for the caller's own account and for the last enabled user.) |
 | GET | `/workers` |
 | GET | `/notifications`, POST `/notifications/:id/read` |
 | GET | `/costs?group=project | task | runtime&from=&to=` |
@@ -1110,6 +1110,7 @@ Email and password.
 - No self-registration. First user via `pnpm --filter api users:add <email>`, further users via the admin route.
 - Login creates a `sessions` row and sets a cookie: `HttpOnly`, `Secure`, `SameSite=Lax`, value signed with `SESSION_SECRET`. Idle expiry 30 days, refreshed on each request.
 - Every authenticated user can do everything. Roles are out of scope.
+- A disabled user (`users.disabled_at` set) cannot log in -- `/auth/login` returns the same invalid-credentials response as a wrong password, so a caller cannot tell a disabled account from an unknown one. Every existing session of that user is deleted when it is disabled, and the auth check also rejects `disabled_at IS NOT NULL` live on each request, so a session already in flight stops authorizing on its next request too. Re-enabling clears `disabled_at` but does not restore the deleted sessions.
 - Rate limit on `/auth/login`: 10 per minute per IP.
 - Agents never authenticate to the api. They authenticate to agent-tools with the per-execution token.
 

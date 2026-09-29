@@ -1,9 +1,10 @@
 import { eq, inArray } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   UniqueViolationError,
   deleteProject,
   deleteRepository,
+  getAdminUserById,
   getProjectById,
   getRepositoryById,
   insertProject,
@@ -11,6 +12,7 @@ import {
   listProjects,
   listRepositories,
   listWorkersWithSlots,
+  updateAdminUser,
   updateProject,
   updateRepository,
 } from "../src/queries/index.js";
@@ -84,6 +86,23 @@ async function insertTaskRow(
       state: "NEEDS_SPEC",
     })
     .returning({ id: schema.tasks.id });
+  return row!.id;
+}
+
+/** Inserts one `users` row directly; the password hash is never verified here. */
+async function insertTestUser(
+  db: DbOrTx,
+  input: { email: string; disabled?: boolean },
+): Promise<string> {
+  const [row] = await db
+    .insert(schema.users)
+    .values({
+      email: input.email,
+      passwordHash: "not-a-real-hash",
+      displayName: input.email,
+      disabledAt: input.disabled ? new Date("2026-01-01T00:00:00Z") : null,
+    })
+    .returning({ id: schema.users.id });
   return row!.id;
 }
 
@@ -590,5 +609,138 @@ describe("deleteProject (GOT.52, D2)", () => {
         expect(deleteResult.value).toEqual({ status: "blocked", taskCount: 1 });
       }
     }
+  });
+});
+
+describe("updateAdminUser (GOT.61)", () => {
+  const now = new Date("2026-01-01T00:00:00Z");
+
+  // Every "last enabled user" assertion needs to know the whole table's
+  // content, and this file never otherwise touches `users`, so clear it
+  // before each case rather than relying on unique-per-test rows.
+  beforeEach(async () => {
+    await h.db.delete(schema.users);
+  });
+
+  it("disables an enabled user, setting disabled_at to now", async () => {
+    await insertTestUser(h.db, { email: "admu1-other@example.com" });
+    const targetId = await insertTestUser(h.db, { email: "admu1-target@example.com" });
+
+    const result = await updateAdminUser(h.db, targetId, { disabled: true }, now);
+
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.row.disabledAt).toEqual(now);
+    }
+  });
+
+  it("re-enables a disabled user, clearing disabled_at", async () => {
+    await insertTestUser(h.db, { email: "admu2-other@example.com" });
+    const targetId = await insertTestUser(h.db, {
+      email: "admu2-target@example.com",
+      disabled: true,
+    });
+
+    const result = await updateAdminUser(h.db, targetId, { disabled: false }, now);
+
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.row.disabledAt).toBeNull();
+    }
+  });
+
+  it("disabling an already-disabled user is idempotent: disabled_at is not bumped", async () => {
+    await insertTestUser(h.db, { email: "admu3-other@example.com" });
+    const originalDisabledAt = new Date("2025-06-01T00:00:00Z");
+    const [row] = await h.db
+      .insert(schema.users)
+      .values({
+        email: "admu3-target@example.com",
+        passwordHash: "not-a-real-hash",
+        displayName: "admu3-target@example.com",
+        disabledAt: originalDisabledAt,
+      })
+      .returning({ id: schema.users.id });
+
+    const result = await updateAdminUser(h.db, row!.id, { disabled: true }, now);
+
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.row.disabledAt).toEqual(originalDisabledAt);
+    }
+  });
+
+  it("refuses to disable the only enabled user", async () => {
+    const targetId = await insertTestUser(h.db, { email: "admu4-target@example.com" });
+
+    const result = await updateAdminUser(h.db, targetId, { disabled: true }, now);
+
+    expect(result).toEqual({ status: "last_enabled_user" });
+    const row = await getAdminUserById(h.db, targetId);
+    expect(row?.disabledAt).toBeNull();
+  });
+
+  it("allows disabling one of two enabled users", async () => {
+    const targetId = await insertTestUser(h.db, { email: "admu5-target@example.com" });
+    await insertTestUser(h.db, { email: "admu5-other@example.com" });
+
+    const result = await updateAdminUser(h.db, targetId, { disabled: true }, now);
+
+    expect(result.status).toBe("ok");
+  });
+
+  it("does not refuse disabling the last enabled user when other users are already disabled", async () => {
+    await insertTestUser(h.db, { email: "admu6-already@example.com", disabled: true });
+    const targetId = await insertTestUser(h.db, { email: "admu6-target@example.com" });
+
+    const result = await updateAdminUser(h.db, targetId, { disabled: true }, now);
+
+    expect(result).toEqual({ status: "last_enabled_user" });
+  });
+
+  it("returns not_found for an unknown id", async () => {
+    const result = await updateAdminUser(
+      h.db,
+      "00000000-0000-0000-0000-000000000000",
+      { disabled: true },
+      now,
+    );
+    expect(result).toEqual({ status: "not_found" });
+  });
+
+  it("patches display_name and disabled together in one call", async () => {
+    await insertTestUser(h.db, { email: "admu7-other@example.com" });
+    const targetId = await insertTestUser(h.db, { email: "admu7-target@example.com" });
+
+    const result = await updateAdminUser(
+      h.db,
+      targetId,
+      { displayName: "Renamed", disabled: true },
+      now,
+    );
+
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.row.displayName).toBe("Renamed");
+      expect(result.row.disabledAt).toEqual(now);
+    }
+  });
+
+  it("only one of two concurrent disables of the last two enabled users succeeds", async () => {
+    const idA = await insertTestUser(h.db, { email: "admu8-a@example.com" });
+    const idB = await insertTestUser(h.db, { email: "admu8-b@example.com" });
+
+    const [resultA, resultB] = await Promise.all([
+      updateAdminUser(h.db, idA, { disabled: true }, now),
+      updateAdminUser(h.db, idB, { disabled: true }, now),
+    ]);
+
+    const statuses = [resultA.status, resultB.status].sort();
+    expect(statuses).toEqual(["last_enabled_user", "ok"]);
+
+    const rowA = await getAdminUserById(h.db, idA);
+    const rowB = await getAdminUserById(h.db, idB);
+    const disabledCount = [rowA, rowB].filter((r) => r?.disabledAt !== null).length;
+    expect(disabledCount).toBe(1);
   });
 });
