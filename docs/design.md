@@ -776,7 +776,6 @@ System prompt, static per role, covers:
 - who the agent is and what it may not do (no product decisions, no editing the spec, no force push, no merging)
 - the agent-tools contract: when to call which tool, that a blocking `raise_issue` means stop
 - the review protocol for the implementation role: after tests pass, run `orchestra-review`, read its findings JSON, fix valid findings, add a regression test per fixed finding, run it again, repeat until `clean` or the tool says stop, then commit, push, `gh pr create`, and call `report_pr_created`
-- if the repository has `no-mistakes` initialized, run that pipeline instead of the manual review loop and report each of its review rounds through `report_review_result`
 - the resume contract: on resume, the prompt begins with a header saying what happened since the last turn
 
 User prompt, assembled per start or resume:
@@ -1086,7 +1085,7 @@ Fastify, JSON, cookie session. All routes under `/api`. Every mutation runs `tra
 | --- | --- |
 | GET, POST, PATCH | `/projects`, `/projects/:id` |
 | GET, POST, PATCH | `/repositories`, `/repositories/:id` |
-| GET, POST, PATCH | `/users`, `/users/:id` (create requires an existing session; the first user is created by CLI) |
+| GET, POST, PATCH | `/users`, `/users/:id` (create requires an existing session; the first user is created by CLI; `PATCH` also takes `disabled: boolean` -- true sets `disabled_at`, false clears it. Refused with 409 for the caller's own account and for the last enabled user.) |
 | GET | `/workers` |
 | GET | `/notifications`, POST `/notifications/:id/read` |
 | GET | `/costs?group=project | task | runtime&from=&to=` |
@@ -1112,6 +1111,7 @@ Email and password.
 - No self-registration. First user via `pnpm --filter api users:add <email>`, further users via the admin route.
 - Login creates a `sessions` row and sets a cookie: `HttpOnly`, `Secure`, `SameSite=Lax`, value signed with `SESSION_SECRET`. Idle expiry 30 days, refreshed on each request.
 - Every authenticated user can do everything. Roles are out of scope.
+- A disabled user (`users.disabled_at` set) cannot log in -- `/auth/login` returns the same invalid-credentials response as a wrong password, so a caller cannot tell a disabled account from an unknown one. Every existing session of that user is deleted when it is disabled, and the auth check also rejects `disabled_at IS NOT NULL` live on each request, so a session already in flight stops authorizing on its next request too. Its open SSE streams are ended as soon as the disable commits, and a login that races the disable creates no session. Re-enabling clears `disabled_at` but does not restore the deleted sessions.
 - Rate limit on `/auth/login`: 10 per minute per IP.
 - Agents never authenticate to the api. They authenticate to agent-tools with the per-execution token.
 
@@ -1251,7 +1251,7 @@ Jira received the spec-approved, PR-opened and CI-passed comments on both ticket
 | D11 | Two state machines, task and execution. One transition function writes audit events. |
 | D12 | User chooses clarification or spec revision when resolving. Revision routes to `SPEC_IN_PROGRESS` and resumes with the new revision and a diff. |
 | D13 | Worker classifies failures by how the execution ended. Limits: 3 infra, 2 protocol, 3 CI rounds, 3 review rounds. Lease TTL 5 minutes. |
-| D14 | Review is a phase inside the implementation execution, run by a fresh-context subagent through `orchestra-review`. `no-mistakes` used when present, not required. Order: implement, review loop, push, PR, CI. |
+| D14 | Review is a phase inside the implementation execution, run by a fresh-context subagent through `orchestra-review`. Order: implement, review loop, push, PR, CI. |
 | D15 | Postgres `LISTEN/NOTIFY` fanned out over SSE. |
 | D16 | Postgres, api, web in compose. Worker native on the host with capability tags. Secrets from the environment. |
 | D17 | Cost per execution: tokens and USD on `executions`, per-round rows in `execution_usage`, Codex priced from a config table. |

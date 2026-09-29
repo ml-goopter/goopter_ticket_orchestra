@@ -64,6 +64,11 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | fixes | GOT.77 | jira: follow tickets that close or leave the JQL | #69 |
 | fixes | GOT.64, GOT.65 | web: board scrollbar overflow and timeline JSON cap | #70 |
 | fixes | GOT.80, GOT.81 | spec: choose and lock the repository before the session starts | #71 |
+| fixes | GOT.62 | docs: max_budget_usd is a per-execution cap | #72 |
+| prompts | (operator) | Claude implementation agent delegates units by model tier | #73 |
+| containers | GOT.83 | worker: docker routing for dead-host takeover and spec session start (C4b) | #74 |
+| prompts | GOT.85 | prompts: remove the no-mistakes review path | #75 |
+| fixes | GOT.61 | users: restore the disable control | #76 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 

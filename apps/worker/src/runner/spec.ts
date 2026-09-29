@@ -12,6 +12,7 @@ import {
   resolveSpecRepository,
   transition,
   unclaimCommand,
+  workerMatchesRepositoryContainerMode,
   type Db,
 } from "@orchestra/db";
 import { renderSpecMarkdown } from "@orchestra/prompts";
@@ -39,8 +40,9 @@ import { ResumeError, type Runner } from "./runner.js";
  * The chat text is not stored as an execution event (C43).
  *
  * Outcomes (C20): `handled` once the session is started or RUNNING;
- * `unclaimed` when a turn is already in flight here or the execution is
- * pinned to another host; `skipped` when there is nothing to do.
+ * `unclaimed` when a turn is already in flight here, the execution is
+ * pinned to another host, or a start needs a docker worker (§9.9);
+ * `skipped` when there is nothing to do.
  */
 
 /** Header of a user chat turn. `buildResumePrompt("user_message")` is per issue. */
@@ -73,12 +75,16 @@ export function specSentBackPrompt(
   return `${SPEC_SENT_BACK_HEADER}\n${text}\n\n### Current draft (revision ${draft.version})\n${body}`;
 }
 
-type StartResult = { ok: true; executionId: string } | { ok: false; reason: string; error?: true };
+type StartResult =
+  | { ok: true; executionId: string }
+  | { ok: false; reason: string; error?: true; leave?: true };
 
 /**
  * One transaction: lock the task, check it, insert the QUEUED spec
  * execution pinned here, move it ASSIGNED, complete the command. Returns
- * without writing when a check fails.
+ * without writing when a check fails. `leave` marks a container-mode
+ * repository on a worker without `docker` (§9.9 Scheduling): the command
+ * belongs to a docker-capable worker.
  */
 async function createSpecExecution(
   db: Db,
@@ -104,6 +110,14 @@ async function createSpecExecution(
       // one restarted without ever supplying one) — never that the project
       // itself lacks repositories.
       return { ok: false, reason: "task has no repository", error: true };
+    }
+    // §9.9: re-checked under the task lock; the claim filters the same way.
+    if (!(await workerMatchesRepositoryContainerMode(tx, repository.id, input.workerId))) {
+      return {
+        ok: false,
+        reason: "container-mode repository needs a worker with the docker capability",
+        leave: true,
+      };
     }
     const { id } = await insertQueuedExecution(tx, {
       taskId: input.taskId,
@@ -159,6 +173,11 @@ export function registerSpecHandlers(
       host: ctx.host,
     });
     if (!result.ok) {
+      if (result.leave) {
+        await unclaimCommand(ctx.db, command.id);
+        log.info({ reason: result.reason }, "start_spec_session: left for a docker worker");
+        return { outcome: "unclaimed" };
+      }
       if (result.error) log.error({ reason: result.reason }, "start_spec_session: cannot start");
       return { outcome: "skipped", reason: result.reason };
     }
