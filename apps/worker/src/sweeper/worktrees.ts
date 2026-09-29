@@ -4,6 +4,7 @@ import {
   clearExecutionWorktree,
   listApprovedSpecWorktrees,
   listContainerExecutions,
+  listExecutionWorktreePaths,
   listRepositoryNames,
   listWorktreeCandidates,
   lockApprovedSpecWorktree,
@@ -214,9 +215,10 @@ async function removeContainerGuarded(
  * below) takes no row lock at all, task, execution or otherwise: a
  * `repositories` row has no worktree candidate hanging off it for this
  * sweep to lock. It takes only the worktree manager's per-repository lock,
- * keyed on the clone's directory name, then a single unlocked
- * `repositoryNameExists` read as its recheck, then the filesystem removal,
- * all before releasing that lock. Because it holds no database lock at any
+ * keyed on the clone's directory name, then unlocked reads of
+ * `repositoryNameExists` and `listExecutionWorktreePaths` as its recheck,
+ * then the worktree-metadata check and the filesystem removal, all before
+ * releasing that lock. Because it holds no database lock at any
  * point, it cannot invert against anything above; it can only ever wait
  * behind, or make wait, a `prepareImplementation`, `prepareSpec` or
  * `pushIfAhead` call on the same repository name, which is exactly the
@@ -567,22 +569,28 @@ async function sweepOrphanContainers(
 
 /**
  * GOT.63, one pass: a bare clone directory under `repos/` whose name
- * matches no repository row, in any project, is the delete route's
- * leftover (design.md D7 keys the clone on name alone; §12.5's delete
- * refuses while a task still references the repository, and the foreign
- * key from `tasks.repository_id` enforces the same thing, so no execution
- * or worktree can still name a deleted repository by the time this runs;
- * there is nothing under `work/` for this pass to find or touch).
+ * matches no repository row, in any project and ignoring case, is a
+ * removal candidate (design.md D7 keys the clone on name alone).
+ *
+ * A missing row does not mean nothing uses the clone. PATCH
+ * /repositories/:id can rename a repository that tasks still use, leaving
+ * their worktrees under `work/` pointing into the old-name clone, and a
+ * worktree can outlive every row that named it. So the clone is kept, and
+ * a warning logged, while any worktree still uses it: a directory under
+ * `work/`, or an execution's recorded `worktree_path` under `work/`, whose
+ * `.git` resolves into the clone or which the clone's `worktrees/` admin
+ * directory records (`LockedRepository.removeBareClone`).
  *
  * Lists `repos/` once, unlocked, logs and skips any symlinked entry there
  * without following it, and keeps a directory a current repository still
  * names. For the rest it takes the worktree manager's per-repository lock,
- * keyed on the directory's name, and re-reads `repositoryNameExists` before
- * removing: a repository recreated with that name, and being cloned or
- * fetched under that same lock, is never deleted. No database row lock is
- * held at any point in this pass, only that in-process lock. A clone that
- * fails to remove is logged and the rest of the sweep continues. Never
- * throws.
+ * keyed on the directory's name (case-insensitively, as every caller's
+ * is), and under it re-reads `repositoryNameExists`, then the executions'
+ * `worktree_path`s, then checks git's worktree metadata and removes: a
+ * repository recreated with that name, and being cloned or fetched under
+ * that same lock, is never deleted. No database row lock is held at any
+ * point in this pass, only that in-process lock. A clone that fails to
+ * remove is logged and the rest of the sweep continues. Never throws.
  */
 async function sweepDeletedRepositoryClones(
   db: Db,
@@ -615,16 +623,19 @@ async function sweepDeletedRepositoryClones(
     return;
   }
 
+  // F2: on a case-insensitive filesystem repository `Casey` uses `casey.git`.
+  const inUse = new Set([...names].map((n) => n.toLowerCase()));
   for (const name of candidates) {
-    if (names.has(name)) continue;
+    if (inUse.has(name.toLowerCase())) continue;
     try {
-      const removed = await worktrees.withRepositoryLock(name, async (repo) => {
-        if (await repositoryNameExists(db, name)) return false;
-        await repo.removeBareClone();
-        return true;
+      const outcome = await worktrees.withRepositoryLock(name, async (repo) => {
+        if (await repositoryNameExists(db, name)) return null;
+        return repo.removeBareClone(await listExecutionWorktreePaths(db));
       });
-      if (removed) {
+      if (outcome?.removed) {
         logger.info({ name }, "deleted repository's bare clone removed");
+      } else if (outcome && outcome.usedBy.length > 0) {
+        logger.warn({ name, worktrees: outcome.usedBy }, "bare clone kept, worktrees still use it");
       }
     } catch (err) {
       logger.error({ name, err: errMessage(err) }, "bare clone removal failed");

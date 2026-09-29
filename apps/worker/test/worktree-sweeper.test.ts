@@ -442,7 +442,7 @@ function recordingOps(
             if (result.tipMoved !== true) removed.push(executionId);
             return result;
           },
-          removeBareClone: () => repo.removeBareClone(),
+          removeBareClone: (recorded) => repo.removeBareClone(recorded),
         }),
       );
     },
@@ -2003,28 +2003,49 @@ describe("deleted repository clones under repos/ (GOT.63)", () => {
   const clonePath = (name: string) => path.join(reposDir(), `${name}.git`);
 
   /** A repository row in a fresh project, no clone created for it. */
-  async function insertRepository(name: string): Promise<void> {
+  async function insertRepository(name: string): Promise<string> {
     const n = ++seq;
     const [project] = await db
       .insert(projects)
       .values({ key: `WTSR${n}`, name: `wt sweep repo ${n}`, jiraJql: `project = WTSR${n}` })
       .returning({ id: projects.id });
-    await db.insert(repositories).values({
-      projectId: project!.id,
-      name,
-      gitUrl: remote,
-      defaultBranch: "main",
-      defaultRuntime: "claude",
-    });
+    const [row] = await db
+      .insert(repositories)
+      .values({
+        projectId: project!.id,
+        name,
+        gitUrl: remote,
+        defaultBranch: "main",
+        defaultRuntime: "claude",
+      })
+      .returning({ id: repositories.id });
+    return row!.id;
   }
 
-  /** The bare clone at repos/<name>.git, with no database row at all. */
-  async function seedBareClone(name: string): Promise<void> {
-    await manager.prepareSpec({
+  /**
+   * The bare clone at repos/<name>.git with a live worktree in it at
+   * work/orphan-<name>, and no database row at all.
+   */
+  async function seedCloneInUse(name: string): Promise<string> {
+    const prepared = await manager.prepareSpec({
       executionId: `orphan-${name}`,
       repository: { name, gitUrl: remote, defaultBranch: "main" },
     });
+    return prepared.worktreePath;
   }
+
+  /** The bare clone at repos/<name>.git, no worktree, no database row. */
+  async function seedBareClone(name: string): Promise<void> {
+    const worktreePath = await seedCloneInUse(name);
+    await manager.remove(worktreePath, { repositoryName: name, branch: null });
+  }
+
+  const keptInUse = (name: string) =>
+    expect.objectContaining({
+      level: "warn",
+      msg: "bare clone kept, worktrees still use it",
+      fields: expect.objectContaining({ name }),
+    });
 
   it("removes a clone whose name has no repository row in any project", async () => {
     await seedBareClone("deleted_repo");
@@ -2044,7 +2065,9 @@ describe("deleted repository clones under repos/ (GOT.63)", () => {
 
   it("keeps a clone whose name another project's repository still uses", async () => {
     await seedBareClone("shared_repo");
+    const deleted = await insertRepository("shared_repo");
     await insertRepository("shared_repo");
+    await raw("delete from repositories where id = $1", [deleted]);
 
     await sweep();
 
@@ -2148,4 +2171,93 @@ describe("deleted repository clones under repos/ (GOT.63)", () => {
     );
   });
 
+  it("F1: keeps a renamed repository's old clone while a live worktree with unpushed work points into it", async () => {
+    const s = await seedWithWorktree({ taskState: "IMPLEMENTING", state: "RUNNING" });
+    const commit = commitIn(s.worktreePath, "unpushed.txt");
+    // PATCH /repositories/:id renaming a repository its tasks still use.
+    await raw("update repositories set name = $1 where name = $2", ["renamed_repo", REPO_NAME]);
+
+    await sweep();
+
+    expect(existsSync(bareClone())).toBe(true);
+    expect(git(s.worktreePath, "rev-parse", "HEAD")).toBe(commit);
+    expect(records).toContainEqual(keptInUse(REPO_NAME));
+    expect(records.filter((r) => r.msg === "deleted repository's bare clone removed")).toEqual(
+      [],
+    );
+  });
+
+  it("F1: keeps the old clone while an execution row records a worktree the clone's worktrees/ still lists", async () => {
+    const s = await seedWithWorktree({ taskState: "IMPLEMENTING", state: "RUNNING" });
+    // The directory is gone without a `git worktree prune`: only the
+    // execution row and the clone's admin entry still know the worktree.
+    await fs.rm(s.worktreePath, { recursive: true, force: true });
+    await raw("update repositories set name = $1 where name = $2", ["renamed_repo", REPO_NAME]);
+
+    await sweep();
+
+    expect(existsSync(bareClone())).toBe(true);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        msg: "bare clone kept, worktrees still use it",
+        fields: expect.objectContaining({ name: REPO_NAME, worktrees: [s.worktreePath] }),
+      }),
+    );
+  });
+
+  it("F3: keeps an otherwise unreferenced clone while a work/ worktree points into it, and warns", async () => {
+    const worktreePath = await seedCloneInUse("unreferenced_repo");
+
+    await sweep();
+
+    expect(existsSync(clonePath("unreferenced_repo"))).toBe(true);
+    expect(gitOk(worktreePath, "status")).toBe(true);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        msg: "bare clone kept, worktrees still use it",
+        fields: expect.objectContaining({ name: "unreferenced_repo", worktrees: [worktreePath] }),
+      }),
+    );
+  });
+
+  it("F2: keeps a clone whose directory name matches a repository name only case-insensitively", async () => {
+    await seedBareClone("casey");
+    await insertRepository("Casey");
+    const ops = recordingOps();
+    const locked: string[] = [];
+    const recording: WorktreeOps = {
+      ...ops,
+      withRepositoryLock(repositoryName, fn) {
+        locked.push(repositoryName);
+        return ops.withRepositoryLock(repositoryName, fn);
+      },
+    };
+
+    await sweep({ worktrees: recording });
+
+    expect(existsSync(clonePath("casey"))).toBe(true);
+    // Kept by the unlocked list itself, not only by the post-lock recheck.
+    expect(locked).not.toContain("casey");
+    expect(records.filter((r) => r.msg === "deleted repository's bare clone removed")).toEqual(
+      [],
+    );
+  });
+
+  it("F2: the post-lock recheck matches a recreated name case-insensitively", async () => {
+    await seedBareClone("recased_repo");
+    const ops = recordingOps();
+    const locking: WorktreeOps = {
+      ...ops,
+      async withRepositoryLock(repositoryName, fn) {
+        if (repositoryName === "recased_repo") await insertRepository("Recased_Repo");
+        return ops.withRepositoryLock(repositoryName, fn);
+      },
+    };
+
+    await sweep({ worktrees: locking });
+
+    expect(existsSync(clonePath("recased_repo"))).toBe(true);
+  });
 });

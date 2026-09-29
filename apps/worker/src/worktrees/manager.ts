@@ -122,10 +122,25 @@ export interface LockedRepository {
   ): Promise<RemoveResult>;
   /**
    * Deletes the bare clone directory itself, not a worktree under it
-   * (GOT.63: the worktree sweeper's deleted-repository pass). Missing
-   * already is not an error.
+   * (GOT.63: the worktree sweeper's deleted-repository pass), unless a
+   * worktree still uses it. Missing already is not an error.
+   *
+   * A worktree uses the clone, judged from git's own metadata and never
+   * from names, when it is a directory under `work/`, or one of
+   * `recordedWorktreePaths` (the executions' `worktree_path`s) under
+   * `work/`, and either its `.git` file's `gitdir:` resolves into the clone
+   * or an entry in the clone's `worktrees/` admin directory records it.
+   * Then nothing is removed and `usedBy` lists those worktree paths.
    */
-  removeBareClone(): Promise<void>;
+  removeBareClone(recordedWorktreePaths: readonly string[]): Promise<BareCloneRemoval>;
+}
+
+/** What `LockedRepository.removeBareClone` did (GOT.63). */
+export interface BareCloneRemoval {
+  /** True when the clone is gone, including when it was already missing. */
+  removed: boolean;
+  /** Worktree paths still using the clone; empty when `removed`. */
+  usedBy: string[];
 }
 
 /** One entry `listBareClones` finds directly under `repos/` (GOT.63). */
@@ -221,11 +236,16 @@ export function workingBranchName(jiraKey: string, taskId: string): string {
 /**
  * Serialises git operations on one bare clone within this process, keyed by
  * its absolute path, so concurrent prepares neither race creating the clone
- * nor contend for ref locks during fetch.
+ * nor contend for ref locks during fetch. The key is lower-cased (GOT.63
+ * F2): on a case-insensitive filesystem `repos/Casey.git` and
+ * `repos/casey.git` are one directory, so they must be one lock. On a
+ * case-sensitive filesystem this only serialises two clones whose names
+ * differ by case.
  */
 const repoLocks = new Map<string, Promise<void>>();
 
-async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+async function withRepoLock<T>(rawKey: string, fn: () => Promise<T>): Promise<T> {
+  const key = rawKey.toLowerCase();
   const previous = repoLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
@@ -249,6 +269,67 @@ async function exists(p: string): Promise<boolean> {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw err;
+  }
+}
+
+/** Absence, for the GOT.63 read-only checks: the path or a parent is missing. */
+function isAbsent(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** Entry names of directory `dir`; none when it does not exist. */
+async function readdirIfExists(dir: string): Promise<string[]> {
+  try {
+    return await fs.readdir(dir);
+  } catch (err) {
+    if (isAbsent(err)) return [];
+    throw err;
+  }
+}
+
+/** Contents of file `file`; null when it is missing or is a directory. */
+async function readFileIfExists(file: string): Promise<string | null> {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch (err) {
+    if (isAbsent(err) || (err as NodeJS.ErrnoException).code === "EISDIR") return null;
+    throw err;
+  }
+}
+
+/**
+ * `p` with its parent directory resolved through symlinks, lower-cased: two
+ * spellings of one worktree path compare equal (git records the canonical
+ * path; the execution row records the workspace root as configured).
+ */
+async function comparablePath(p: string): Promise<string> {
+  const resolved = path.resolve(p);
+  let parent = path.dirname(resolved);
+  try {
+    parent = await fs.realpath(parent);
+  } catch (err) {
+    if (!isAbsent(err)) throw err;
+  }
+  return path.join(parent, path.basename(resolved)).toLowerCase();
+}
+
+/**
+ * True when `p` or an existing ancestor of it is the directory `target`,
+ * compared by device and inode. Only stats; never modifies anything.
+ */
+async function liesWithin(p: string, target: { dev: number; ino: number }): Promise<boolean> {
+  let current = path.resolve(p);
+  for (;;) {
+    try {
+      const stat = await fs.stat(current);
+      if (stat.dev === target.dev && stat.ino === target.ino) return true;
+    } catch (err) {
+      if (!isAbsent(err)) throw err;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
   }
 }
 
@@ -494,11 +575,11 @@ export class WorktreeManager {
    * that locks the task and execution rows, so it never waits for the lock
    * while holding those rows. GOT.63's deleted-repository clone pass takes
    * this same lock but opens no transaction and takes no row lock at all:
-   * it re-reads whether a repository still has this name with a plain,
-   * unlocked select, immediately before `removeBareClone`, so the check and
-   * the removal race no database row, only whatever else takes this
-   * in-process lock (a concurrent `prepareImplementation` or `pushIfAhead`
-   * on the same name).
+   * it re-reads whether a repository still has this name, and the recorded
+   * worktree paths, with plain, unlocked selects, immediately before
+   * `removeBareClone`, so the check and the removal race no database row,
+   * only whatever else takes this in-process lock (a concurrent
+   * `prepareImplementation` or `pushIfAhead` on the same name, in any case).
    */
   async withRepositoryLock<T>(
     repositoryName: string,
@@ -512,9 +593,85 @@ export class WorktreeManager {
             ...options,
             repositoryName,
           }),
-        removeBareClone: () => fs.rm(barePath, { recursive: true, force: true }),
+        removeBareClone: (recordedWorktreePaths) =>
+          this.removeBareCloneLocked(barePath, recordedWorktreePaths),
       }),
     );
+  }
+
+  /**
+   * `removeBareClone`'s body. The caller holds the lock on `barePath`, so no
+   * prepare can add a worktree to the clone between the check and the
+   * removal. `fs.rm` unlinks a symlink it meets rather than following it.
+   */
+  private async removeBareCloneLocked(
+    barePath: string,
+    recordedWorktreePaths: readonly string[],
+  ): Promise<BareCloneRemoval> {
+    let clone: { dev: number; ino: number };
+    try {
+      clone = await fs.lstat(barePath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return { removed: true, usedBy: [] };
+      }
+      throw err;
+    }
+    const usedBy = await this.bareCloneUsers(barePath, clone, recordedWorktreePaths);
+    if (usedBy.length > 0) return { removed: false, usedBy };
+    await fs.rm(barePath, { recursive: true, force: true });
+    return { removed: true, usedBy: [] };
+  }
+
+  /**
+   * Worktree paths under `work/` that use the clone at `barePath` (GOT.63
+   * F1): every entry of `work/` plus each of `recordedWorktreePaths` under
+   * `work/`, kept when the clone's `worktrees/` admin directory records it
+   * or its `.git` file's `gitdir:` resolves into the clone (same device and
+   * inode as the clone or one of its ancestors, so case, `..` and symlinked
+   * path prefixes do not matter). Detection only reads; a read it cannot
+   * make for a reason other than absence throws, so the caller keeps the
+   * clone rather than guessing.
+   */
+  private async bareCloneUsers(
+    barePath: string,
+    clone: { dev: number; ino: number },
+    recordedWorktreePaths: readonly string[],
+  ): Promise<string[]> {
+    const workRoot = path.join(this.workspaceRoot, "work");
+    const candidates = new Set<string>();
+    for (const name of await readdirIfExists(workRoot)) {
+      candidates.add(path.join(workRoot, name));
+    }
+    for (const recorded of recordedWorktreePaths) {
+      const resolved = path.resolve(recorded);
+      if (resolved.startsWith(workRoot + path.sep)) candidates.add(resolved);
+    }
+    if (candidates.size === 0) return [];
+
+    const adminDir = path.join(barePath, "worktrees");
+    const recordedByGit = new Set<string>();
+    for (const id of await readdirIfExists(adminDir)) {
+      const entry = path.join(adminDir, id);
+      const gitFile = await readFileIfExists(path.join(entry, "gitdir"));
+      if (gitFile === null || gitFile.trim() === "") continue;
+      const worktree = path.dirname(path.resolve(entry, gitFile.trim()));
+      recordedByGit.add(await comparablePath(worktree));
+    }
+
+    const users: string[] = [];
+    for (const candidate of candidates) {
+      if (recordedByGit.has(await comparablePath(candidate))) {
+        users.push(candidate);
+        continue;
+      }
+      const gitFile = await readFileIfExists(path.join(candidate, ".git"));
+      const match = gitFile === null ? null : /^gitdir:\s*(.+?)\s*$/m.exec(gitFile);
+      if (match && (await liesWithin(path.resolve(candidate, match[1]!), clone))) {
+        users.push(candidate);
+      }
+    }
+    return users.sort();
   }
 
   /**

@@ -619,18 +619,35 @@ export async function listRepositoryNames(db: DbOrTx): Promise<Set<string>> {
 }
 
 /**
- * True when some repository, in any project, currently has `name` (GOT.63).
- * The worktree sweeper's authoritative check, run with no row lock
- * immediately before a bare clone named `name` is removed and after the
- * worktree manager's per-repository lock is taken: a repository recreated
- * with that name after the unlocked `listRepositoryNames` read, whether or
- * not it is mid-clone or mid-fetch under the same lock, is never deleted.
+ * True when some repository, in any project, currently has `name`, compared
+ * case-insensitively (GOT.63): on a case-insensitive filesystem a repository
+ * named `Casey` uses an existing `casey.git`. The worktree sweeper's
+ * authoritative check, run with no row lock immediately before a bare clone
+ * named `name` is removed and after the worktree manager's per-repository
+ * lock is taken: a repository recreated with that name after the unlocked
+ * `listRepositoryNames` read, whether or not it is mid-clone or mid-fetch
+ * under the same lock, is never deleted.
  */
 export async function repositoryNameExists(db: DbOrTx, name: string): Promise<boolean> {
   const [row] = await db
     .select({ one: sql`1` })
     .from(repositories)
-    .where(eq(repositories.name, name))
+    .where(sql`lower(${repositories.name}) = lower(${name})`)
     .limit(1);
   return row !== undefined;
+}
+
+/**
+ * Every recorded `executions.worktree_path`, in any state and on any host
+ * (GOT.63). Read without locks: the worktree sweeper's deleted-repository
+ * pass reads it under the worktree manager's per-repository lock, just
+ * before removing a bare clone, and keeps the clone when any of these
+ * worktrees still uses it.
+ */
+export async function listExecutionWorktreePaths(db: DbOrTx): Promise<string[]> {
+  const rows = await db
+    .selectDistinct({ worktreePath: executions.worktreePath })
+    .from(executions)
+    .where(isNotNull(executions.worktreePath));
+  return rows.flatMap((row) => (row.worktreePath === null ? [] : [row.worktreePath]));
 }

@@ -1,8 +1,12 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { listRepositoryNames, repositoryNameExists } from "../src/queries/index.js";
+import {
+  listExecutionWorktreePaths,
+  listRepositoryNames,
+  repositoryNameExists,
+} from "../src/queries/index.js";
 import * as schema from "../src/schema/index.js";
-import { startTestDb, type TestDb } from "./harness.js";
+import { seedExecution, seedFixtures, seedTask, startTestDb, type TestDb } from "./harness.js";
 
 /**
  * Queries behind the worktree sweeper's deleted-repository clone pass
@@ -121,5 +125,39 @@ describe("repositoryNameExists (GOT.63)", () => {
     // see it again, not a stale "gone" answer.
     await repository(projectId, name);
     expect(await repositoryNameExists(h.db, name)).toBe(true);
+  });
+
+  it("matches a name that differs only by case (F2: case-insensitive filesystems)", async () => {
+    const key = `RNE${++seq}`;
+    const name = `Casey_${key}`;
+    await repository(await project(key), name);
+
+    expect(await repositoryNameExists(h.db, name.toLowerCase())).toBe(true);
+    expect(await repositoryNameExists(h.db, name.toUpperCase())).toBe(true);
+  });
+});
+
+describe("listExecutionWorktreePaths (GOT.63 F1)", () => {
+  it("returns every recorded worktree_path, in any state, and skips executions with none", async () => {
+    const key = `LEW${++seq}`;
+    const fx = await seedFixtures(h.db, key);
+    const taskId = await seedTask(h.db, fx, { jiraKey: `${key}-1`, state: "IMPLEMENTING" });
+    const running = await seedExecution(h.db, taskId, { state: "RUNNING" });
+    const failed = await seedExecution(h.db, taskId, { state: "FAILED", attempt: 2 });
+    const none = await seedExecution(h.db, taskId, { state: "FAILED", attempt: 3 });
+    const pathFor = (id: string) => `/workspace/${key}/work/${id}`;
+    for (const id of [running, failed]) {
+      await h.db
+        .update(schema.executions)
+        .set({ worktreePath: pathFor(id) })
+        .where(eq(schema.executions.id, id));
+    }
+
+    const paths = await listExecutionWorktreePaths(h.db);
+
+    expect(paths).toContain(pathFor(running));
+    expect(paths).toContain(pathFor(failed));
+    expect(paths).not.toContain(pathFor(none));
+    expect(paths).not.toContain(null);
   });
 });
