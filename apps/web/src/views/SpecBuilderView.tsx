@@ -126,6 +126,11 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   // never offered and the task's own repository is used instead.
   const [selectedRepositoryId, setSelectedRepositoryId] = useState<string>("");
   const [confirmingStart, setConfirmingStart] = useState(false);
+  // GOT.81-fix1: guards POST /tasks/:id/spec/session against a double click
+  // on Confirm sending two start requests (the second can 409 after a
+  // successful first start). Also disables Cancel and re-opening the
+  // confirmation via Start while the request is in flight.
+  const [startingSession, setStartingSession] = useState(false);
 
   // Mirrors of `formContent`/`formBaseline` for `applyAggregate` below, which
   // runs at the end of an async fetch and needs the value current at that
@@ -450,17 +455,22 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   }, [revisions, readRevisionId]);
 
   async function handleStartSession() {
+    // GOT.81-fix1: a request is already in flight, ignore a second click.
+    if (startingSession) return;
     // GOT.81 D2: the task's own repository (once it has one) always wins;
     // otherwise the id the user picked and is now confirming.
     const repositoryId = aggregate?.repository?.id ?? (selectedRepositoryId === "" ? null : selectedRepositoryId);
     if (repositoryId === null) return;
     setActionError(null);
+    setStartingSession(true);
     try {
       await apiClient.startSpecSession(id, repositoryId);
       setConfirmingStart(false);
       await refetch(false);
     } catch (err) {
       setActionError(describeError(err));
+    } finally {
+      setStartingSession(false);
     }
   }
 
@@ -699,15 +709,19 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
                     <span>
                       Start spec session on {startRepositoryName}? The repository can&apos;t be changed afterwards.
                     </span>
-                    <button type="button" onClick={() => void handleStartSession()}>
+                    <button type="button" disabled={startingSession} onClick={() => void handleStartSession()}>
                       Confirm
                     </button>
-                    <button type="button" onClick={() => setConfirmingStart(false)}>
+                    <button type="button" disabled={startingSession} onClick={() => setConfirmingStart(false)}>
                       Cancel
                     </button>
                   </span>
                 ) : (
-                  <button type="button" disabled={!canStartSession} onClick={() => setConfirmingStart(true)}>
+                  <button
+                    type="button"
+                    disabled={!canStartSession || startingSession}
+                    onClick={() => setConfirmingStart(true)}
+                  >
                     Start spec session
                   </button>
                 )}

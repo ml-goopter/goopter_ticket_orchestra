@@ -868,6 +868,43 @@ describe("SpecBuilderView", () => {
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
   });
 
+  it("GOT.81-fix1: clicking Confirm twice quickly sends exactly one startSpecSession request, and disables Confirm/Cancel while in flight", async () => {
+    let resolveStart!: (value: { from: string; to: string }) => void;
+    const startPromise = new Promise<{ from: string; to: string }>((resolve) => {
+      resolveStart = resolve;
+    });
+    const startSpecSession = vi.fn().mockReturnValue(startPromise);
+    const getTask = vi.fn().mockResolvedValue(needsSpecAggregate());
+    const client = makeFakeClient({
+      getTask,
+      startSpecSession,
+      listProjectRepositories: vi.fn().mockResolvedValue([makeAdminRepository({ id: "repo-1", name: "tsk-repo" })]),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Repository") as HTMLSelectElement).value).toBe("repo-1"));
+    fireEvent.click(screen.getByRole("button", { name: "Start spec session" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy());
+
+    const confirmButton = screen.getByRole("button", { name: "Confirm" }) as HTMLButtonElement;
+    const cancelButton = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+    fireEvent.click(cancelButton);
+
+    expect(startSpecSession).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Confirm" }) as HTMLButtonElement).disabled).toBe(true));
+    expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => {
+      resolveStart({ from: "NEEDS_SPEC", to: "SPEC_IN_PROGRESS" });
+      await startPromise;
+    });
+
+    expect(startSpecSession).toHaveBeenCalledTimes(1);
+  });
+
   it("GOT.81: surfaces the api's error code when starting the session fails", async () => {
     const startSpecSession = vi
       .fn()
