@@ -36,7 +36,7 @@ const logger: Logger = {
 function fakeClient(): JiraClient {
   return {
     search: vi.fn(),
-    issueExists: vi.fn(),
+    getIssueStatus: vi.fn(),
     getIssue: vi.fn(),
     addComment: vi.fn(),
   };

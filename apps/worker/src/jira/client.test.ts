@@ -74,7 +74,7 @@ describe("createJiraClient.search (design.md §11.1, E1, C1)", () => {
     const req = requests[0]!;
     expect(req.path).toBe("/rest/api/3/search/jql");
     expect(req.query.get("jql")).toBe("project = GOOP ORDER BY created ASC");
-    expect(req.query.get("fields")).toBe("summary,priority,created");
+    expect(req.query.get("fields")).toBe("summary,priority,created,status");
     const expectedAuth = `Basic ${Buffer.from("bot@goopter.dev:secret-token").toString("base64")}`;
     expect(req.headers.authorization).toBe(expectedAuth);
   });
@@ -130,32 +130,81 @@ describe("createJiraClient.search (design.md §11.1, E1, C1)", () => {
 
     await expect(client.search("project = GOOP")).rejects.toThrow(JiraApiError);
   });
-});
 
-describe("createJiraClient.issueExists (design.md §11.1, E3)", () => {
-  it("returns true on 200", async () => {
-    const { baseUrl, requests } = await setUp(() => ({
+  it("parses each issue's status category key, null when Jira omits it (GOT.77)", async () => {
+    const { baseUrl } = await setUp(() => ({
       status: 200,
-      body: { fields: { summary: "s" } },
+      body: {
+        issues: [
+          {
+            key: "GOOP-1",
+            fields: {
+              summary: "closed",
+              priority: { id: "1" },
+              created: "2026-01-01T00:00:00.000+0000",
+              status: { name: "Done", statusCategory: { key: "done" } },
+            },
+          },
+          {
+            key: "GOOP-2",
+            fields: {
+              summary: "open",
+              priority: { id: "1" },
+              created: "2026-01-01T00:00:00.000+0000",
+              status: { name: "In Progress", statusCategory: { key: "indeterminate" } },
+            },
+          },
+          {
+            key: "GOOP-3",
+            fields: { summary: "no status", priority: { id: "1" }, created: "2026-01-01T00:00:00.000+0000" },
+          },
+        ],
+      },
     }));
     const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
 
-    await expect(client.issueExists("GOOP-1")).resolves.toBe(true);
+    const issues = await client.search("project = GOOP");
+
+    expect(issues.map((i) => i.statusCategory)).toEqual(["done", "indeterminate", null]);
+  });
+});
+
+describe("createJiraClient.getIssueStatus (design.md §11.1, E3, GOT.77)", () => {
+  it("returns the status category key on 200, requesting only the status field", async () => {
+    const { baseUrl, requests } = await setUp(() => ({
+      status: 200,
+      body: { fields: { status: { name: "Done", statusCategory: { key: "done" } } } },
+    }));
+    const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
+
+    await expect(client.getIssueStatus("GOOP-1")).resolves.toEqual({ statusCategory: "done" });
     expect(requests[0]!.path).toBe("/rest/api/3/issue/GOOP-1");
+    expect(requests[0]!.query.get("fields")).toBe("status");
   });
 
-  it("returns false on 404", async () => {
+  it("returns a null status category on 200 when Jira omits the status", async () => {
+    const { baseUrl } = await setUp(() => ({ status: 200, body: { fields: {} } }));
+    const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
+
+    await expect(client.getIssueStatus("GOOP-1")).resolves.toEqual({ statusCategory: null });
+  });
+
+  it("returns null on 404", async () => {
     const { baseUrl } = await setUp(() => ({ status: 404 }));
     const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
 
-    await expect(client.issueExists("GOOP-1")).resolves.toBe(false);
+    await expect(client.getIssueStatus("GOOP-1")).resolves.toBeNull();
   });
 
-  it("throws JiraApiError on any other status", async () => {
-    const { baseUrl } = await setUp(() => ({ status: 500 }));
-    const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
+  it("throws JiraApiError on 5xx and 429", async () => {
+    for (const status of [500, 429]) {
+      const { baseUrl } = await setUp(() => ({ status }));
+      const client = createJiraClient({ baseUrl, email: "e", apiToken: "t" });
 
-    await expect(client.issueExists("GOOP-1")).rejects.toThrow(JiraApiError);
+      await expect(client.getIssueStatus("GOOP-1")).rejects.toThrow(JiraApiError);
+      await cleanup?.();
+      cleanup = undefined;
+    }
   });
 });
 
