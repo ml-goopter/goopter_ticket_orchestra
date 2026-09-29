@@ -74,6 +74,20 @@
   color: var(--color-text-faint);
 }
 
+/* The user's own chat turn (GOT.57 D1: `spec.message`), right-aligned
+ * against the agent's left-aligned `.spec-builder__bubble--agent`. */
+.spec-builder__bubble--user {
+  align-self: flex-end;
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-accent-contrast);
+}
+
+.spec-builder__bubble--user .spec-builder__bubble-meta {
+  color: var(--color-accent-contrast);
+  opacity: 0.8;
+}
+
 .spec-builder__bubble-text .markdown {
   font-size: var(--font-size-base);
 }
