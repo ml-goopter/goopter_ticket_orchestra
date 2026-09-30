@@ -109,3 +109,33 @@ describe("TimelineRow JSON preview (GOT.65)", () => {
     });
   });
 });
+
+describe("TimelineRow row tints (UR3 AC5)", () => {
+  it("gives a failed tool call a danger tint", () => {
+    renderRow(
+      makeItem({ kind: "tool_call", toolName: "run_tests", toolInput: {}, toolOk: false, toolError: "boom" }),
+    );
+
+    expect(screen.getByTestId("timeline-item").className).toContain("timeline-item--danger");
+  });
+
+  it("does not tint a successful tool call", () => {
+    renderRow(makeItem({ kind: "tool_call", toolName: "run_tests", toolInput: {}, toolOk: true }));
+
+    expect(screen.getByTestId("timeline-item").className).not.toContain("timeline-item--danger");
+  });
+
+  it("gives an issue row an attention tint", () => {
+    renderRow(makeItem({ kind: "issue", type: "issue.created", issueTitle: "Which pagination style?" }));
+
+    expect(screen.getByTestId("timeline-item").className).toContain("timeline-item--attention");
+  });
+
+  it("does not tint a row that is neither a failed tool call nor an issue", () => {
+    renderRow(makeItem({ kind: "state_changed", type: "task.state_changed", from: "READY", to: "IMPLEMENTING" }));
+
+    const className = screen.getByTestId("timeline-item").className;
+    expect(className).not.toContain("timeline-item--danger");
+    expect(className).not.toContain("timeline-item--attention");
+  });
+});
