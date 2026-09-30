@@ -1,8 +1,8 @@
 /**
- * Spec builder (U4, docs/design.md §14 Spec builder row). Builds on
- * `.split`/`.split__pane`, `.form-grid`, `.field`, `.alert`, `.card`,
- * `.empty-state`, `.markdown`, `.badge` from styles/components.css; only
- * classes local to this view live here.
+ * Spec builder (U4, UR4, docs/design.md §14 Spec builder row). Builds on
+ * `.topbar`, `.split`/`.split__pane`, `.tabs`, `.form-grid`, `.field`,
+ * `.alert`, `.card`, `.empty-state`, `.markdown`, `.badge`, `.btn`, `.tag`
+ * from styles/components.css; only classes local to this view live here.
  */
 
 /* Visually hides a machine-readable helper node (e.g. the raw task-state
@@ -19,23 +19,52 @@
   border: 0;
 }
 
-/* Fills the viewport below the app bar and this view's own header row
- * (design.md §14: "filling the viewport height below the header"), mirroring
- * `.kanban__column`'s `calc(100vh - 56px - var(--space-12))` plus an
- * allowance for the header/alert row above the split. */
+/* --------------------------------------------------------------------
+ * Topbar (UR4 mockup): breadcrumb (Board / KEY / Spec), the task's state
+ * badge, and its summary right-aligned via the shared `.topbar__spacer`.
+ * ------------------------------------------------------------------ */
+.spec-builder__topbar {
+  margin-bottom: var(--space-5);
+}
+
+.spec-builder__crumb-key {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.spec-builder__topbar-summary {
+  color: var(--color-text-faint);
+  font-size: var(--font-size-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Fills the viewport below the app's page padding and this view's own
+ * topbar (design.md §14: "filling the viewport height below the header"),
+ * mirroring `.kanban__column`'s `calc(100vh - 56px - var(--space-12))`. The
+ * topbar above is 52px tall (`.topbar`, styles/components.css) plus its own
+ * bottom margin. */
 .spec-builder__split {
-  height: calc(100vh - 56px - var(--space-12) - 64px);
+  height: calc(100vh - var(--space-12) - 52px - var(--space-5));
   min-height: 420px;
 }
 
 /* --------------------------------------------------------------------
  * Chat pane: scrolling message list plus a composer pinned to the bottom
  * (never scrolls out of view, unlike the draft pane's sticky footer).
+ * Sized to roughly 40% of the split, the draft pane taking the rest
+ * (AC2/UR4 mockup `.split{grid-template-columns:minmax(360px,5fr) 7fr}`).
  * ------------------------------------------------------------------ */
 .split__pane.spec-builder__chat-pane {
+  flex: 0 1 40%;
   display: flex;
   flex-direction: column;
   overflow-y: hidden;
+}
+
+.split__pane.spec-builder__draft-pane {
+  flex: 1 1 60%;
 }
 
 .spec-builder__chat-header {
@@ -45,6 +74,32 @@
   justify-content: space-between;
   gap: var(--space-3);
   margin-bottom: var(--space-3);
+}
+
+.spec-builder__chat-header h2 {
+  margin: 0;
+}
+
+.spec-builder__start-session {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.spec-builder__repo-select.field {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+
+.spec-builder__confirm-start {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
 }
 
 .spec-builder__chat-list {
@@ -61,11 +116,10 @@
 
 .spec-builder__bubble {
   align-self: flex-start;
-  max-width: 85%;
-  background: var(--color-surface-raised);
-  border: 1px solid var(--color-border);
+  max-width: 88%;
+  background: var(--color-surface-sunken);
   border-radius: var(--radius-lg);
-  padding: var(--space-3);
+  padding: var(--space-2) var(--space-3);
 }
 
 .spec-builder__bubble-meta {
@@ -79,7 +133,6 @@
 .spec-builder__bubble--user {
   align-self: flex-end;
   background: var(--color-accent);
-  border-color: var(--color-accent);
   color: var(--color-accent-contrast);
 }
 
@@ -94,9 +147,23 @@
 
 .spec-builder__tool-line {
   align-self: flex-start;
-  font-size: var(--font-size-xs);
-  color: var(--color-text-faint);
-  font-family: var(--font-mono);
+}
+
+/* A typing indicator on a not-yet-final agent message (UR4 mockup
+ * `.typing`): three static dots rather than an animation, kept simple. */
+.spec-builder__typing {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: var(--space-1);
+  vertical-align: middle;
+}
+
+.spec-builder__typing i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-text-faint);
+  opacity: 0.6;
 }
 
 .spec-builder__composer {
@@ -128,27 +195,57 @@
 }
 
 /* --------------------------------------------------------------------
- * Draft pane: the structured form (editable) or the read-only approved
- * spec, with a sticky action footer.
+ * Draft pane: a tab bar (Draft vN / Revisions (n)) pinned to the top, a
+ * scrolling body showing whichever tab is active, and a sticky action
+ * footer -- the same three-band layout as the chat pane above.
  * ------------------------------------------------------------------ */
-.spec-builder__draft-pane h2 {
-  margin-top: 0;
+.split__pane.spec-builder__draft-pane {
+  display: flex;
+  flex-direction: column;
+  overflow-y: hidden;
 }
 
+.spec-builder__draft-tabs {
+  flex-shrink: 0;
+}
+
+/* The "Unsaved changes" indicator (AC5) sits in the tab bar itself,
+ * pushed to the far right. */
 .spec-builder__unsaved {
+  margin-left: auto;
+  padding-bottom: var(--space-2);
   color: var(--color-attention-fg);
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-xs);
+}
+
+.spec-builder__draft-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.spec-builder__draft-body h2 {
+  margin-top: 0;
 }
 
 .spec-draft-form textarea {
   resize: vertical;
 }
 
-.spec-draft-form__field--highlighted {
-  background: var(--color-attention-bg);
-  border-radius: var(--radius-md);
-  padding: var(--space-2);
-  margin: calc(var(--space-2) * -1);
+.spec-draft-form__field-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Highlighted fields (design.md §14: changed by the agent) get an
+ * attention-coloured border on the control itself, matching the mockup's
+ * `.f.hl textarea`, plus the "Updated by agent" tag in the field header. */
+.spec-draft-form__field--highlighted textarea,
+.spec-draft-form__field--highlighted input {
+  border-color: var(--color-attention-fg);
+  background: var(--color-attention-soft);
+  box-shadow: 0 0 0 3px var(--color-attention-bg);
 }
 
 .spec-builder__approved {
@@ -160,15 +257,10 @@
   font-size: var(--font-size-sm);
 }
 
-/* Sticky footer background matches the page background (body, base.css),
- * not `--color-surface`: the pane it sits in has no background of its
- * own, so a surface-white footer drew a visible white strip over it. */
 .spec-builder__draft-actions {
-  position: sticky;
-  bottom: 0;
-  background: var(--color-surface-sunken);
+  flex-shrink: 0;
   border-top: 1px solid var(--color-border);
-  margin-top: var(--space-4);
+  margin-top: var(--space-3);
   padding-top: var(--space-3);
 }
 
@@ -176,18 +268,33 @@
   margin-bottom: 0;
 }
 
-/* --------------------------------------------------------------------
- * Revision history/diff (below the split, scrolls with the page). Rows
- * are compact (version, status badge, Time) so the card stays a handful
- * of rows tall; the compare/diff/view controls live inside a collapsed
- * <details> so they don't add height until opened (S1, SCRUM-93 visual
- * check: this card was 2,456px tall with raw ISO timestamps and an
- * always-expanded diff).
- * ------------------------------------------------------------------ */
-.spec-builder__revisions {
-  margin-top: var(--space-5);
+.spec-builder__blocker {
+  margin-bottom: var(--space-3);
 }
 
+.spec-builder__actions-sep {
+  display: inline-block;
+  width: 1px;
+  height: 20px;
+  background: var(--color-border);
+  margin: 0 var(--space-1);
+}
+
+.toolbar label.spec-builder__runtime {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-faint);
+}
+
+/* --------------------------------------------------------------------
+ * Revision history/diff (the Revisions tab's panel). Rows are compact
+ * (version, status badge, Time) so the panel stays scannable; the
+ * compare/diff/view controls live inside a collapsed <details> so they
+ * don't add height until opened (S1, SCRUM-93 visual check).
+ * ------------------------------------------------------------------ */
 .spec-builder__revision-list {
   list-style: none;
   margin: 0 0 var(--space-3);
@@ -224,7 +331,9 @@
     height: auto;
   }
 
-  .split__pane.spec-builder__chat-pane {
+  .split__pane.spec-builder__chat-pane,
+  .split__pane.spec-builder__draft-pane {
+    flex-basis: auto;
     overflow-y: visible;
   }
 
@@ -234,5 +343,9 @@
 
   .spec-builder__composer {
     position: static;
+  }
+
+  .spec-builder__draft-body {
+    overflow-y: visible;
   }
 }
