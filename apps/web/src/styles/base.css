@@ -17,7 +17,7 @@ html {
 
 body {
   margin: 0;
-  background: var(--color-surface-sunken);
+  background: var(--color-page-bg);
   color: var(--color-text);
   font-family: var(--font-sans);
   font-size: var(--font-size-base);

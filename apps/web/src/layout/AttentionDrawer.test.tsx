@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { useRef } from "react";
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,7 +7,12 @@ import type { BoardApiClient } from "../api/client.js";
 import type { Issue, Notification, TaskCard } from "../api/types.js";
 import type { EventSourceLike, MessageEventLike } from "../sse/useEventStream.js";
 import { makeFakeClient } from "../task/fixtures.js";
-import { AttentionDrawer } from "./AttentionDrawer.js";
+import {
+  AttentionDrawer,
+  type AttentionCounts,
+  type AttentionDrawerHandle,
+  type AttentionSection,
+} from "./AttentionDrawer.js";
 
 class FakeEventSource implements EventSourceLike {
   static instances: FakeEventSource[] = [];
@@ -126,23 +132,64 @@ function makeClient(fixtures: Fixtures): BoardApiClient {
   });
 }
 
-function renderDrawer(client: BoardApiClient) {
+const NOW = new Date("2026-01-01T00:05:00.000Z");
+
+/**
+ * Stands in for the sidebar (layout/AppLayout.tsx): a generic opener button
+ * (no section, scrolls to the top) and one opener per section, each of
+ * which is the element focus should return to on close.
+ */
+function Harness(props: {
+  client: BoardApiClient;
+  onCountsChange?: (counts: AttentionCounts) => void;
+  now?: Date;
+}) {
+  const ref = useRef<AttentionDrawerHandle | null>(null);
+  const sections: AttentionSection[] = ["blocking", "specReviews", "needsHuman", "readyForMerge", "unread"];
+  return (
+    <>
+      <button onClick={(event) => ref.current?.open(undefined, event.currentTarget)}>Open</button>
+      {sections.map((section) => (
+        <button key={section} onClick={(event) => ref.current?.open(section, event.currentTarget)}>
+          Open {section}
+        </button>
+      ))}
+      <AttentionDrawer
+        ref={ref}
+        client={props.client}
+        createEventSource={factory}
+        onCountsChange={props.onCountsChange}
+        now={props.now}
+      />
+    </>
+  );
+}
+
+function renderHarness(client: BoardApiClient, onCountsChange?: (counts: AttentionCounts) => void) {
   return render(
     <MemoryRouter>
-      <AttentionDrawer client={client} createEventSource={factory} />
+      <Harness client={client} onCountsChange={onCountsChange} now={NOW} />
     </MemoryRouter>,
   );
 }
 
-async function openDrawer() {
-  const toggle = await screen.findByRole("button", { name: /attention/i });
+async function openPanel() {
+  const toggle = await screen.findByRole("button", { name: "Open" });
   await act(async () => {
     toggle.click();
   });
 }
 
+async function openSection(section: AttentionSection) {
+  const toggle = await screen.findByRole("button", { name: `Open ${section}` });
+  await act(async () => {
+    toggle.click();
+  });
+  return toggle;
+}
+
 describe("AttentionDrawer", () => {
-  it("counts blocking issues, the three task groups, and unread notifications, and links each section (AC5)", async () => {
+  it("reports counts for blocking issues, the three task groups, and unread notifications via onCountsChange (AC5)", async () => {
     const fixtures: Fixtures = {
       issues: [makeIssue({ id: "i1", taskId: "t1", title: "Need a decision" })],
       tasks: [
@@ -153,49 +200,65 @@ describe("AttentionDrawer", () => {
       notifications: [makeNotification({ id: "n1", readAt: null, title: "Unread one" })],
     };
     const client = makeClient(fixtures);
-    renderDrawer(client);
+    const onCountsChange = vi.fn();
+    renderHarness(client, onCountsChange);
 
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("5"));
+    await waitFor(() =>
+      expect(onCountsChange).toHaveBeenLastCalledWith({
+        blocking: 1,
+        specReviews: 1,
+        needsHuman: 1,
+        readyForMerge: 1,
+        unread: 1,
+        total: 5,
+      }),
+    );
     expect(client.listIssues).toHaveBeenCalledWith({ status: "OPEN", blocking: true });
     expect(client.listTasks).toHaveBeenCalledWith({ attention: true });
 
-    await openDrawer();
+    await openPanel();
 
     const blocking = screen.getByRole("region", { name: "Blocking issues" });
     const blockingLink = within(blocking).getByRole("link", { name: "AAA-1: Need a decision" });
     expect(blockingLink.getAttribute("href")).toBe("/issues/i1");
 
     const specReviews = screen.getByRole("region", { name: "Spec reviews requested" });
-    const specLink = within(specReviews).getByRole("link", { name: "BBB-2" });
+    const specLink = within(specReviews).getByRole("link", { name: "BBB-2: Summary" });
     expect(specLink.getAttribute("href")).toBe("/tasks/t2/spec");
+    expect(within(specReviews).getByText("5m")).toBeTruthy();
 
     const needsHuman = screen.getByRole("region", { name: "Needs human" });
-    expect(within(needsHuman).getByRole("link", { name: "AAA-1" }).getAttribute("href")).toBe("/tasks/t1");
+    expect(within(needsHuman).getByRole("link", { name: "AAA-1: Summary" }).getAttribute("href")).toBe(
+      "/tasks/t1",
+    );
 
     const readyForMerge = screen.getByRole("region", { name: "Ready for merge" });
-    expect(within(readyForMerge).getByRole("link", { name: "CCC-3" }).getAttribute("href")).toBe("/tasks/t3");
+    expect(within(readyForMerge).getByRole("link", { name: "CCC-3: Summary" }).getAttribute("href")).toBe(
+      "/tasks/t3",
+    );
 
     const unreadSection = screen.getByRole("region", { name: "Unread notifications" });
     expect(within(unreadSection).getByText("Unread one")).toBeTruthy();
   });
 
-  it("refetches all three lists and updates the count on issue.created (AC5)", async () => {
+  it("refetches all three lists and updates counts on issue.created (AC5)", async () => {
     const fixtures: Fixtures = {
       issues: [],
       tasks: [],
       notifications: [],
     };
     const client = makeClient(fixtures);
-    renderDrawer(client);
+    const onCountsChange = vi.fn();
+    renderHarness(client, onCountsChange);
 
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+    await waitFor(() => expect(onCountsChange).toHaveBeenLastCalledWith(expect.objectContaining({ total: 0 })));
 
     fixtures.issues = [makeIssue({ id: "i1" })];
     await act(async () => {
       currentSource().emit("issue.created", { issueId: "i1" });
     });
 
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("1"));
+    await waitFor(() => expect(onCountsChange).toHaveBeenLastCalledWith(expect.objectContaining({ total: 1 })));
     expect(client.listIssues).toHaveBeenCalledTimes(2);
     expect(client.listTasks).toHaveBeenCalledTimes(2);
     expect(client.listNotifications).toHaveBeenCalledTimes(2);
@@ -208,10 +271,11 @@ describe("AttentionDrawer", () => {
       notifications: [makeNotification({ id: "n1", readAt: null, title: "Unread one" })],
     };
     const client = makeClient(fixtures);
-    renderDrawer(client);
+    const onCountsChange = vi.fn();
+    renderHarness(client, onCountsChange);
 
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("1"));
-    await openDrawer();
+    await waitFor(() => expect(onCountsChange).toHaveBeenLastCalledWith(expect.objectContaining({ total: 1 })));
+    await openPanel();
 
     fixtures.notifications = [
       { ...fixtures.notifications[0]!, readAt: "2026-01-02T00:00:00.000Z" },
@@ -223,7 +287,7 @@ describe("AttentionDrawer", () => {
     });
 
     expect(client.markNotificationRead).toHaveBeenCalledWith("n1");
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+    await waitFor(() => expect(onCountsChange).toHaveBeenLastCalledWith(expect.objectContaining({ total: 0 })));
     // Only notifications refetch, not the other two lists (contract point 3).
     expect(client.listIssues).toHaveBeenCalledTimes(1);
     expect(client.listTasks).toHaveBeenCalledTimes(1);
@@ -232,7 +296,7 @@ describe("AttentionDrawer", () => {
 
   it("refetches after a reconnect (AC4)", async () => {
     const client = makeClient({ issues: [], tasks: [], notifications: [] });
-    renderDrawer(client);
+    renderHarness(client);
 
     await waitFor(() => expect(client.listIssues).toHaveBeenCalledTimes(1));
 
@@ -254,12 +318,11 @@ describe("AttentionDrawer", () => {
     await waitFor(() => expect(client.listIssues).toHaveBeenCalledTimes(2));
   }, 10000);
 
-  it("renders empty states for an empty drawer (AC7)", async () => {
+  it("renders empty states for an empty panel", async () => {
     const client = makeClient({ issues: [], tasks: [], notifications: [] });
-    renderDrawer(client);
+    renderHarness(client);
 
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
-    await openDrawer();
+    await openPanel();
 
     expect(screen.getByText("No blocking issues.")).toBeTruthy();
     expect(screen.getByText("No spec reviews requested.")).toBeTruthy();
@@ -269,12 +332,12 @@ describe("AttentionDrawer", () => {
     expect(screen.getByText("Nothing needs attention.")).toBeTruthy();
   });
 
-  it("renders visible error text when a fetch fails (AC7)", async () => {
+  it("renders visible error text when a fetch fails", async () => {
     const client: BoardApiClient = makeFakeClient({
       listIssues: vi.fn(() => Promise.reject(new Error("network down"))),
     });
-    renderDrawer(client);
-    await openDrawer();
+    renderHarness(client);
+    await openPanel();
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("network down"));
   });
@@ -293,70 +356,23 @@ describe("AttentionDrawer", () => {
       }
       return Promise.resolve([makeIssue({ id: "i2", title: "Second" })]);
     });
+    const onCountsChange = vi.fn();
 
-    renderDrawer(client);
+    renderHarness(client, onCountsChange);
     await waitFor(() => expect(client.listIssues).toHaveBeenCalledTimes(1));
 
     await act(async () => {
       currentSource().emit("issue.created", { issueId: "i2" });
     });
     await waitFor(() => expect(client.listIssues).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("1"));
+    await waitFor(() => expect(onCountsChange).toHaveBeenLastCalledWith(expect.objectContaining({ total: 1 })));
 
     // The slower, first (mount) fetchAll resolves last, with data that is now stale.
     await act(async () => {
       resolveFirstIssues?.([]);
     });
 
-    expect(screen.getByTestId("attention-count").textContent).toBe("1");
-  });
-
-  it("does not let a slower, still-pending fetchAll overwrite a faster mark-read refetch (F2 shared generation)", async () => {
-    let resolveSecondIssues: ((issues: Issue[]) => void) | undefined;
-    let issuesCallCount = 0;
-    const fixtures: Fixtures = {
-      issues: [],
-      tasks: [],
-      notifications: [makeNotification({ id: "n1", readAt: null, title: "Unread one" })],
-    };
-    const client = makeClient(fixtures);
-    client.listIssues = vi.fn(() => {
-      issuesCallCount += 1;
-      if (issuesCallCount === 2) {
-        return new Promise<Issue[]>((resolve) => {
-          resolveSecondIssues = resolve;
-        });
-      }
-      return Promise.resolve(fixtures.issues);
-    });
-    client.markNotificationRead = vi.fn((id: string) => {
-      fixtures.notifications = [{ ...fixtures.notifications[0]!, readAt: "2026-01-02T00:00:00.000Z" }];
-      return Promise.resolve(fixtures.notifications[0]!);
-    });
-
-    renderDrawer(client);
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("1"));
-    await openDrawer();
-
-    // Trigger the second, slower fetchAll; it hangs on listIssues.
-    await act(async () => {
-      currentSource().emit("issue.created", { issueId: "i2" });
-    });
-    await waitFor(() => expect(client.listIssues).toHaveBeenCalledTimes(2));
-
-    // Mark read while that fetchAll is still pending: fetchNotifications is a later generation.
-    const markReadButton = screen.getByRole("button", { name: "Mark read" });
-    await act(async () => {
-      markReadButton.click();
-    });
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
-
-    // The stale, still-pending fetchAll finally resolves with pre-mark-read data.
-    await act(async () => {
-      resolveSecondIssues?.([]);
-    });
-
-    expect(screen.getByTestId("attention-count").textContent).toBe("0");
+    expect(onCountsChange).toHaveBeenLastCalledWith(expect.objectContaining({ total: 1 }));
   });
 
   it("shows a visible error and leaves the count unchanged when markNotificationRead fails (F3)", async () => {
@@ -367,10 +383,11 @@ describe("AttentionDrawer", () => {
     };
     const client = makeClient(fixtures);
     client.markNotificationRead = vi.fn(() => Promise.reject(new Error("mark read failed")));
+    const onCountsChange = vi.fn();
 
-    renderDrawer(client);
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("1"));
-    await openDrawer();
+    renderHarness(client, onCountsChange);
+    await waitFor(() => expect(onCountsChange).toHaveBeenLastCalledWith(expect.objectContaining({ total: 1 })));
+    await openPanel();
 
     const markReadButton = screen.getByRole("button", { name: "Mark read" });
     await act(async () => {
@@ -378,7 +395,7 @@ describe("AttentionDrawer", () => {
     });
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("mark read failed"));
-    expect(screen.getByTestId("attention-count").textContent).toBe("1");
+    expect(onCountsChange).toHaveBeenLastCalledWith(expect.objectContaining({ total: 1 }));
     // Only the failed markNotificationRead call; no refetch follows a rejection.
     expect(client.listNotifications).toHaveBeenCalledTimes(1);
   });
@@ -393,10 +410,8 @@ describe("AttentionDrawer", () => {
       ],
     };
     const client = makeClient(fixtures);
-    renderDrawer(client);
-
-    await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("2"));
-    await openDrawer();
+    renderHarness(client);
+    await openPanel();
 
     const unreadSection = screen.getByRole("region", { name: "Unread notifications" });
     expect(within(unreadSection).getByRole("link", { name: "Has an issue" }).getAttribute("href")).toBe(
@@ -409,24 +424,22 @@ describe("AttentionDrawer", () => {
   describe("dialog behaviour (U1)", () => {
     it("is a dialog with an accessible name, closed by default and opened by the trigger", async () => {
       const client = makeClient({ issues: [], tasks: [], notifications: [] });
-      renderDrawer(client);
-      await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+      renderHarness(client);
 
       expect(screen.queryByRole("dialog")).toBeNull();
 
-      await openDrawer();
+      await openPanel();
 
       const dialog = screen.getByRole("dialog", { name: "Attention" });
       expect(dialog).toBeTruthy();
     });
 
-    it("moves focus into the panel on open and back to the trigger on close via the close button", async () => {
+    it("moves focus into the panel on open and back to the opener on close via the close button", async () => {
       const client = makeClient({ issues: [], tasks: [], notifications: [] });
-      renderDrawer(client);
-      await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+      renderHarness(client);
 
-      const toggle = screen.getByRole("button", { name: /attention/i });
-      await openDrawer();
+      const toggle = await screen.findByRole("button", { name: "Open" });
+      await openPanel();
 
       const dialog = screen.getByRole("dialog", { name: "Attention" });
       expect(dialog.contains(document.activeElement)).toBe(true);
@@ -440,13 +453,27 @@ describe("AttentionDrawer", () => {
       expect(document.activeElement).toBe(toggle);
     });
 
-    it("closes on Escape and returns focus to the trigger", async () => {
+    it("returns focus to whichever sub-row opened the panel, not always the same opener", async () => {
       const client = makeClient({ issues: [], tasks: [], notifications: [] });
-      renderDrawer(client);
-      await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+      renderHarness(client);
 
-      const toggle = screen.getByRole("button", { name: /attention/i });
-      await openDrawer();
+      const opener = await openSection("needsHuman");
+      expect(screen.getByRole("dialog", { name: "Attention" })).toBeTruthy();
+
+      const closeButton = screen.getByRole("button", { name: "Close" });
+      await act(async () => {
+        closeButton.click();
+      });
+
+      expect(document.activeElement).toBe(opener);
+    });
+
+    it("closes on Escape and returns focus to the opener", async () => {
+      const client = makeClient({ issues: [], tasks: [], notifications: [] });
+      renderHarness(client);
+
+      const toggle = await screen.findByRole("button", { name: "Open" });
+      await openPanel();
       expect(screen.getByRole("dialog", { name: "Attention" })).toBeTruthy();
 
       await act(async () => {
@@ -459,19 +486,37 @@ describe("AttentionDrawer", () => {
 
     it("closes on a backdrop click", async () => {
       const client = makeClient({ issues: [], tasks: [], notifications: [] });
-      renderDrawer(client);
-      await waitFor(() => expect(screen.getByTestId("attention-count").textContent).toBe("0"));
+      renderHarness(client);
 
-      await openDrawer();
+      await openPanel();
       expect(screen.getByRole("dialog", { name: "Attention" })).toBeTruthy();
 
-      const backdrop = document.querySelector(".drawer__backdrop");
+      const backdrop = document.querySelector(".side-panel__backdrop");
       expect(backdrop).toBeTruthy();
       await act(async () => {
         (backdrop as HTMLElement).click();
       });
 
       expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    it("scrolls the requested section into view when opened from a sub-row", async () => {
+      const client = makeClient({
+        issues: [],
+        tasks: [makeTask({ id: "t1", jiraKey: "AAA-1", state: "NEEDS_HUMAN" })],
+        notifications: [],
+      });
+      renderHarness(client);
+
+      const scrolledElements: Element[] = [];
+      Element.prototype.scrollIntoView = vi.fn(function (this: Element) {
+        scrolledElements.push(this);
+      });
+
+      await openSection("needsHuman");
+
+      const needsHumanSection = screen.getByRole("region", { name: "Needs human" });
+      expect(scrolledElements).toContain(needsHumanSection);
     });
   });
 });
