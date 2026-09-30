@@ -52,6 +52,7 @@ import type { LogFields, Logger } from "../src/logger.js";
 import { createDefaultPhases } from "../src/phases/index.js";
 import type { PricingTable } from "../src/pricing/index.js";
 import {
+  BACKGROUND_DELEGATION_DETAIL,
   DEFAULT_REVIEW_WRAPPER_BIN,
   PROTOCOL_VIOLATION_DETAIL,
   ResumeError,
@@ -887,6 +888,48 @@ describe("after the turn (design.md §9.3, §8)", () => {
     expect(row.endReason).toBe("protocol_violation");
     expect(row.endDetail).toBe(PROTOCOL_VIOLATION_DETAIL);
     expect((await task(s.taskId)).state).toBe("IMPLEMENTING");
+    await expectCleanedUp(h, s.executionId);
+  });
+
+  it("turn ended with a background subagent still running and no terminal call -> FAILED protocol_violation naming background delegation (GOT.101)", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    h.adapter.script = async function* () {
+      yield { type: "session", sessionId: "sess-5b" };
+      yield { type: "tool_call", name: "Agent", input: { prompt: "do it", run_in_background: true } };
+      yield { type: "tool_result", name: "Agent", ok: true };
+      yield { type: "turn_done", finalText: "Now I'll delegate...", backgroundSubagents: 1 };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("FAILED");
+    expect(row.endReason).toBe("protocol_violation");
+    expect(row.endDetail).toBe(BACKGROUND_DELEGATION_DETAIL);
+    expect(row.endDetail).toMatch(/background delegation/);
+    expect(row.endDetail).toMatch(
+      /expected report_pr_created, report_failed, or a blocking raise_issue$/,
+    );
+    expect((await task(s.taskId)).state).toBe("IMPLEMENTING");
+    await expectCleanedUp(h, s.executionId);
+  });
+
+  it("a blocking raise with a background subagent still running -> WAITING_FOR_USER as before (GOT.101)", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({ workerId: s.workerId });
+    h.adapter.script = async function* ({ executionId }) {
+      yield { type: "session", sessionId: "sess-5c" };
+      h.registry.get(executionId)!.blockingPending = true;
+      yield { type: "turn_done", finalText: "stopping", backgroundSubagents: 1 };
+    };
+
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("WAITING_FOR_USER");
+    expect(row.endReason).toBeNull();
+    expect(row.endDetail).toBeNull();
     await expectCleanedUp(h, s.executionId);
   });
 

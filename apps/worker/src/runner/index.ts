@@ -39,6 +39,8 @@ export {
   revisionResumePrompt,
 } from "./issues.js";
 export {
+  BACKGROUND_DELEGATION_DETAIL,
+  BACKGROUND_DELEGATION_NUDGE,
   DEFAULT_REVIEW_WRAPPER_BIN,
   DEFAULT_RUNNER_SHUTDOWN_TIMEOUT_MS,
   DEFAULT_RUNNER_TIMINGS,
@@ -49,7 +51,9 @@ export {
   createRunner,
   freshRetryHeader,
   infraRetryResumePrompt,
+  protocolNudgePrompt,
   type FreshSessionReason,
+  type ProtocolNudge,
   type ResumeErrorCode,
   type ResumeInput,
   type RetryStart,

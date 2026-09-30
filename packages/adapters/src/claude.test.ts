@@ -2047,3 +2047,224 @@ describe("ClaudeAdapter keeps the execution token off the CLI argv (design.md §
     },
   );
 });
+
+describe("ClaudeAdapter background subagents at turn end (GOT.101)", () => {
+  // SDK message shapes from the installed `sdk.d.ts`: `tool_use` blocks for
+  // Agent and Task, and the `task_started`, `task_updated` and
+  // `task_notification` system messages that bracket a subagent's life.
+  const toolUse = (id: string, name: string, input: Record<string, unknown>) =>
+    cast({
+      type: "assistant",
+      session_id: SESSION_ID,
+      parent_tool_use_id: null,
+      uuid: `u-${id}`,
+      message: {
+        role: "assistant",
+        content: [{ type: "tool_use", id, name, input }],
+      },
+    });
+  const toolResult = (id: string) =>
+    cast({
+      type: "user",
+      session_id: SESSION_ID,
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: id, content: "launched" }],
+      },
+    });
+  const taskStarted = (fields: Record<string, unknown>) =>
+    cast({
+      type: "system",
+      subtype: "task_started",
+      description: "implement the ticket",
+      session_id: SESSION_ID,
+      uuid: `u-started-${String(fields.task_id)}`,
+      ...fields,
+    });
+  const taskUpdated = (taskId: string, patch: Record<string, unknown>) =>
+    cast({
+      type: "system",
+      subtype: "task_updated",
+      task_id: taskId,
+      patch,
+      session_id: SESSION_ID,
+      uuid: `u-updated-${taskId}`,
+    });
+  const taskNotification = (fields: Record<string, unknown>) =>
+    cast({
+      type: "system",
+      subtype: "task_notification",
+      status: "completed",
+      output_file: "/tmp/out",
+      summary: "done",
+      session_id: SESSION_ID,
+      uuid: `u-note-${String(fields.task_id)}`,
+      ...fields,
+    });
+  const delegate = { description: "do it", prompt: "Implement GOT-1." };
+
+  async function turnDone(messages: SDKMessage[]): Promise<AgentEvent> {
+    const adapter = new ClaudeAdapter({ query: scripted(messages).fn });
+    const events = await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+    const done = events.filter((e) => e.type === "turn_done");
+    expect(done).toHaveLength(1);
+    return done[0]!;
+  }
+
+  it("counts an Agent call with run_in_background true that has not returned", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_a", "Agent", { ...delegate, run_in_background: true }),
+        toolResult("toolu_a"),
+        resultSuccess({ result: "Now I'll delegate." }),
+      ]),
+    ).toEqual({
+      type: "turn_done",
+      finalText: "Now I'll delegate.",
+      backgroundSubagents: 1,
+    });
+  });
+
+  it("counts a Task call with run_in_background true the same way", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_t", "Task", { ...delegate, run_in_background: true }),
+        resultSuccess(),
+      ]),
+    ).toMatchObject({ backgroundSubagents: 1 });
+  });
+
+  it("counts a subagent the SDK registered in the background without the flag", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_b", "Agent", delegate),
+        taskStarted({
+          task_id: "task_b",
+          tool_use_id: "toolu_b",
+          task_type: "local_agent",
+          is_backgrounded: true,
+        }),
+        toolResult("toolu_b"),
+        resultSuccess(),
+      ]),
+    ).toMatchObject({ backgroundSubagents: 1 });
+  });
+
+  it("counts a foreground subagent later moved to the background", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_m", "Agent", { ...delegate, run_in_background: false }),
+        taskStarted({
+          task_id: "task_m",
+          tool_use_id: "toolu_m",
+          task_type: "local_agent",
+          is_backgrounded: false,
+        }),
+        taskUpdated("task_m", { is_backgrounded: true }),
+        toolResult("toolu_m"),
+        resultSuccess(),
+      ]),
+    ).toMatchObject({ backgroundSubagents: 1 });
+  });
+
+  it("counts each outstanding subagent and drops the ones that settled", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_1", "Agent", { ...delegate, run_in_background: true }),
+        toolUse("toolu_2", "Agent", { ...delegate, run_in_background: true }),
+        toolUse("toolu_3", "Agent", { ...delegate, run_in_background: true }),
+        taskStarted({
+          task_id: "task_2",
+          tool_use_id: "toolu_2",
+          task_type: "local_agent",
+          is_backgrounded: true,
+        }),
+        taskStarted({
+          task_id: "task_3",
+          tool_use_id: "toolu_3",
+          task_type: "local_agent",
+          is_backgrounded: true,
+        }),
+        // Settled by the notification's tool_use_id with no task_started seen.
+        taskNotification({ task_id: "task_1", tool_use_id: "toolu_1" }),
+        // Settled by task id only.
+        taskUpdated("task_2", { status: "completed" }),
+        resultSuccess(),
+      ]),
+    ).toMatchObject({ backgroundSubagents: 1 });
+  });
+
+  it("reports nothing when every background subagent returned before the turn ended", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_a", "Agent", { ...delegate, run_in_background: true }),
+        taskStarted({
+          task_id: "task_a",
+          tool_use_id: "toolu_a",
+          task_type: "local_agent",
+          is_backgrounded: true,
+        }),
+        toolResult("toolu_a"),
+        taskNotification({ task_id: "task_a", status: "failed" }),
+        resultSuccess(),
+      ]),
+    ).toEqual({ type: "turn_done", finalText: "Opened PR #12." });
+  });
+
+  it("leaves foreground delegation exactly as before", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_f", "Agent", { ...delegate, run_in_background: false }),
+        taskStarted({
+          task_id: "task_f",
+          tool_use_id: "toolu_f",
+          task_type: "local_agent",
+          is_backgrounded: false,
+        }),
+        taskNotification({ task_id: "task_f", tool_use_id: "toolu_f" }),
+        toolResult("toolu_f"),
+        resultSuccess(),
+      ]),
+    ).toEqual({ type: "turn_done", finalText: "Opened PR #12." });
+  });
+
+  it("does not count a background shell command as a subagent", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_s", "Bash", { command: "pnpm test", run_in_background: true }),
+        taskStarted({
+          task_id: "task_s",
+          tool_use_id: "toolu_s",
+          task_type: "local_bash",
+          is_backgrounded: true,
+        }),
+        toolResult("toolu_s"),
+        resultSuccess(),
+      ]),
+    ).toEqual({ type: "turn_done", finalText: "Opened PR #12." });
+  });
+
+  it("starts every stream with no outstanding subagents", async () => {
+    const adapter = new ClaudeAdapter({
+      query: scripted([systemInit, resultSuccess()]).fn,
+    });
+    await collect(
+      adapter.start(startRequest, new AbortController().signal),
+    );
+    const resumed = await collect(
+      adapter.resume(resumeRequest, new AbortController().signal),
+    );
+    expect(resumed.at(-1)).toEqual({ type: "turn_done", finalText: "Opened PR #12." });
+  });
+});

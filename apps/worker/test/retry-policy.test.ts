@@ -26,6 +26,7 @@ import {
 import { createExecutionRegistry } from "../src/agent-tools/index.js";
 import type { LogFields, Logger } from "../src/logger.js";
 import {
+  BACKGROUND_DELEGATION_DETAIL,
   INFRA_RETRY_BACKOFF_BASE_MS,
   PROTOCOL_VIOLATION_DETAIL,
   classifyFailure,
@@ -213,7 +214,10 @@ describe("classifyFailure (§9.5, AC1)", () => {
     lease_expired: [["lease expired", { class: "infrastructure", action: "retry" }]],
     agent_hung: [["no agent event", { class: "infrastructure", action: "retry" }]],
     setup_failed: [["npm ERR!", { class: "infrastructure", action: "retry" }]],
-    protocol_violation: [[PROTOCOL_VIOLATION_DETAIL, { class: "protocol", action: "nudge" }]],
+    protocol_violation: [
+      [PROTOCOL_VIOLATION_DETAIL, { class: "protocol", action: "nudge" }],
+      [BACKGROUND_DELEGATION_DETAIL, { class: "protocol", action: "nudge" }],
+    ],
     agent_gave_up: [["stuck: detail", { class: "business", action: "escalate" }]],
     budget_exceeded: [[null, { class: "business", action: "escalate" }]],
     cancelled: [[null, { class: "user", action: "none" }]],
@@ -431,6 +435,30 @@ describe("protocol retries (C26, AC4)", () => {
       "execution_failed",
       "needs_human",
     ]);
+  });
+
+  it("a background delegation violation queues the same nudge and counts against the same limit (GOT.101)", async () => {
+    const s = await seedRunning({ maxProtocolRetries: 1 });
+
+    const first = await failAndApply(s, "protocol_violation", BACKGROUND_DELEGATION_DETAIL);
+    expect(first).toMatchObject({ kind: "retry" });
+    const [r1] = await retryOf(s.taskId, s.executionId);
+    const [q1] = await eventsOf(r1!.id);
+    expect((q1!.payload as { nudge: unknown }).nudge).toEqual({
+      kind: "protocol_nudge",
+      missing_tool_call: "report_pr_created, report_failed, or a blocking raise_issue",
+    });
+
+    // Second violation: 2 > 1.
+    await raw("update executions set state = 'RUNNING' where id = $1", [r1!.id]);
+    const second = await failAndApply(
+      { taskId: s.taskId, executionId: r1!.id },
+      "protocol_violation",
+      BACKGROUND_DELEGATION_DETAIL,
+    );
+    expect(second).toMatchObject({ kind: "escalated", taskMoved: true });
+    expect(await executionsOf(s.taskId)).toHaveLength(2);
+    expect((await taskRow(s.taskId)).needsHumanReason).toMatch(/^protocol retries exhausted \(1\)/);
   });
 
   it("an infrastructure retry does not count against protocol retries, nor protocol against infrastructure", async () => {

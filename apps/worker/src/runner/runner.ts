@@ -137,6 +137,25 @@ export const PROTOCOL_VIOLATION_DETAIL =
   "turn ended without a terminal call: expected report_pr_created, report_failed, or a blocking raise_issue";
 
 /**
+ * GOT.101: the protocol violation detail when the turn ended while a
+ * subagent the agent started in the background was still running. Same
+ * `expected ...` tail as `PROTOCOL_VIOLATION_DETAIL`, so the retry policy
+ * reads the same missing call from it.
+ */
+export const BACKGROUND_DELEGATION_DETAIL =
+  "turn ended without a terminal call while a subagent started in the background was still running (background delegation): expected report_pr_created, report_failed, or a blocking raise_issue";
+
+/**
+ * GOT.101: added to the protocol nudge of a retry whose failed attempt
+ * ended with `BACKGROUND_DELEGATION_DETAIL`. That attempt's subagents died
+ * with its session, so the retry must not address them.
+ */
+export const BACKGROUND_DELEGATION_NUDGE = [
+  "## Background delegation",
+  "Your last turn ended while a subagent you started in the background was still running. That execution has ended and its subagents ended with it. Do not message, resume, or wait for any subagent from the earlier execution. If you delegate, use foreground Agent calls only (run_in_background: false), so each result comes back before your turn continues.",
+].join("\n");
+
+/**
  * §9.5 adapter_error classification decides retriable vs terminal, but a
  * budget failure is neither: it is `budget_exceeded` (§9.5 business,
  * NEEDS_HUMAN), decided before that classification ever runs. Same pattern
@@ -362,7 +381,7 @@ export function freshRetryHeader(
   previousAttempt: number,
   endReason: string,
   sameWorktree: boolean,
-  nudge?: { missingToolCall: string },
+  nudge?: ProtocolNudge,
 ): string {
   const where = sameWorktree
     ? "It runs in the same worktree, so that attempt's changes, committed or not, are still here"
@@ -371,9 +390,40 @@ export function freshRetryHeader(
     `## Retry of attempt ${previousAttempt}`,
     `The previous attempt (${previousAttempt}) ended with ${endReason}. This is a new session. ${where}; check its state before continuing.`,
   ].join("\n");
-  return nudge
-    ? `${header}\n\n${buildResumePrompt("protocol_nudge", { missingToolCall: nudge.missingToolCall })}`
-    : header;
+  return nudge ? `${header}\n\n${protocolNudgePrompt(nudge)}` : header;
+}
+
+/**
+ * A protocol retry's nudge (C26). `backgroundDelegation` is set when the
+ * failed attempt ended with `BACKGROUND_DELEGATION_DETAIL` (GOT.101).
+ */
+export interface ProtocolNudge {
+  missingToolCall: string;
+  backgroundDelegation?: boolean;
+}
+
+/**
+ * The `protocol_nudge` resume text naming the missing call, followed by
+ * `BACKGROUND_DELEGATION_NUDGE` after background delegation (GOT.101).
+ */
+export function protocolNudgePrompt(nudge: ProtocolNudge): string {
+  const reminder = buildResumePrompt("protocol_nudge", {
+    missingToolCall: nudge.missingToolCall,
+  });
+  return nudge.backgroundDelegation
+    ? `${reminder}\n\n${BACKGROUND_DELEGATION_NUDGE}`
+    : reminder;
+}
+
+/** The nudge of `retry` against the failed attempt it retries (GOT.101). */
+function retryNudge(
+  retry: RetryStart,
+  previous: { endDetail: string | null } | null,
+): ProtocolNudge | undefined {
+  if (!retry.nudge) return undefined;
+  return previous?.endDetail === BACKGROUND_DELEGATION_DETAIL
+    ? { ...retry.nudge, backgroundDelegation: true }
+    : retry.nudge;
 }
 
 /**
@@ -492,7 +542,7 @@ class RunState {
 }
 
 type TurnEnd =
-  | { kind: "turn_done"; finalText: string }
+  | { kind: "turn_done"; finalText: string; backgroundSubagents?: number }
   | { kind: "exhausted" }
   | { kind: "error"; message: string; retriable: boolean }
   | { kind: "thrown"; message: string }
@@ -1130,7 +1180,11 @@ export function createRunner(deps: RunnerDeps): Runner {
             };
             break;
           } else if (event.type === "turn_done") {
-            end = { kind: "turn_done", finalText: event.finalText };
+            end = {
+              kind: "turn_done",
+              finalText: event.finalText,
+              backgroundSubagents: event.backgroundSubagents,
+            };
             break;
           }
           // tool_result: agent-tools records its own calls.
@@ -1392,6 +1446,12 @@ export function createRunner(deps: RunnerDeps): Runner {
       if (ctx.execution.role === "spec") return "spec";
       if (row.state !== "RUNNING" && row.state !== "ASSIGNED") return "other";
       const endedAt = now();
+      // GOT.101: a subagent the agent started in the background was still
+      // running when the turn ended; still a protocol violation (§9.5).
+      const endDetail =
+        end.kind === "turn_done" && (end.backgroundSubagents ?? 0) > 0
+          ? BACKGROUND_DELEGATION_DETAIL
+          : PROTOCOL_VIOLATION_DETAIL;
       await transition(tx, {
         entity: "execution",
         id: ctx.execution.id,
@@ -1399,14 +1459,14 @@ export function createRunner(deps: RunnerDeps): Runner {
         actor: worker,
         set: {
           endReason: "protocol_violation",
-          endDetail: PROTOCOL_VIOLATION_DETAIL,
+          endDetail,
           endedAt,
         },
       });
       await runFailurePolicy(tx, {
         executionId: ctx.execution.id,
         endReason: "protocol_violation",
-        endDetail: PROTOCOL_VIOLATION_DETAIL,
+        endDetail,
         actor: worker,
         now: endedAt,
         logger: log,
@@ -1510,10 +1570,10 @@ export function createRunner(deps: RunnerDeps): Runner {
           await resumeRetry(state, ctx, target, previous, session, retry, log);
           return;
         }
-        await prepareAndRun(state, ctx, target, log, previous, reused, retry.nudge);
+        await prepareAndRun(state, ctx, target, log, previous, reused, retryNudge(retry, previous));
         return;
       }
-      await prepareAndRun(state, ctx, target, log, previous, null, retry.nudge);
+      await prepareAndRun(state, ctx, target, log, previous, null, retryNudge(retry, previous));
     });
   }
 
@@ -1589,8 +1649,9 @@ export function createRunner(deps: RunnerDeps): Runner {
         costUsd: row.costUsd,
       };
     }
-    const prompt = retry.nudge
-      ? buildResumePrompt("protocol_nudge", { missingToolCall: retry.nudge.missingToolCall })
+    const nudge = retryNudge(retry, previous);
+    const prompt = nudge
+      ? protocolNudgePrompt(nudge)
       : infraRetryResumePrompt(previous.attempt, previous.endReason ?? "an unknown failure");
     const testCommand = testCommandFor(ctx);
     log.info(
@@ -1665,7 +1726,7 @@ export function createRunner(deps: RunnerDeps): Runner {
     log: Logger,
     retryOf: RunnerContext["execution"] | null = null,
     reuse: { worktreePath: string; branch: string | null } | null = null,
-    nudge?: { missingToolCall: string },
+    nudge?: ProtocolNudge,
   ): Promise<void> {
     await setExecutionPlacement(db, ctx.execution.id, { workerId, host });
 

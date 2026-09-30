@@ -124,7 +124,7 @@ export type AgentEventUnionIsExactlyThis = Assert<
         output: number;
         costUsd?: number;
       }
-    | { type: "turn_done"; finalText: string }
+    | { type: "turn_done"; finalText: string; backgroundSubagents?: number }
     | { type: "error"; message: string; retriable: boolean }
   >
 >;
@@ -163,6 +163,9 @@ export const AGENT_EVENT_SAMPLES: readonly AgentEvent[] = [
   { type: "tool_call", name: "Read", input: { file_path: "/a" } },
   { type: "tool_result", name: "Read", ok: true },
   { type: "usage", model: "claude-sonnet-5", input: 1, cached: 2, output: 3 },
+  // `backgroundSubagents` is deliberately absent: it is an optional
+  // extension of §7 (GOT.101), and `types.test.ts` pins this sample's field
+  // set to exactly the base §7 shape.
   { type: "turn_done", finalText: "done" },
   { type: "error", message: "boom", retriable: false },
 ];
