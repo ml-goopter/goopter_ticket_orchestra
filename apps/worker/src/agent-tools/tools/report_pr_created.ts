@@ -1,11 +1,82 @@
-import { appendEvent, transition, upsertPullRequest } from "@orchestra/db";
-import { defineTool } from "../tool.js";
+import {
+  appendEvent,
+  getTaskState,
+  latestReviewRound,
+  transition,
+  upsertPullRequest,
+  type Tx,
+} from "@orchestra/db";
+import { defineTool, ReviewRequiredError } from "../tool.js";
 import { revokeToken } from "../tokens.js";
+
+const REVIEW_REQUIRED_INSTRUCTION =
+  "report_pr_created needs a clean verdict for the latest review round. " +
+  "Run orchestra-review, fix the findings and run it again until the verdict is clean, " +
+  "then call report_pr_created again.";
+
+/**
+ * D14 order is implement, review loop, push, PR (design.md §8, GOT.97). The
+ * latest round is the last `review.started` of this execution, and it must
+ * have a `clean` `review.result`. The task must also be REVIEWING: a clean
+ * round followed by a move back to IMPLEMENTING (a CI failure) no longer
+ * covers the code. Throws `ReviewRequiredError` before any write otherwise,
+ * so the tool's transaction writes nothing.
+ *
+ * The refusal message only tells the agent to run orchestra-review again
+ * when the task is IMPLEMENTING (start a new round). NEEDS_HUMAN (for
+ * example a review round-limit escalation, `report_review_result.ts`) points
+ * to `report_failed` instead, and any other state just says a PR cannot be
+ * opened here — never a contradicting instruction to keep reviewing.
+ */
+async function requireCleanReview(
+  tx: Tx,
+  taskId: string,
+  executionId: string,
+): Promise<void> {
+  const latest = await latestReviewRound(tx, taskId, executionId);
+  if (latest === null) {
+    throw new ReviewRequiredError(
+      `No review round has been started. Call report_review_started first. ${REVIEW_REQUIRED_INSTRUCTION}`,
+    );
+  }
+  if (latest.verdict === null) {
+    throw new ReviewRequiredError(
+      `Review round ${latest.round} has no result yet. ${REVIEW_REQUIRED_INSTRUCTION}`,
+    );
+  }
+  if (latest.verdict !== "clean") {
+    throw new ReviewRequiredError(
+      `Review round ${latest.round} ended with verdict ${latest.verdict}. ${REVIEW_REQUIRED_INSTRUCTION}`,
+    );
+  }
+  const state = await getTaskState(tx, taskId);
+  if (state === "REVIEWING") return;
+
+  if (state === "IMPLEMENTING") {
+    throw new ReviewRequiredError(
+      `The task is IMPLEMENTING, not REVIEWING, so review round ${latest.round} no longer covers the changes. ` +
+        `Call report_review_started for a new round. ${REVIEW_REQUIRED_INSTRUCTION}`,
+    );
+  }
+
+  if (state === "NEEDS_HUMAN") {
+    throw new ReviewRequiredError(
+      `The task is NEEDS_HUMAN, so a pull request cannot be opened in this state. Call report_failed.`,
+    );
+  }
+
+  throw new ReviewRequiredError(
+    `The task is ${state ?? "missing"}, not REVIEWING, so a pull request cannot be opened in this state.`,
+  );
+}
 
 /**
  * design.md §8, §5.3: record `pull_requests`, `pull_request.created`, task
  * REVIEWING -> CI_RUNNING, execution RUNNING -> COMPLETED. The execution
  * leaves RUNNING, so the token is revoked in the same transaction (§8).
+ *
+ * Refused with `REVIEW_REQUIRED` unless the latest review round is clean
+ * (GOT.97, `requireCleanReview`).
  *
  * GOT.39 C17: after a CI-failure resume the task already has its PR row, so
  * a second call updates that row in place (new head sha, CI back to
@@ -14,8 +85,10 @@ import { revokeToken } from "../tokens.js";
 export const reportPrCreated = defineTool({
   name: "report_pr_created",
   description:
-    "Call once after you have pushed your branch and opened the pull request. This completes the execution.",
+    "Call once after orchestra-review returned a clean verdict for your latest review round and you have pushed your branch and opened the pull request. This completes the execution.",
   async run({ tx, auth, now, actor }, input) {
+    await requireCleanReview(tx, auth.task.id, auth.execution.id);
+
     const pr = await upsertPullRequest(tx, {
       taskId: auth.task.id,
       executionId: auth.execution.id,

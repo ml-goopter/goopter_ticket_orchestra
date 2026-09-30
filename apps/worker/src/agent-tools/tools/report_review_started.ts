@@ -1,7 +1,11 @@
 import { appendEvent, transition } from "@orchestra/db";
 import { defineTool } from "../tool.js";
 
-/** design.md §8, §5.3: `review.started`, task IMPLEMENTING -> REVIEWING. */
+/**
+ * design.md §8, §5.3: `review.started`, task IMPLEMENTING -> REVIEWING, or
+ * REVIEWING -> REVIEWING when a round starts with the task already
+ * REVIEWING (GOT.97).
+ */
 export const reportReviewStarted = defineTool({
   name: "report_review_started",
   description:

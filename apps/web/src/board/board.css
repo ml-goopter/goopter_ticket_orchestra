@@ -1,52 +1,32 @@
 /**
- * Board-specific styles (U2, docs/design.md §14 "Board"). The kanban
- * container, column, and badge classes this view sits inside
- * (`.kanban`, `.kanban__column`, `.kanban__column--highlighted`,
- * `.kanban__column-header`, `.kanban__column-body`, `.badge`) already
- * live in ../styles/components.css and are not duplicated here.
+ * Board-specific styles (U2, docs/design.md §14 "Board", approved mockup
+ * UR2). The kanban container, column, badge, and page-topbar classes this
+ * view sits inside (`.kanban`, `.kanban__column`, `.kanban__column--highlighted`,
+ * `.kanban__column-header`, `.kanban__column-body`, `.badge`, `.topbar`,
+ * `.topbar__crumbs`, `.topbar__crumb-current`, `.topbar__spacer`, `.tag`)
+ * already live in ../styles/components.css and are not duplicated here.
  */
 
 /*
- * Full-bleed break-out (visual fix B1): AppLayout wraps every routed view
- * in `<main class="page">`, which centres content at max-width 1200px. The
- * kanban row needs the full viewport width instead, so ten columns (most
- * of them compact) fit without an immediate scrollbar, while the rest of
- * the page (title) stays inside the normal page width. `calc(50% - 50vw)`
- * centres this element on the viewport regardless of `.page`'s own
- * width/centring; the left/right padding then restores `.page`'s own
- * horizontal padding (--space-5) so the kanban row's content still lines
- * up with the page title above it.
+ * Board wrapper (fix F1, UR2 fix round): AppLayout renders every routed
+ * view inside `<main class="page">`, which fills the area right of the
+ * sidebar and keeps its own padding (--space-6 --space-5) for its content
+ * (../styles/components.css, "Page" section). This view's own
+ * `<main class="board">` sits directly inside that `.page`, with `.topbar`
+ * as its first child, so `.topbar`'s existing negative-margin break-out
+ * (components.css) cancels `.page`'s padding and the topbar spans the page
+ * area edge to edge; everything after the topbar keeps `.page`'s own
+ * padding, same as every other view. `.board` itself carries no width,
+ * margin, or overflow rule of its own -- it exists only so the
+ * column-width overrides below can out-specificity components.css's
+ * single-class `.kanban__column` selector. The board therefore never
+ * extends past `.page`'s own box: it cannot overlap the sidebar or run
+ * past the viewport edge, and the document never scrolls horizontally.
  */
-.board-bleed {
-  width: 100vw;
-  margin-left: calc(50% - 50vw);
-  margin-right: calc(50% - 50vw);
-  padding-left: var(--space-5);
-  padding-right: var(--space-5);
-  box-sizing: border-box;
-}
-
-/*
- * Scrollbar-width overflow guard (GOT.64): `100vw` above is, per the CSS
- * spec, the *full* viewport width -- including the strip a classic,
- * always-visible vertical scrollbar occupies -- while the page's actual
- * visible width (and `.board-bleed`'s intended right edge) is the viewport
- * width *minus* that scrollbar. On a platform with an always-visible
- * scrollbar (non-macOS: Windows/Linux browsers), `.board-bleed` therefore
- * ends up `scrollbar-width` wider than the document, giving the whole page
- * its own horizontal scrollbar. macOS's overlay scrollbar is 0px wide, so
- * `100vw` already matches the visible width there and this guard changes
- * nothing (no visual change on macOS). `:has()` scopes the guard to only
- * take effect while a `.board-bleed` element is actually mounted (the
- * board view), rather than hiding horizontal overflow on every page.
- */
-body:has(.board-bleed) {
-  overflow-x: hidden;
-}
 
 /*
  * Column widths and gap (B1/B3, U7): three tiers, narrowest first, each
- * overriding the last via selector specificity (`.board-bleed .kanban__column`
+ * overriding the last via selector specificity (`.board .kanban__column`
  * beats components.css's single-class `.kanban__column`; adding a second
  * class beats that in turn), so this doesn't touch components.css itself
  * and doesn't depend on stylesheet import order.
@@ -55,21 +35,24 @@ body:has(.board-bleed) {
  *     nothing in them): narrower, 180px, still a full header+body column.
  *   - empty and not highlighted: collapses to a 96px compact column
  *     (below).
- * The 12px gap (rather than components.css's 16px) is part of fitting all
- * ten columns in the viewport at once (B3). At a 1440px viewport this is
- * 2 highlighted (180px) + 7 compact (96px) + 1 populated (260px) + 9 gaps
- * (12px) = 1,400px, inside the 1,400px board width (U7).
+ * The 12px gap (rather than components.css's 16px) helps fit more columns
+ * before the row needs to scroll (B3). If the ten columns' combined width
+ * still exceeds the page area (the viewport minus the sidebar and `.page`'s
+ * own horizontal padding), `.kanban` scrolls horizontally on its own
+ * (components.css already sets `overflow-x: auto` on `.kanban`); the
+ * document itself never gains a horizontal scrollbar, because neither
+ * `.board` nor `.page` is ever wider than its own container.
  */
-.board-bleed .kanban {
+.board .kanban {
   gap: var(--space-3);
 }
 
-.board-bleed .kanban__column {
+.board .kanban__column {
   flex: 0 0 260px;
   width: 260px;
 }
 
-.board-bleed .kanban__column.board-column--highlighted-empty {
+.board .kanban__column.board-column--highlighted-empty {
   flex: 0 0 180px;
   width: 180px;
 }
@@ -82,7 +65,7 @@ body:has(.board-bleed) {
  * text, so the column's accessible name and heading role are unaffected
  * by the visual collapse.
  */
-.board-bleed .kanban__column.board-column--compact {
+.board .kanban__column.board-column--compact {
   flex: 0 0 96px;
   width: 96px;
 }
@@ -150,6 +133,33 @@ body:has(.board-bleed) {
   flex-shrink: 0;
 }
 
+/*
+ * Column header dot (AC2, approved mockup): a non-highlighted column shows
+ * a colour dot next to its name instead of relying on the badge alone --
+ * blue for the three agent-active columns, green for the two merge-ready
+ * ones, grey for the rest. Colour is chosen by `columnAccent()`
+ * (board/columns.ts) and passed in as a `--dot` modifier class.
+ */
+.board-column__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-border-strong);
+  flex-shrink: 0;
+}
+
+.board-column__dot--attention {
+  background: var(--color-attention-fg);
+}
+
+.board-column__dot--progress {
+  background: var(--color-progress-fg);
+}
+
+.board-column__dot--success {
+  background: var(--color-success-fg);
+}
+
 /* List of `.board-card`s inside a `.kanban__column-body`: no bullets or
    indent, so cards stack flush like `.drawer__list`. */
 .board-list {
@@ -180,7 +190,16 @@ body:has(.board-bleed) {
   border-left: 3px solid var(--color-attention-fg);
 }
 
+/* Top row (AC3): key link on the left, cost on the right. */
+.board-card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
 .board-card__key {
+  font-family: var(--font-mono);
   font-weight: 700;
   font-size: var(--font-size-sm);
 }
@@ -188,13 +207,14 @@ body:has(.board-bleed) {
 .board-card__summary {
   margin: 0;
   display: -webkit-box;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
   color: var(--color-text-muted);
   font-size: var(--font-size-sm);
 }
 
+/* Meta row (AC3): runtime tag on the left, age pushed to the right. */
 .board-card__meta {
   display: flex;
   align-items: center;
@@ -203,9 +223,13 @@ body:has(.board-bleed) {
   color: var(--color-text-faint);
 }
 
-.board-card__cost {
+.board-card__age {
   margin-left: auto;
+}
+
+.board-card__cost {
   font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
 }
 
 /* Empty column: a single compact muted line, not the bigger `.empty-state`

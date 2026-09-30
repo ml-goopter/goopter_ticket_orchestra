@@ -79,4 +79,14 @@ describe("AdminView", () => {
 
     await waitFor(() => expect(screen.queryByRole("heading", { name: "Projects" })).toBeNull());
   });
+
+  it("renders the Admin heading inside a topbar element with the shared title class", async () => {
+    const request = emptyRequest();
+    render(<AdminView request={request} />);
+
+    const heading = screen.getByRole("heading", { name: "Admin" });
+    const topbar = heading.closest(".topbar");
+    expect(topbar).toBeTruthy();
+    expect(heading.classList.contains("topbar__crumb-current")).toBe(true);
+  });
 });

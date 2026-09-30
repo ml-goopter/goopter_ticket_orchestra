@@ -9,6 +9,7 @@ import {
 } from "@orchestra/core";
 import {
   agentWorkers,
+  executionEvents,
   executions,
   listActiveExecutionIds,
   projects,
@@ -196,6 +197,31 @@ async function seed(options: SeedOptions): Promise<Seeded> {
     executionId: execution!.id,
     token,
   };
+}
+
+/**
+ * Writes the events `report_review_started` and `report_review_result`
+ * leave for one round, without their transitions, so a test seeded in
+ * REVIEWING passes the `report_pr_created` review gate (GOT.97).
+ */
+async function seedReviewRound(
+  s: Seeded,
+  round: number,
+  verdict: "clean" | "findings" | "ask_user" | null = "clean",
+): Promise<void> {
+  await db.insert(executionEvents).values({
+    taskId: s.taskId,
+    executionId: s.executionId,
+    type: "review.started",
+    payload: { round },
+  });
+  if (verdict === null) return;
+  await db.insert(executionEvents).values({
+    taskId: s.taskId,
+    executionId: s.executionId,
+    type: "review.result",
+    payload: { review_result_id: "seeded", round, verdict, findings_count: 0 },
+  });
 }
 
 // ------------------------------------------------------------------ reads
@@ -887,6 +913,7 @@ describe("lock order: agent tool vs api cancel (design.md §5, §8)", () => {
   for (const { tool, taskState, effect, firstInsert } of RACE_TOOLS) {
     it(`${tool}: cancel holds the task lock first -> cancel commits, tool gets UNAUTHORIZED and writes nothing`, async () => {
       const s = await seed({ taskState });
+      if (tool === "report_pr_created") await seedReviewRound(s, 1);
       const def = TOOL_DEFINITIONS.find((d) => d.name === tool)!;
       const taskLocked = deferred();
       const release = deferred();
@@ -947,6 +974,7 @@ describe("lock order: agent tool vs api cancel (design.md §5, §8)", () => {
 
     it(`${tool}: tool holds its locks first -> tool commits, then cancel succeeds`, async () => {
       const s = await seed({ taskState });
+      if (tool === "report_pr_created") await seedReviewRound(s, 1);
       const def = TOOL_DEFINITIONS.find((d) => d.name === tool)!;
 
       // Park the tool mid-transaction: it takes its row locks, then waits
@@ -1002,9 +1030,9 @@ describe("lock order: agent tool vs api cancel (design.md §5, §8)", () => {
     await recreateEventForeignKey("task_id");
     onTestFinished(() => recreateEventForeignKey("execution_id"));
 
-    // REVIEWING has no review.started edge, so the call fails with
+    // CI_RUNNING has no review.started edge, so the call fails with
     // ILLEGAL_TRANSITION and record() runs with ok:false.
-    const s = await seed({ taskState: "REVIEWING" });
+    const s = await seed({ taskState: "CI_RUNNING" });
     const def = TOOL_DEFINITIONS.find((d) => d.name === "report_review_started")!;
     const taskLocked = deferred();
     const release = deferred();
@@ -1092,10 +1120,10 @@ async function recreateEventForeignKey(
 
 describe("lease renewal after a failed call (design.md §6.4, §8)", () => {
   it("a failed call on an execution cancelled before renewal leaves the lease alone and still records ok:false", async () => {
-    // REVIEWING has no review.started edge, so the call fails with
+    // CI_RUNNING has no review.started edge, so the call fails with
     // ILLEGAL_TRANSITION. The cancel commits between the rollback and the
     // lease renewal.
-    const s = await seed({ taskState: "REVIEWING" });
+    const s = await seed({ taskState: "CI_RUNNING" });
     const base = createLiveExecution(
       { executionId: s.executionId, taskId: s.taskId, role: "implementation" },
       { db, now: () => new Date() },
@@ -1291,8 +1319,30 @@ describe("report_review_started", () => {
     await expectRecorded(s, "report_review_started", before.leaseExpiresAt);
   });
 
-  it("returns ILLEGAL_TRANSITION from the wrong task state and rolls the event back", async () => {
+  it("GOT.97: starts a new round while the task is already REVIEWING (REVIEWING -> REVIEWING)", async () => {
     const s = await seed({ taskState: "REVIEWING" });
+    const before = await snapshot(s);
+
+    expectOk(await call(s.token, "report_review_started", { round: 2 }));
+
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+    const events = await eventsFor(s.taskId);
+    expect(events.find((e) => e.type === "review.started")!.payload).toMatchObject({
+      round: 2,
+    });
+    expect(
+      events.find((e) => e.type === "task.state_changed")!.payload,
+    ).toMatchObject({
+      from: "REVIEWING",
+      to: "REVIEWING",
+      trigger: "review.started",
+      actor: { kind: "agent" },
+    });
+    await expectRecorded(s, "report_review_started", before.leaseExpiresAt);
+  });
+
+  it("returns ILLEGAL_TRANSITION from the wrong task state and rolls the event back", async () => {
+    const s = await seed({ taskState: "CI_RUNNING" });
 
     const result = await call(s.token, "report_review_started", { round: 1 });
 
@@ -1419,6 +1469,35 @@ describe("report_review_result", () => {
         .payload,
     ).toMatchObject({ to: "NEEDS_HUMAN", trigger: "task.escalated" });
     await expectRecorded(s, "report_review_result", before.leaseExpiresAt);
+  });
+
+  it("GOT.97: a round started from REVIEWING counts toward the limit and escalates when it exceeds it", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING", maxReviewRounds: 1 });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "ask_user",
+        findings: [{ severity: "blocking", description: "?", action: "ask" }],
+      }),
+    );
+    // The task is still REVIEWING; the next round starts from there.
+    expectOk(await callOn(client, "report_review_started", { round: 2 }));
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+
+    const data = expectOk(
+      await callOn(client, "report_review_result", {
+        round: 2,
+        verdict: "clean",
+        findings: [],
+      }),
+    );
+
+    expect(data.instruction).toBe(REVIEW_ROUND_LIMIT_INSTRUCTION);
+    const task = await getTask(s.taskId);
+    expect(task!.state).toBe("NEEDS_HUMAN");
+    expect(task!.needsHumanReason).toMatch(/round 2 > max_review_rounds 1/);
   });
 
   it("round == max_review_rounds is still within the limit", async () => {
@@ -1631,6 +1710,7 @@ describe("report_usage (design.md §9.7)", () => {
 describe("report_pr_created", () => {
   it("inserts the PR, moves task to CI_RUNNING and execution to COMPLETED, and revokes the token", async () => {
     const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1);
     const before = await snapshot(s);
     const client = await connect(s.token);
 
@@ -1677,6 +1757,7 @@ describe("report_pr_created", () => {
 
   it("GOT.39 C17: a second call for the same task updates the PR row in place, leaving exactly one", async () => {
     const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1);
     expectOk(
       await call(s.token, "report_pr_created", {
         url: "https://github.com/goopter/orchestra/pull/42",
@@ -1705,6 +1786,7 @@ describe("report_pr_created", () => {
       });
       await transition(tx, { entity: "task", id: s.taskId, trigger: "review.started", actor });
     });
+    await seedReviewRound(s, 2);
     const token = await db.transaction((tx) => issueToken(tx, s.executionId));
     issuedTokens.push(token);
 
@@ -1752,6 +1834,7 @@ describe("report_pr_created", () => {
 
   it("GOT.39 F4 (C22): reporting a new PR over a closed or merged row reopens it, clears merged_at, and takes the new number and sha", async () => {
     const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1);
     expectOk(
       await call(s.token, "report_pr_created", {
         url: "https://github.com/goopter/orchestra/pull/42",
@@ -1774,6 +1857,7 @@ describe("report_pr_created", () => {
       "update executions set state = 'RUNNING', ended_at = null where id = $1",
       [s.executionId],
     );
+    await seedReviewRound(s, 2);
     const token = await db.transaction((tx) => issueToken(tx, s.executionId));
     issuedTokens.push(token);
 
@@ -1799,6 +1883,360 @@ describe("report_pr_created", () => {
       ciState: "pending",
     });
     expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+  });
+});
+
+describe("report_pr_created review gate (GOT.97, D14)", () => {
+  const PR_ARGS = {
+    url: "https://github.com/goopter/orchestra/pull/7",
+    number: 7,
+    head_sha: "cafe",
+  };
+
+  /**
+   * AC1: the call is a REVIEW_REQUIRED tool error naming the requirement,
+   * writes no pull_requests row and changes no state. The only new row is
+   * its own `agent.tool_call` record with `ok: false` (§8).
+   */
+  const prRows = (taskId: string) =>
+    db.query.pullRequests.findMany({ where: (t, { eq }) => eq(t.taskId, taskId) });
+
+  async function expectRefused(
+    s: Seeded,
+    client?: Client,
+    opts: { orchestraReview?: boolean } = {},
+  ) {
+    const { orchestraReview = true } = opts;
+    const before = await snapshot(s);
+    const prsBefore = await prRows(s.taskId);
+
+    const result = client
+      ? await callOn(client, "report_pr_created", PR_ARGS)
+      : await call(s.token, "report_pr_created", PR_ARGS);
+
+    expect(result).toMatchObject({ isError: true, code: "REVIEW_REQUIRED" });
+    const message = (result as { message: string }).message;
+    if (orchestraReview) {
+      expect(message).toContain("orchestra-review");
+      expect(message).toContain("clean");
+    }
+
+    const after = await snapshot(s);
+    expect({ ...after, events: 0, leaseExpiresAt: 0 }).toEqual({
+      ...before,
+      events: 0,
+      leaseExpiresAt: 0,
+    });
+    // No PR row inserted, and an existing one (after a CI failure) untouched.
+    expect(await prRows(s.taskId)).toEqual(prsBefore);
+    const added = (await eventsFor(s.taskId)).slice(before.events);
+    expect(added.map((e) => [e.type, e.payload])).toEqual([
+      [
+        "agent.tool_call",
+        { tool: "report_pr_created", input: PR_ARGS, ok: false, error: "REVIEW_REQUIRED" },
+      ],
+    ]);
+    return message;
+  }
+
+  it("refuses when the execution never started a review round", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    const message = await expectRefused(s);
+    expect(message).toContain("report_review_started");
+  });
+
+  it("refuses when the latest round has no review.result", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1, null);
+    const message = await expectRefused(s);
+    expect(message).toContain("round 1");
+  });
+
+  it("refuses when the latest round's verdict is ask_user (task still REVIEWING)", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1, "ask_user");
+    const message = await expectRefused(s);
+    expect(message).toContain("ask_user");
+  });
+
+  it("refuses with REVIEW_REQUIRED, not ILLEGAL_TRANSITION, when the latest verdict is findings", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "findings",
+        findings: [
+          { severity: "warning", description: "d", action: "a" },
+        ],
+      }),
+    );
+    const message = await expectRefused(s, client);
+    expect(message).toContain("findings");
+  });
+
+  it("round 1 clean, then round 2 started without a result: refused", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", { round: 1, verdict: "clean", findings: [] }),
+    );
+    // A second round started after the clean one has no verdict yet.
+    await seedReviewRound(s, 2, null);
+    const message = await expectRefused(s, client);
+    expect(message).toContain("round 2");
+  });
+
+  it("round 1 findings, round 2 started without a result: refused", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "findings",
+        findings: [{ severity: "warning", description: "d", action: "a" }],
+      }),
+    );
+    expectOk(await callOn(client, "report_review_started", { round: 2 }));
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+    const message = await expectRefused(s, client);
+    expect(message).toContain("round 2");
+  });
+
+  it("round 1 findings, round 2 clean: the PR is recorded exactly as before", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "findings",
+        findings: [{ severity: "warning", description: "d", action: "a" }],
+      }),
+    );
+    expectOk(await callOn(client, "report_review_started", { round: 2 }));
+    expectOk(
+      await callOn(client, "report_review_result", { round: 2, verdict: "clean", findings: [] }),
+    );
+
+    expect(await callOn(client, "report_pr_created", PR_ARGS)).toEqual({
+      isError: false,
+      data: { ok: true },
+    });
+
+    const prs = await db.query.pullRequests.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    expect(prs).toHaveLength(1);
+    expect(prs[0]).toMatchObject({ executionId: s.executionId, number: 7, headSha: "cafe" });
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+    const execution = await getExecution(s.executionId);
+    expect(execution!.state).toBe("COMPLETED");
+    expect(execution!.toolsTokenHash).toBeNull();
+  });
+
+  it("a refused call leaves the session able to review and then open the PR", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    await expectRefused(s, client);
+
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", { round: 1, verdict: "clean", findings: [] }),
+    );
+    expectOk(await callOn(client, "report_pr_created", PR_ARGS));
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+  });
+
+  // ------------------------------------------------ GOT.97 fix round 2
+
+  it("F1: a retry execution that starts with the task REVIEWING runs its own round and opens the PR", async () => {
+    // The retry execution; the task was left REVIEWING by the failed attempt.
+    const s = await seed({ taskState: "REVIEWING" });
+    await db.$client.unsafe("update executions set attempt = 2 where id = $1", [s.executionId]);
+    const [failed] = await db
+      .insert(executions)
+      .values({
+        taskId: s.taskId,
+        role: "implementation",
+        attempt: 1,
+        state: "FAILED",
+        runtime: "codex",
+        model: "gpt-5-codex",
+      })
+      .returning({ id: executions.id });
+    // The failed attempt's clean round is not the retry's round.
+    await seedReviewRound({ ...s, executionId: failed!.id }, 1);
+
+    const client = await connect(s.token);
+    const message = await expectRefused(s, client);
+    expect(message).toContain("report_review_started");
+
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+    expectOk(
+      await callOn(client, "report_review_result", { round: 1, verdict: "clean", findings: [] }),
+    );
+    expect(await callOn(client, "report_pr_created", PR_ARGS)).toEqual({
+      isError: false,
+      data: { ok: true },
+    });
+
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+    expect((await getExecution(s.executionId))!.state).toBe("COMPLETED");
+    const prs = await prRows(s.taskId);
+    expect(prs).toHaveLength(1);
+    expect(prs[0]).toMatchObject({ executionId: s.executionId, number: 7 });
+  });
+
+  it("F2: after ask_user and a clarification resume, a new round from REVIEWING opens the PR once clean", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    const askUser = expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "ask_user",
+        findings: [{ severity: "blocking", description: "?", action: "ask" }],
+      }),
+    );
+    expect(askUser.instruction).toMatch(/raise_issue/);
+    expectOk(await callOn(client, "raise_issue", RAISE_ARGS));
+
+    // The turn ends, the user resolves the issue as a clarification, and
+    // the same execution resumes. The task stays REVIEWING throughout.
+    const actor = { kind: "worker" as const };
+    await db.transaction(async (tx) => {
+      await transition(tx, { entity: "execution", id: s.executionId, trigger: "execution.waiting", actor });
+      await transition(tx, { entity: "execution", id: s.executionId, trigger: "execution.resumed", actor });
+    });
+    const token = await db.transaction((tx) => issueToken(tx, s.executionId));
+    issuedTokens.push(token);
+    const resumed: Seeded = { ...s, token };
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+
+    const resumedClient = await connect(token);
+    const message = await expectRefused(resumed, resumedClient);
+    expect(message).toContain("ask_user");
+
+    expectOk(await callOn(resumedClient, "report_review_started", { round: 2 }));
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+    expectOk(
+      await callOn(resumedClient, "report_review_result", {
+        round: 2,
+        verdict: "clean",
+        findings: [],
+      }),
+    );
+    expectOk(await callOn(resumedClient, "report_pr_created", PR_ARGS));
+
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+    expect((await getExecution(s.executionId))!.state).toBe("COMPLETED");
+    expect(await prRows(s.taskId)).toHaveLength(1);
+  });
+
+  it("F3: after a CI failure the old clean round does not pass; REVIEW_REQUIRED, not ILLEGAL_TRANSITION", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1);
+    expectOk(await call(s.token, "report_pr_created", PR_ARGS));
+
+    // CI failed; the worker resumes the same execution with the task IMPLEMENTING.
+    const actor = { kind: "worker" as const };
+    await db.transaction(async (tx) => {
+      await transition(tx, { entity: "task", id: s.taskId, trigger: "ci.failed", actor });
+      await transition(tx, {
+        entity: "execution",
+        id: s.executionId,
+        trigger: "resume_with_ci_failure",
+        actor,
+      });
+    });
+    const token = await db.transaction((tx) => issueToken(tx, s.executionId));
+    issuedTokens.push(token);
+    const resumed: Seeded = { ...s, token };
+    expect((await getTask(s.taskId))!.state).toBe("IMPLEMENTING");
+
+    const client = await connect(token);
+    const message = await expectRefused(resumed, client);
+    expect(message).toContain("IMPLEMENTING");
+    expect(message).toContain("report_review_started");
+
+    // A fresh round after the fix opens the PR again.
+    expectOk(await callOn(client, "report_review_started", { round: 2 }));
+    expectOk(
+      await callOn(client, "report_review_result", { round: 2, verdict: "clean", findings: [] }),
+    );
+    expectOk(await callOn(client, "report_pr_created", { ...PR_ARGS, head_sha: "beef" }));
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+    const prs = await prRows(s.taskId);
+    expect(prs).toHaveLength(1);
+    expect(prs[0]!.headSha).toBe("beef");
+  });
+
+  it("refuses with REVIEW_REQUIRED when the task is IMPLEMENTING even though the latest round is clean, and tells the agent to review again (F1)", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    await seedReviewRound(s, 1, "clean");
+    const message = await expectRefused(s);
+    expect(message).toContain("IMPLEMENTING");
+    expect(message).toContain("REVIEWING");
+    expect(message).toContain("orchestra-review");
+  });
+
+  it("refuses with REVIEW_REQUIRED when the task is CI_RUNNING, without instructing another review round (F1)", async () => {
+    const s = await seed({ taskState: "CI_RUNNING" });
+    await seedReviewRound(s, 1, "clean");
+    const message = await expectRefused(s, undefined, { orchestraReview: false });
+    expect(message).toContain("CI_RUNNING");
+    expect(message).toContain("cannot be opened");
+    expect(message).not.toContain("orchestra-review");
+  });
+
+  it("refuses with REVIEW_REQUIRED when the task is NEEDS_HUMAN, pointing to report_failed instead of another review round (F1)", async () => {
+    const s = await seed({ taskState: "NEEDS_HUMAN" });
+    await seedReviewRound(s, 1, "clean");
+    const message = await expectRefused(s, undefined, { orchestraReview: false });
+    expect(message).toContain("NEEDS_HUMAN");
+    expect(message).toContain("report_failed");
+    expect(message).not.toContain("orchestra-review");
+  });
+
+  it("after a review round-limit escalation (NEEDS_HUMAN, execution still RUNNING) points to report_failed, not orchestra-review (F1)", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING", maxReviewRounds: 1 });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    const data = expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "clean",
+        findings: [],
+      }),
+    );
+    expect(data.instruction).toBeUndefined();
+
+    // Second round exceeds the limit: task escalates to NEEDS_HUMAN, but the
+    // execution stays RUNNING (report_review_result.ts).
+    expectOk(await callOn(client, "report_review_started", { round: 2 }));
+    const escalated = expectOk(
+      await callOn(client, "report_review_result", {
+        round: 2,
+        verdict: "clean",
+        findings: [],
+      }),
+    );
+    expect(escalated.instruction).toContain("report_failed");
+    const task = await getTask(s.taskId);
+    expect(task!.state).toBe("NEEDS_HUMAN");
+    expect((await getExecution(s.executionId))!.state).toBe("RUNNING");
+
+    const result = await callOn(client, "report_pr_created", PR_ARGS);
+    expect(result).toMatchObject({ isError: true, code: "REVIEW_REQUIRED" });
+    const message = (result as { message: string }).message;
+    expect(message).toContain("NEEDS_HUMAN");
+    expect(message).toContain("report_failed");
+    expect(message).not.toContain("orchestra-review");
   });
 });
 

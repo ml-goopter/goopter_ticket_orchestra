@@ -26,6 +26,25 @@ export const HIGHLIGHTED_COLUMNS: ReadonlySet<DashboardColumn> = new Set([
   "Needs Human",
 ]);
 
+/** The colour family a non-highlighted column header's dot uses (UR2, approved mockup). */
+export type ColumnAccent = "attention" | "progress" | "success" | "neutral";
+
+const PROGRESS_COLUMNS: ReadonlySet<DashboardColumn> = new Set(["Spec In Progress", "Implementing", "CI"]);
+const SUCCESS_COLUMNS: ReadonlySet<DashboardColumn> = new Set(["Ready for Merge", "Done"]);
+
+/**
+ * Column header dot colour (UR2 AC2): "Waiting for You" / "Needs Human" are
+ * `attention` (amber, matching their highlighted tint); the agent-active
+ * columns are `progress` (blue); the two merge-ready columns are `success`
+ * (green); everything else (still-in-triage columns) is `neutral` (grey).
+ */
+export function columnAccent(column: DashboardColumn): ColumnAccent {
+  if (HIGHLIGHTED_COLUMNS.has(column)) return "attention";
+  if (PROGRESS_COLUMNS.has(column)) return "progress";
+  if (SUCCESS_COLUMNS.has(column)) return "success";
+  return "neutral";
+}
+
 /**
  * Groups cards by their api-assigned `column`, preserving each card's
  * position within the api's response order (design.md §12.2 `listBoard`

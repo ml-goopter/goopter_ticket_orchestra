@@ -12,11 +12,11 @@ const REFRESH_INTERVAL_MS = 30_000;
 
 /**
  * Workers panel (design.md §14 Admin row, §12.5 `/workers`, §6.1 dead-host
- * threshold, task contract GOT.29; restyled by U5): read-only list with
- * host, capabilities as badges, capacity as used/max slots, and heartbeat
- * age; a stale badge past the 15 minute dead-host threshold; a manual
- * refresh in the panel header and an automatic refetch every 30s while
- * this panel is mounted.
+ * threshold, task contract GOT.29; restyled by U5, dense table by UR7):
+ * read-only list with host, capabilities as tags, heartbeat age with a
+ * stale badge past the 15 minute dead-host threshold, and capacity as a
+ * small used/max bar; a manual refresh in the panel header and an
+ * automatic refetch every 30s while this panel is mounted (unchanged).
  */
 export function WorkersPanel({ adminApi }: WorkersPanelProps) {
   const { begin, isCurrent } = useLatestRequest();
@@ -51,6 +51,7 @@ export function WorkersPanel({ adminApi }: WorkersPanelProps) {
       <div className="page-header">
         <h2 className="page-header__title">Workers</h2>
         <div className="page-header__actions">
+          <span className="admin-table__muted">Refreshes every 30s</span>
           <button type="button" onClick={() => void fetchWorkers()}>
             Refresh
           </button>
@@ -74,23 +75,25 @@ export function WorkersPanel({ adminApi }: WorkersPanelProps) {
             <tr>
               <th scope="col">Host</th>
               <th scope="col">Capabilities</th>
-              <th scope="col" className="num">
-                Slots
-              </th>
               <th scope="col">Heartbeat</th>
+              <th scope="col">Slots</th>
             </tr>
           </thead>
           <tbody>
             {workers.map((worker) => {
               const stale = isStaleHeartbeat(worker.heartbeatAgeSeconds);
+              const used = worker.maxConcurrent - worker.freeSlots;
+              const usedPct = worker.maxConcurrent > 0 ? (used / worker.maxConcurrent) * 100 : 0;
               return (
                 <tr key={worker.id} data-stale={stale}>
-                  <td>{worker.host}</td>
+                  <td>
+                    <span className="admin-table__mono">{worker.host}</span>
+                  </td>
                   <td>
                     {worker.capabilities.length > 0 ? (
                       <div className="admin-badge-list">
                         {worker.capabilities.map((capability) => (
-                          <span key={capability} className="badge badge--neutral">
+                          <span key={capability} className="tag">
                             {capability}
                           </span>
                         ))}
@@ -99,7 +102,6 @@ export function WorkersPanel({ adminApi }: WorkersPanelProps) {
                       <span className="admin-table__muted">—</span>
                     )}
                   </td>
-                  <td className="num">{formatSlots(worker.maxConcurrent, worker.freeSlots)}</td>
                   <td>
                     <span className="admin-table__with-badge">
                       {formatHeartbeatAge(worker.heartbeatAgeSeconds)}
@@ -108,6 +110,14 @@ export function WorkersPanel({ adminApi }: WorkersPanelProps) {
                           Stale
                         </span>
                       )}
+                    </span>
+                  </td>
+                  <td>
+                    <span className="admin-slots">
+                      <span className="admin-slots__bar">
+                        <span className="admin-slots__bar-fill" style={{ width: `${usedPct}%` }} />
+                      </span>
+                      {formatSlots(worker.maxConcurrent, worker.freeSlots)}
                     </span>
                   </td>
                 </tr>

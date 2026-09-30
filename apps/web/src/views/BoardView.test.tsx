@@ -1,5 +1,8 @@
 // @vitest-environment jsdom
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BoardApiClient } from "../api/client.js";
@@ -160,7 +163,44 @@ describe("BoardView", () => {
     expect(within(screen.getByRole("region", { name: "Ready" })).queryByRole("link", { name: "BBB-2" })).toBeNull();
   });
 
-  it("shows the key link, summary, runtime badge, age, and cost on a card (AC2)", async () => {
+  it("shows the topbar with 'Board' and the loaded card count, no extra request (AC1)", async () => {
+    const client = makeClient(() =>
+      Promise.resolve([makeCard({ id: "1", column: "Ready" }), makeCard({ id: "2", column: "Done" })]),
+    );
+    renderBoard(client);
+
+    expect(screen.getByRole("heading", { name: "Board" })).toBeTruthy();
+    expect(screen.queryByText(/tasks$/)).toBeNull();
+
+    await waitFor(() => expect(screen.getByText("· 2 tasks")).toBeTruthy());
+    expect(client.listTasks).toHaveBeenCalledTimes(1);
+  });
+
+  it("colours the highlighted columns' count pill amber and gives every other column header a colour dot (AC2)", async () => {
+    const client = makeClient(() => Promise.resolve([]));
+    renderBoard(client);
+
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(10));
+
+    const waiting = screen.getByRole("region", { name: "Waiting for You" });
+    const needsHuman = screen.getByRole("region", { name: "Needs Human" });
+    expect(within(waiting).getByText("0").className).toContain("badge--attention");
+    expect(within(needsHuman).getByText("0").className).toContain("badge--attention");
+
+    const ready = screen.getByRole("region", { name: "Ready" });
+    expect(within(ready).getByText("0").className).toContain("badge--neutral");
+
+    const dot = (name: string) => screen.getByRole("region", { name }).querySelector(".board-column__dot");
+    expect(dot("Waiting for You")?.className).toContain("board-column__dot--attention");
+    expect(dot("Spec In Progress")?.className).toContain("board-column__dot--progress");
+    expect(dot("Implementing")?.className).toContain("board-column__dot--progress");
+    expect(dot("CI")?.className).toContain("board-column__dot--progress");
+    expect(dot("Ready for Merge")?.className).toContain("board-column__dot--success");
+    expect(dot("Done")?.className).toContain("board-column__dot--success");
+    expect(dot("Needs Spec")?.className).toContain("board-column__dot--neutral");
+  });
+
+  it("shows the key link, summary, runtime tag, age, and cost on a card (AC3)", async () => {
     const client = makeClient(() =>
       Promise.resolve([
         makeCard({
@@ -183,8 +223,8 @@ describe("BoardView", () => {
     expect(link.getAttribute("href")).toBe("/tasks/1");
     const summary = within(card).getByText("Do the thing");
     expect(summary.getAttribute("title")).toBe("Do the thing");
-    expect(within(card).getByTestId("runtime-badge").className).toContain("badge--neutral");
-    expect(within(card).getByTestId("runtime-badge").textContent).toBe("codex");
+    expect(within(card).getByTestId("runtime-tag").className).toContain("tag");
+    expect(within(card).getByTestId("runtime-tag").textContent).toBe("codex");
     expect(within(card).getByTestId("card-age").textContent).toBe("3m");
     expect(within(card).getByTestId("card-cost").textContent).toBe("$12.35");
   });
@@ -307,5 +347,22 @@ describe("BoardView", () => {
     renderBoard(client);
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("network down"));
+  });
+
+  it("never breaks the board out to the viewport width (regression, UR2 fix F1)", () => {
+    // `100vw` / `calc(50% - 50vw)` escape `.page`'s own box (the area right
+    // of the sidebar) to the full viewport, overlapping the sidebar and
+    // running past the right edge. The board must instead stay inside
+    // `.page` and rely on `.topbar`'s own shared edge-to-edge break-out.
+    // Note: this file runs under `@vitest-environment jsdom`, whose global
+    // `URL` is jsdom's own (not Node's), so `new URL(relative, import.meta.url)`
+    // would throw when handed to Node's `fileURLToPath`. Resolve via
+    // `node:path` off the already-absolute test file path instead.
+    const testFilePath = fileURLToPath(import.meta.url);
+    const cssPath = join(dirname(testFilePath), "..", "board", "board.css");
+    const css = readFileSync(cssPath, "utf8");
+    expect(css).not.toContain("100vw");
+    expect(css).not.toContain("50vw");
+    expect(css).not.toContain("overflow-x: hidden");
   });
 });

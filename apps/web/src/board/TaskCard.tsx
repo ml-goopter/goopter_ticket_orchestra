@@ -17,10 +17,10 @@ function formatCost(costUsd: number): string {
 }
 
 /**
- * One board card (design.md §14 Board row): Jira key link, summary
- * (clamped to 3 lines, full text in `title`), runtime badge, age in
- * column, cost so far. A card in a highlighted column carries a matching
- * accent (`.board-card--highlighted`).
+ * One board card (design.md §14 Board row, approved mockup UR2): top row is
+ * the Jira key link and cost, then the summary (clamped to 2 lines, full
+ * text in `title`), then a meta row of the runtime tag and age. A card in a
+ * highlighted column carries a matching accent (`.board-card--highlighted`).
  */
 export function TaskCard({ card, now, highlighted }: TaskCardProps) {
   return (
@@ -28,21 +28,23 @@ export function TaskCard({ card, now, highlighted }: TaskCardProps) {
       data-testid="board-card"
       className={highlighted ? "board-card board-card--highlighted" : "board-card"}
     >
-      <Link to={`/tasks/${card.id}`} className="board-card__key">
-        {card.jiraKey}
-      </Link>
+      <div className="board-card__top">
+        <Link to={`/tasks/${card.id}`} className="board-card__key">
+          {card.jiraKey}
+        </Link>
+        <span className="board-card__cost" data-testid="card-cost">
+          {formatCost(card.cost)}
+        </span>
+      </div>
       <p className="board-card__summary" title={card.jiraSummary}>
         {card.jiraSummary}
       </p>
       <div className="board-card__meta">
-        <span className="badge badge--neutral" data-testid="runtime-badge">
+        <span className="tag" data-testid="runtime-tag">
           {card.runtime ?? "none"}
         </span>
         <span className="board-card__age" data-testid="card-age">
           {formatAge(card.updatedAt, now)}
-        </span>
-        <span className="board-card__cost" data-testid="card-cost">
-          {formatCost(card.cost)}
         </span>
       </div>
     </li>
