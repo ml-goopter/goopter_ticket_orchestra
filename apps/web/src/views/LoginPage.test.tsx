@@ -61,4 +61,66 @@ describe("LoginPage", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toBe("Invalid email or password.");
   });
+
+  it("displays the subtitle below the heading", async () => {
+    const client = makeFakeClient({
+      me: vi.fn().mockRejectedValue(new Error("anonymous")),
+      login: vi.fn(),
+    });
+
+    render(
+      <SessionProvider client={client}>
+        <LoginPage />
+      </SessionProvider>,
+    );
+
+    const subtitle = await screen.findByText("Jira tickets to reviewed pull requests.");
+    expect(subtitle).toBeTruthy();
+  });
+
+  it("displays footer text below the card", async () => {
+    const client = makeFakeClient({
+      me: vi.fn().mockRejectedValue(new Error("anonymous")),
+      login: vi.fn(),
+    });
+
+    render(
+      <SessionProvider client={client}>
+        <LoginPage />
+      </SessionProvider>,
+    );
+
+    const footer = await screen.findByText("Accounts are created by an admin.");
+    expect(footer).toBeTruthy();
+  });
+
+  it("displays the alert before the form when an error is shown", async () => {
+    const client = makeFakeClient({
+      me: vi.fn().mockRejectedValue(new Error("anonymous")),
+      login: vi.fn().mockRejectedValue(new ApiError(401, "invalid_credentials", "Invalid email or password.")),
+    });
+
+    render(
+      <SessionProvider client={client}>
+        <LoginPage />
+      </SessionProvider>,
+    );
+
+    await screen.findByRole("heading", { name: "Log in" });
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "wrong" } });
+    const submit = screen.getByRole("button", { name: "Log in" });
+
+    await act(async () => {
+      submit.click();
+    });
+
+    const alert = await screen.findByRole("alert");
+    const form = screen.getByRole("button", { name: "Log in" }).closest("form");
+
+    // Alert should appear before form in DOM order
+    if (form) {
+      expect(alert.compareDocumentPosition(form)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    }
+  });
 });

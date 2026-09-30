@@ -1,0 +1,102 @@
+/**
+ * Login page styles (UR8, approved mockup login.mockup.html).
+ * Extends the layout defined in components.css .login-page.
+ */
+
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-page-bg);
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    var(--color-border) 1px,
+    transparent 1px
+  );
+  background-size: 22px 22px;
+}
+
+.login-page__wrap {
+  width: 360px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.login-page__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-5);
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.login-page__brand-mark {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
+  background: var(--color-text);
+  color: var(--color-surface);
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.login-page__card {
+  width: 100%;
+}
+
+.login-page__subtitle {
+  color: var(--color-text-faint);
+  margin: var(--space-3) 0 var(--space-4) 0;
+  font-size: var(--font-size-sm);
+}
+
+.login-page__card .field {
+  margin-bottom: var(--space-4);
+}
+
+.login-page__card .field label {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-text-muted);
+  display: block;
+  margin-bottom: var(--space-1);
+}
+
+.login-page__card .field input {
+  width: 100%;
+  height: 36px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-base);
+  color: var(--color-text);
+  box-sizing: border-box;
+}
+
+.login-page__card .field input:focus {
+  outline: 0;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+}
+
+.login-page__card .alert {
+  margin-bottom: var(--space-4);
+}
+
+.login-page__card button[type="submit"] {
+  width: 100%;
+  margin-top: var(--space-1);
+}
+
+.login-page__footer {
+  text-align: center;
+  color: var(--color-text-faint);
+  font-size: var(--font-size-xs);
+  margin-top: var(--space-5);
+}
