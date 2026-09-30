@@ -2,6 +2,12 @@
  * Design tokens (U1, docs/design.md §14). Light theme only (user decision).
  * Every later view task styles against these custom properties instead of
  * hard-coding colours, spacing, radii, or shadows.
+ *
+ * Palette and radii adopted from the approved mockups (UR1,
+ * nimbalyst-local/mockups/{board,attention-inbox,task-detail,admin}.mockup.html).
+ * Every property name that predates UR1 keeps working: `--color-border`,
+ * `--color-border-strong`, and `--radius-lg` change *value* to match the
+ * mockups, but nothing is renamed or removed.
  */
 :root {
   color-scheme: light;
@@ -31,18 +37,25 @@
   --space-10: 40px;
   --space-12: 48px;
 
-  /* Radii */
+  /* Radii (mockup `--r-sm|--r-md|--r-lg`) */
   --radius-sm: 4px;
   --radius-md: 6px;
-  --radius-lg: 10px;
+  --radius-lg: 8px;
   --radius-full: 999px;
 
-  /* Neutral surfaces and text (slate) */
+  /* Sidebar width (UR1): shared by the sidebar itself and the attention
+     panel/scrim, which anchor to its right edge. */
+  --sidebar-width: 220px;
+
+  /* Neutral surfaces and text (slate). `--color-page-bg` is the mockup's
+     `--bg`, the body's colour; `--color-surface-sunken` is its separate
+     `--sunken`, used for cards/columns/hovers sitting on that body. */
+  --color-page-bg: #f8fafc;
   --color-surface: #ffffff;
   --color-surface-raised: #f8fafc;
   --color-surface-sunken: #f1f5f9;
-  --color-border: #cbd5e1;
-  --color-border-strong: #94a3b8;
+  --color-border: #e2e8f0;
+  --color-border-strong: #cbd5e1;
   --color-text: #0f172a;
   --color-text-muted: #475569;
   --color-text-faint: #64748b;
@@ -50,14 +63,19 @@
   /* Accent, primary actions and links */
   --color-accent: #2563eb;
   --color-accent-hover: #1d4ed8;
+  --color-accent-soft: #eff6ff;
   --color-accent-contrast: #ffffff;
   --color-link: var(--color-accent);
 
   /* Status colours: attention/amber, progress/blue, success/green,
      danger/red, neutral/grey. Each has a background + foreground pair
-     meeting WCAG AA for the foreground text on the background. */
+     meeting WCAG AA for the foreground text on the background.
+     `--color-attention-soft`/`--color-attention-line` are the mockup's
+     `--att-soft`/`--att-line`, used for the open/active nav-item state. */
   --color-attention-bg: #fef3c7;
   --color-attention-fg: #7c4a03;
+  --color-attention-soft: #fffbeb;
+  --color-attention-line: #fde68a;
   --color-progress-bg: #dbeafe;
   --color-progress-fg: #1e3a8a;
   --color-success-bg: #dcfce7;

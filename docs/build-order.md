@@ -79,6 +79,7 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | fixes | GOT.67 | worker tests: drive the runner's quiet timer deterministically | #84 |
 | fixes | GOT.93 | tasks: refuse to reopen a task whose Jira ticket was recorded out of scope | #85 |
 | prompts | GOT.101 (part A) | prompts: delegated subagents run in the foreground | #86 |
+| ui redesign | UR1 | web: left sidebar shell, attention slide-over, shared style primitives | #87 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
