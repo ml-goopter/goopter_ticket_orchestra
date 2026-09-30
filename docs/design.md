@@ -495,6 +495,7 @@ stateDiagram-v2
   SPEC_APPROVED --> BLOCKED: dependency failed or cancelled
   READY --> IMPLEMENTING: claimed
   IMPLEMENTING --> REVIEWING: review.started
+  REVIEWING --> REVIEWING: review.started (new round)
   REVIEWING --> IMPLEMENTING: review.findings
   REVIEWING --> CI_RUNNING: pull_request.created
   CI_RUNNING --> IMPLEMENTING: ci.failed
@@ -560,6 +561,7 @@ A spec execution is `COMPLETED` when the user requests review. Sending the spec 
 | --- | --- | --- | --- | --- | --- |
 | task | READY | `task.claimed` | IMPLEMENTING | worker | create execution, lease |
 | task | IMPLEMENTING | `review.started` | REVIEWING | agent |  |
+| task | REVIEWING | `review.started` | REVIEWING | agent | a new round with the task already `REVIEWING` (GOT.97) |
 | task | REVIEWING | `review.findings` | IMPLEMENTING | agent | `review_rounds++`, check limit |
 | task | REVIEWING | `pull_request.created` | CI_RUNNING | agent | insert `pull_requests`, execution `COMPLETED` |
 | task | CI_RUNNING | `ci.failed` | IMPLEMENTING | worker | `ci_rounds++`, enqueue `resume_with_ci_failure` |
@@ -570,6 +572,8 @@ A spec execution is `COMPLETED` when the user requests review. Sending the spec 
 | task | SPEC_APPROVED | `spec.approved` no execution | READY or BLOCKED | user | dependency check |
 
 The full table is code, in `packages/core/src/transitions.ts`, and is the reference for every edge above.
+
+`review.started` is legal from `REVIEWING` as well as `IMPLEMENTING` (GOT.97, user decision 2026-09-29). A retry execution can start while the task is `REVIEWING` (§9.5), and an `ask_user` verdict leaves the task `REVIEWING` through its clarification, so in both cases the agent's next round starts from `REVIEWING` and the task stays there. A round started this way counts toward the review round limit like any other: `report_review_result` checks every result's `round` against `max_review_rounds` whichever state the round started from, escalates the task to `NEEDS_HUMAN` when it is exceeded, and a `findings` verdict within the limit still does `review_rounds++`.
 
 ---
 
@@ -701,7 +705,7 @@ Uses `@anthropic-ai/claude-agent-sdk`.
 | text | `assistant` messages, text blocks |
 | review subagent | native `Agent` tool is allowed, but the instructions tell the agent to use `orchestra-review` so both runtimes share one path |
 | tool policy `spec` | `Read, Glob, Grep, Bash(git log:*), Bash(git show:*), mcp__orchestra__propose_spec, mcp__orchestra__raise_issue` |
-| tool policy `implementation` | all built-ins plus `mcp__orchestra__*` |
+| tool policy `implementation` | all built-ins except `Skill`, plus `mcp__orchestra__*`. `Skill` is also passed as `disallowedTools`, because `bypassPermissions` ignores the allow list (GOT.97) |
 | tool policy `review` | `Read, Glob, Grep, Bash(git diff:*), Bash(git log:*)`, plus the repository's test command |
 
 ### 7.2 Codex adapter
@@ -737,9 +741,9 @@ Tools. All take and return JSON validated by zod schemas in `packages/core`.
 | tool | roles | input | effect |
 | --- | --- | --- | --- |
 | `raise_issue` | all | `type, severity, blocking, title, description, question?, options?, recommended_option?` | insert `issues`, event `issue.created`, notification. If blocking, mark execution `blocking_pending` and return `{ issue_id, instruction: "Stop now. End your turn without further work. You will be resumed with the answer." }` |
-| `report_review_started` | implementation | `round` | event `review.started`, task → `REVIEWING` |
+| `report_review_started` | implementation | `round` | event `review.started`, task `IMPLEMENTING` or `REVIEWING` → `REVIEWING` |
 | `report_review_result` | implementation | `round, verdict, findings[]` | insert `review_results`, event. `findings` → task `IMPLEMENTING`. `ask_user` findings must be followed by `raise_issue`. If `round > max_review_rounds`, return an instruction to stop and call `report_failed`. |
-| `report_pr_created` | implementation | `url, number, head_sha` | insert `pull_requests`, event, task → `CI_RUNNING`, execution → `COMPLETED` |
+| `report_pr_created` | implementation | `url, number, head_sha` | insert `pull_requests`, event, task → `CI_RUNNING`, execution → `COMPLETED`. Gated on the review loop (D14): refused unless the execution's latest review round, the round of its last `review.started`, has a `review.result` with verdict `clean` written after that start, and the task is `REVIEWING`. A clean round followed by a move back to `IMPLEMENTING`, for example a CI failure, does not pass, and neither does a round of an earlier execution of the task. Otherwise it returns tool error `REVIEW_REQUIRED`, telling the agent to run `orchestra-review` until the verdict is clean, and writes no `pull_requests` row and changes no state. |
 | `report_complete` | spec | `summary` | used by spec role only when the user has finished; implementation completion is `report_pr_created` |
 | `report_failed` | all | `reason, detail` | execution → `FAILED` with `end_reason = agent_gave_up`, task → `NEEDS_HUMAN` |
 | `propose_spec` | spec | `SpecContent` | validate, upsert the task's draft revision, event `spec.proposed` |
@@ -781,6 +785,8 @@ System prompt, static per role, covers:
 - the agent-tools contract: when to call which tool, that a blocking `raise_issue` means stop
 - the review protocol for the implementation role: after tests pass, run `orchestra-review`, read its findings JSON, fix valid findings, add a regression test per fixed finding, run it again, repeat until `clean` or the tool says stop, then commit, push, `gh pr create`, and call `report_pr_created`
 - the resume contract: on resume, the prompt begins with a header saying what happened since the last turn
+
+The prompt is not the only enforcement of that protocol (GOT.97). The Claude adapter passes `disallowedTools: ["Skill"]` for the implementation role, which removes the `Skill` tool from the session even under `bypassPermissions` (section 7.1), so a built-in review skill cannot stand in for `orchestra-review`, and `report_pr_created` refuses until the latest review round is clean (section 8). The Codex runtime's tool policy is unchanged and relies on the `report_pr_created` gate alone.
 
 User prompt, assembled per start or resume:
 

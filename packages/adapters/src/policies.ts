@@ -13,8 +13,8 @@ import type { ToolPolicy } from "./types.js";
 /**
  * Built-in tool names of the installed `@anthropic-ai/claude-agent-sdk`
  * (0.3.282), read from `BUILTIN_TOOL_NAMES` in the bundled CLI rather than
- * written from memory. `implementation` is "all built-ins" (design.md §7.1),
- * so it is this list verbatim.
+ * written from memory. `implementation` is this list minus
+ * `IMPLEMENTATION_DISALLOWED_TOOLS` (design.md §7.1).
  */
 export const CLAUDE_BUILTIN_TOOLS = [
   "Bash",
@@ -82,11 +82,24 @@ export const REVIEW_TOOLS = [
   "Bash(git log:*)",
 ] as const;
 
-/** Every built-in plus the agent-tools MCP server (design.md §7.1). */
-export const IMPLEMENTATION_TOOLS = [
-  ...CLAUDE_BUILTIN_TOOLS,
+/**
+ * Built-ins the implementation role must not use (GOT.97, design.md §7.1,
+ * §9.2). `Skill` would let a built-in review skill stand in for
+ * `orchestra-review`.
+ */
+export const IMPLEMENTATION_DISALLOWED_TOOLS = ["Skill"] as const;
+
+/**
+ * Every built-in except `IMPLEMENTATION_DISALLOWED_TOOLS`, plus the
+ * agent-tools MCP server (design.md §7.1).
+ */
+export const IMPLEMENTATION_TOOLS: readonly string[] = [
+  ...CLAUDE_BUILTIN_TOOLS.filter(
+    (tool) =>
+      !(IMPLEMENTATION_DISALLOWED_TOOLS as readonly string[]).includes(tool),
+  ),
   ORCHESTRA_MCP_WILDCARD,
-] as const;
+];
 
 export interface AllowedToolsOptions {
   /**
@@ -226,6 +239,21 @@ export function builtinToolsFor(
     if (!builtins.includes(name)) builtins.push(name);
   }
   return builtins;
+}
+
+/**
+ * Tools to pass as the SDK's `disallowedTools`, or `undefined` for none.
+ *
+ * `implementation` runs under `bypassPermissions`, which approves every tool
+ * whether or not `allowedTools` lists it, so omitting a tool from the allow
+ * list restricts nothing. `disallowedTools` removes the tool from the model's
+ * context in every permission mode (sdk.d.ts `Options.disallowedTools`). The
+ * read-only roles need none: their `tools` option already excludes it.
+ */
+export function disallowedToolsFor(policy: ToolPolicy): string[] | undefined {
+  return policy === "implementation"
+    ? [...IMPLEMENTATION_DISALLOWED_TOOLS]
+    : undefined;
 }
 
 /** `codex exec --sandbox` values this layer uses (design.md §7.2). */

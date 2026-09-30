@@ -5,6 +5,7 @@ import {
   CLAUDE_BUILTIN_TOOLS,
   allowedToolsFor,
   builtinToolsFor,
+  disallowedToolsFor,
   permissionModeFor,
   settingSourcesFor,
 } from "./policies.js";
@@ -118,11 +119,12 @@ describe("allowedToolsFor (design.md §7.1 tool policies)", () => {
     }
   });
 
-  it("returns every built-in plus the orchestra MCP wildcard for implementation", () => {
+  it("returns every built-in except Skill plus the orchestra MCP wildcard for implementation", () => {
     expect(allowedToolsFor("implementation")).toEqual([
-      ...CLAUDE_BUILTIN_TOOLS,
+      ...CLAUDE_BUILTIN_TOOLS.filter((tool) => tool !== "Skill"),
       "mcp__orchestra__*",
     ]);
+    expect(allowedToolsFor("implementation")).not.toContain("Skill");
     expect(allowedToolsFor("implementation")).toContain("Write");
     expect(allowedToolsFor("implementation")).toContain("Edit");
     expect(allowedToolsFor("implementation")).toContain("Bash");
@@ -211,6 +213,29 @@ describe("builtinToolsFor (base set of built-ins offered to the session)", () =>
 
   it("leaves implementation on the runtime default, i.e. every built-in", () => {
     expect(builtinToolsFor("implementation")).toBeUndefined();
+  });
+});
+
+describe("disallowedToolsFor (GOT.97, design.md §7.1, §9.2)", () => {
+  it("disallows Skill for implementation", () => {
+    expect(disallowedToolsFor("implementation")).toEqual(["Skill"]);
+  });
+
+  it("disallows nothing for the read-only roles", () => {
+    expect(disallowedToolsFor("spec")).toBeUndefined();
+    expect(disallowedToolsFor("review")).toBeUndefined();
+  });
+
+  it("names only real built-ins", () => {
+    for (const tool of disallowedToolsFor("implementation") ?? []) {
+      expect(CLAUDE_BUILTIN_TOOLS).toContain(tool);
+    }
+  });
+
+  it("returns a fresh array each call", () => {
+    const first = disallowedToolsFor("implementation");
+    first?.push("Write");
+    expect(disallowedToolsFor("implementation")).toEqual(["Skill"]);
   });
 });
 

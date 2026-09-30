@@ -23,6 +23,9 @@ const EXPECTED_EDGES: {
   { entity: "task", from: "SPEC_APPROVED", trigger: "spec.approved", to: "IMPLEMENTING" },
   { entity: "task", from: "READY", trigger: "task.claimed", to: "IMPLEMENTING" },
   { entity: "task", from: "IMPLEMENTING", trigger: "review.started", to: "REVIEWING" },
+  // GOT.97 user decision: a new round may start while the task is already
+  // REVIEWING (retry execution, or after an ask_user clarification).
+  { entity: "task", from: "REVIEWING", trigger: "review.started", to: "REVIEWING" },
   { entity: "task", from: "REVIEWING", trigger: "review.findings", to: "IMPLEMENTING" },
   { entity: "task", from: "REVIEWING", trigger: "pull_request.created", to: "CI_RUNNING" },
   { entity: "task", from: "CI_RUNNING", trigger: "ci.failed", to: "IMPLEMENTING" },
@@ -197,6 +200,33 @@ describe("reopen edges (design.md §12.2 POST /tasks/:id/reopen, GOT.55)", () =>
       );
       expect(accepting).toEqual(["CANCELLED"]);
     }
+  });
+});
+
+describe("review.started edges (design.md §5.1, GOT.97)", () => {
+  it("only IMPLEMENTING and REVIEWING accept review.started, both to REVIEWING", () => {
+    const rows = TRANSITIONS.filter(
+      (r) => r.entity === "task" && r.trigger === "review.started",
+    ).map((r) => `${r.from}->${r.to}`);
+    expect(rows.sort()).toEqual([
+      "IMPLEMENTING->REVIEWING",
+      "REVIEWING->REVIEWING",
+    ]);
+  });
+
+  it("REVIEWING keeps its other edges unchanged", () => {
+    const fromReviewing = TRANSITIONS.filter(
+      (r) => r.entity === "task" && r.from === "REVIEWING",
+    ).map((r) => `${r.trigger}->${r.to}`);
+    expect(fromReviewing.sort()).toEqual([
+      "issue.resolved.spec_revision->SPEC_IN_PROGRESS",
+      "pull_request.created->CI_RUNNING",
+      "review.findings->IMPLEMENTING",
+      "review.started->REVIEWING",
+      "task.cancelled->CANCELLED",
+      "task.escalated->NEEDS_HUMAN",
+      "task.failed->FAILED",
+    ]);
   });
 });
 

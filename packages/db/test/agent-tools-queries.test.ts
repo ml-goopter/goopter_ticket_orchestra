@@ -16,6 +16,7 @@ import {
   insertNotification,
   insertPullRequest,
   insertReviewResult,
+  latestReviewRound,
   lockExecutionForTool,
   lockTaskForTool,
   renewTaskLease,
@@ -493,5 +494,132 @@ describe("getTaskState", () => {
     expect(
       await getTaskState(h.db, "00000000-0000-4000-8000-000000000000"),
     ).toBeNull();
+  });
+});
+
+describe("latestReviewRound (GOT.97, design.md §8 report_pr_created gate)", () => {
+  async function seedRunning(): Promise<{ taskId: string; executionId: string }> {
+    const taskId = await seedTask(h.db, fx, {
+      jiraKey: nextKey(),
+      state: "REVIEWING",
+    });
+    const executionId = await seedExecution(h.db, taskId, { state: "RUNNING" });
+    return { taskId, executionId };
+  }
+
+  async function started(
+    s: { taskId: string; executionId: string },
+    round: number,
+  ): Promise<void> {
+    await h.db.insert(schema.executionEvents).values({
+      taskId: s.taskId,
+      executionId: s.executionId,
+      type: "review.started",
+      payload: { round },
+    });
+  }
+
+  async function result(
+    s: { taskId: string; executionId: string },
+    round: number,
+    verdict: "clean" | "findings" | "ask_user",
+  ): Promise<void> {
+    await h.db.insert(schema.executionEvents).values({
+      taskId: s.taskId,
+      executionId: s.executionId,
+      type: "review.result",
+      payload: { review_result_id: "x", round, verdict, findings_count: 0 },
+    });
+  }
+
+  it("is null when the execution never started a review round", async () => {
+    const s = await seedRunning();
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toBeNull();
+  });
+
+  it("round started without a result has no verdict", async () => {
+    const s = await seedRunning();
+    await started(s, 1);
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toEqual({
+      round: 1,
+      verdict: null,
+    });
+  });
+
+  it("returns the verdict of the latest round's result", async () => {
+    const s = await seedRunning();
+    await started(s, 1);
+    await result(s, 1, "findings");
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toEqual({
+      round: 1,
+      verdict: "findings",
+    });
+    await started(s, 2);
+    await result(s, 2, "clean");
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toEqual({
+      round: 2,
+      verdict: "clean",
+    });
+  });
+
+  it("round 1 clean then round 2 started without a result has no verdict", async () => {
+    const s = await seedRunning();
+    await started(s, 1);
+    await result(s, 1, "clean");
+    await started(s, 2);
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toEqual({
+      round: 2,
+      verdict: null,
+    });
+  });
+
+  it("a result recorded before the round was started again does not count", async () => {
+    const s = await seedRunning();
+    await started(s, 2);
+    await result(s, 2, "clean");
+    await started(s, 2);
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toEqual({
+      round: 2,
+      verdict: null,
+    });
+  });
+
+  it("a result for another round does not count", async () => {
+    const s = await seedRunning();
+    await started(s, 2);
+    await result(s, 1, "clean");
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toEqual({
+      round: 2,
+      verdict: null,
+    });
+  });
+
+  it("the last result of the round wins", async () => {
+    const s = await seedRunning();
+    await started(s, 1);
+    await result(s, 1, "clean");
+    await result(s, 1, "findings");
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toEqual({
+      round: 1,
+      verdict: "findings",
+    });
+  });
+
+  it("ignores another execution's review events", async () => {
+    const s = await seedRunning();
+    const other = await seedExecution(h.db, s.taskId, {
+      state: "FAILED",
+      attempt: 2,
+    });
+    await started({ taskId: s.taskId, executionId: other }, 1);
+    await result({ taskId: s.taskId, executionId: other }, 1, "clean");
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toBeNull();
+
+    await started(s, 1);
+    await started({ taskId: s.taskId, executionId: other }, 2);
+    expect(await latestReviewRound(h.db, s.taskId, s.executionId)).toEqual({
+      round: 1,
+      verdict: null,
+    });
   });
 });
