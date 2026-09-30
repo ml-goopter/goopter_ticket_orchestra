@@ -58,6 +58,7 @@ describe("WorkersPanel", () => {
     expect(screen.getByText("1/3")).toBeTruthy();
     expect(screen.getByText("1m ago")).toBeTruthy();
     expect(screen.queryByTestId("stale-marker")).toBeNull();
+    expect(screen.getByText("Refreshes every 30s")).toBeTruthy();
   });
 
   it("shows a muted em dash when a worker has no capabilities", async () => {
