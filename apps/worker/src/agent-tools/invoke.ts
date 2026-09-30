@@ -10,7 +10,11 @@ import {
 import type { Logger } from "../logger.js";
 import { renewExecutionLease } from "./lease.js";
 import type { ExecutionRegistry, LiveExecution } from "./registry.js";
-import { RepositoryLockedError, type ToolContext } from "./tool.js";
+import {
+  RepositoryLockedError,
+  ReviewRequiredError,
+  type ToolContext,
+} from "./tool.js";
 import {
   authenticate,
   reauthorize,
@@ -25,6 +29,7 @@ export type ToolErrorCode =
   | "ILLEGAL_TRANSITION"
   | "NOT_FOUND"
   | "REPOSITORY_LOCKED"
+  | "REVIEW_REQUIRED"
   | "INTERNAL";
 
 export const REDACTED = "[REDACTED]";
@@ -96,6 +101,9 @@ function classify(err: unknown): { code: ToolErrorCode; message: string } {
   }
   if (err instanceof RepositoryLockedError) {
     return { code: "REPOSITORY_LOCKED", message: err.message };
+  }
+  if (err instanceof ReviewRequiredError) {
+    return { code: "REVIEW_REQUIRED", message: err.message };
   }
   return { code: "INTERNAL", message: "Internal error. The call had no effect." };
 }

@@ -739,7 +739,7 @@ Tools. All take and return JSON validated by zod schemas in `packages/core`.
 | `raise_issue` | all | `type, severity, blocking, title, description, question?, options?, recommended_option?` | insert `issues`, event `issue.created`, notification. If blocking, mark execution `blocking_pending` and return `{ issue_id, instruction: "Stop now. End your turn without further work. You will be resumed with the answer." }` |
 | `report_review_started` | implementation | `round` | event `review.started`, task → `REVIEWING` |
 | `report_review_result` | implementation | `round, verdict, findings[]` | insert `review_results`, event. `findings` → task `IMPLEMENTING`. `ask_user` findings must be followed by `raise_issue`. If `round > max_review_rounds`, return an instruction to stop and call `report_failed`. |
-| `report_pr_created` | implementation | `url, number, head_sha` | insert `pull_requests`, event, task → `CI_RUNNING`, execution → `COMPLETED` |
+| `report_pr_created` | implementation | `url, number, head_sha` | insert `pull_requests`, event, task → `CI_RUNNING`, execution → `COMPLETED`. Gated on the review loop (D14): refused unless the execution's latest review round, the round of its last `review.started`, has a `review.result` with verdict `clean` written after that start. Otherwise it returns tool error `REVIEW_REQUIRED`, telling the agent to run `orchestra-review` until the verdict is clean, and writes no `pull_requests` row and changes no state. |
 | `report_complete` | spec | `summary` | used by spec role only when the user has finished; implementation completion is `report_pr_created` |
 | `report_failed` | all | `reason, detail` | execution → `FAILED` with `end_reason = agent_gave_up`, task → `NEEDS_HUMAN` |
 | `propose_spec` | spec | `SpecContent` | validate, upsert the task's draft revision, event `spec.proposed` |
@@ -780,6 +780,8 @@ System prompt, static per role, covers:
 - who the agent is and what it may not do (no product decisions, no editing the spec, no force push, no merging)
 - the agent-tools contract: when to call which tool, that a blocking `raise_issue` means stop
 - the review protocol for the implementation role: after tests pass, run `orchestra-review`, read its findings JSON, fix valid findings, add a regression test per fixed finding, run it again, repeat until `clean` or the tool says stop, then commit, push, `gh pr create`, and call `report_pr_created`
+
+The prompt is not the only enforcement of that protocol (GOT.97). The `Skill` tool is unavailable to the implementation role's Claude sessions, so a built-in review skill cannot stand in for `orchestra-review`, and `report_pr_created` refuses until the latest review round is clean (section 8). The Codex runtime's tool policy is unchanged and relies on the `report_pr_created` gate alone.
 - the resume contract: on resume, the prompt begins with a header saying what happened since the last turn
 
 User prompt, assembled per start or resume:

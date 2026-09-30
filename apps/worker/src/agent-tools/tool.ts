@@ -60,3 +60,16 @@ export class RepositoryLockedError extends Error {
     this.name = "RepositoryLockedError";
   }
 }
+
+/**
+ * Thrown by `report_pr_created` when the execution's latest review round
+ * has no clean verdict (design.md §8, D14, GOT.97). `invoke.ts` maps this
+ * to the `REVIEW_REQUIRED` tool error code and passes the message, which
+ * tells the agent what to do, through to it.
+ */
+export class ReviewRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReviewRequiredError";
+  }
+}

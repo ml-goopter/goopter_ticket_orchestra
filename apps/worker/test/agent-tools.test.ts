@@ -9,6 +9,7 @@ import {
 } from "@orchestra/core";
 import {
   agentWorkers,
+  executionEvents,
   executions,
   listActiveExecutionIds,
   projects,
@@ -196,6 +197,31 @@ async function seed(options: SeedOptions): Promise<Seeded> {
     executionId: execution!.id,
     token,
   };
+}
+
+/**
+ * Writes the events `report_review_started` and `report_review_result`
+ * leave for one round, without their transitions, so a test seeded in
+ * REVIEWING passes the `report_pr_created` review gate (GOT.97).
+ */
+async function seedReviewRound(
+  s: Seeded,
+  round: number,
+  verdict: "clean" | "findings" | "ask_user" | null = "clean",
+): Promise<void> {
+  await db.insert(executionEvents).values({
+    taskId: s.taskId,
+    executionId: s.executionId,
+    type: "review.started",
+    payload: { round },
+  });
+  if (verdict === null) return;
+  await db.insert(executionEvents).values({
+    taskId: s.taskId,
+    executionId: s.executionId,
+    type: "review.result",
+    payload: { review_result_id: "seeded", round, verdict, findings_count: 0 },
+  });
 }
 
 // ------------------------------------------------------------------ reads
@@ -887,6 +913,7 @@ describe("lock order: agent tool vs api cancel (design.md §5, §8)", () => {
   for (const { tool, taskState, effect, firstInsert } of RACE_TOOLS) {
     it(`${tool}: cancel holds the task lock first -> cancel commits, tool gets UNAUTHORIZED and writes nothing`, async () => {
       const s = await seed({ taskState });
+      if (tool === "report_pr_created") await seedReviewRound(s, 1);
       const def = TOOL_DEFINITIONS.find((d) => d.name === tool)!;
       const taskLocked = deferred();
       const release = deferred();
@@ -947,6 +974,7 @@ describe("lock order: agent tool vs api cancel (design.md §5, §8)", () => {
 
     it(`${tool}: tool holds its locks first -> tool commits, then cancel succeeds`, async () => {
       const s = await seed({ taskState });
+      if (tool === "report_pr_created") await seedReviewRound(s, 1);
       const def = TOOL_DEFINITIONS.find((d) => d.name === tool)!;
 
       // Park the tool mid-transaction: it takes its row locks, then waits
@@ -1631,6 +1659,7 @@ describe("report_usage (design.md §9.7)", () => {
 describe("report_pr_created", () => {
   it("inserts the PR, moves task to CI_RUNNING and execution to COMPLETED, and revokes the token", async () => {
     const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1);
     const before = await snapshot(s);
     const client = await connect(s.token);
 
@@ -1677,6 +1706,7 @@ describe("report_pr_created", () => {
 
   it("GOT.39 C17: a second call for the same task updates the PR row in place, leaving exactly one", async () => {
     const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1);
     expectOk(
       await call(s.token, "report_pr_created", {
         url: "https://github.com/goopter/orchestra/pull/42",
@@ -1705,6 +1735,7 @@ describe("report_pr_created", () => {
       });
       await transition(tx, { entity: "task", id: s.taskId, trigger: "review.started", actor });
     });
+    await seedReviewRound(s, 2);
     const token = await db.transaction((tx) => issueToken(tx, s.executionId));
     issuedTokens.push(token);
 
@@ -1752,6 +1783,7 @@ describe("report_pr_created", () => {
 
   it("GOT.39 F4 (C22): reporting a new PR over a closed or merged row reopens it, clears merged_at, and takes the new number and sha", async () => {
     const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1);
     expectOk(
       await call(s.token, "report_pr_created", {
         url: "https://github.com/goopter/orchestra/pull/42",
@@ -1774,6 +1806,7 @@ describe("report_pr_created", () => {
       "update executions set state = 'RUNNING', ended_at = null where id = $1",
       [s.executionId],
     );
+    await seedReviewRound(s, 2);
     const token = await db.transaction((tx) => issueToken(tx, s.executionId));
     issuedTokens.push(token);
 
@@ -1798,6 +1831,160 @@ describe("report_pr_created", () => {
       mergedAt: null,
       ciState: "pending",
     });
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+  });
+});
+
+describe("report_pr_created review gate (GOT.97, D14)", () => {
+  const PR_ARGS = {
+    url: "https://github.com/goopter/orchestra/pull/7",
+    number: 7,
+    head_sha: "cafe",
+  };
+
+  /**
+   * AC1: the call is a REVIEW_REQUIRED tool error naming the requirement,
+   * writes no pull_requests row and changes no state. The only new row is
+   * its own `agent.tool_call` record with `ok: false` (§8).
+   */
+  async function expectRefused(s: Seeded, client?: Client) {
+    const before = await snapshot(s);
+
+    const result = client
+      ? await callOn(client, "report_pr_created", PR_ARGS)
+      : await call(s.token, "report_pr_created", PR_ARGS);
+
+    expect(result).toMatchObject({ isError: true, code: "REVIEW_REQUIRED" });
+    const message = (result as { message: string }).message;
+    expect(message).toContain("orchestra-review");
+    expect(message).toContain("clean");
+
+    const after = await snapshot(s);
+    expect({ ...after, events: 0, leaseExpiresAt: 0 }).toEqual({
+      ...before,
+      events: 0,
+      leaseExpiresAt: 0,
+    });
+    expect(after.pullRequests).toBe(0);
+    const added = (await eventsFor(s.taskId)).slice(before.events);
+    expect(added.map((e) => [e.type, e.payload])).toEqual([
+      [
+        "agent.tool_call",
+        { tool: "report_pr_created", input: PR_ARGS, ok: false, error: "REVIEW_REQUIRED" },
+      ],
+    ]);
+    return message;
+  }
+
+  it("refuses when the execution never started a review round", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    const message = await expectRefused(s);
+    expect(message).toContain("report_review_started");
+  });
+
+  it("refuses when the latest round has no review.result", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1, null);
+    const message = await expectRefused(s);
+    expect(message).toContain("round 1");
+  });
+
+  it("refuses when the latest round's verdict is ask_user (task still REVIEWING)", async () => {
+    const s = await seed({ taskState: "REVIEWING" });
+    await seedReviewRound(s, 1, "ask_user");
+    const message = await expectRefused(s);
+    expect(message).toContain("ask_user");
+  });
+
+  it("refuses with REVIEW_REQUIRED, not ILLEGAL_TRANSITION, when the latest verdict is findings", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "findings",
+        findings: [
+          { severity: "warning", description: "d", action: "a" },
+        ],
+      }),
+    );
+    const message = await expectRefused(s, client);
+    expect(message).toContain("findings");
+  });
+
+  it("round 1 clean, then round 2 started without a result: refused", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", { round: 1, verdict: "clean", findings: [] }),
+    );
+    // A second round started after the clean one has no verdict yet.
+    await seedReviewRound(s, 2, null);
+    const message = await expectRefused(s, client);
+    expect(message).toContain("round 2");
+  });
+
+  it("round 1 findings, round 2 started without a result: refused", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "findings",
+        findings: [{ severity: "warning", description: "d", action: "a" }],
+      }),
+    );
+    expectOk(await callOn(client, "report_review_started", { round: 2 }));
+    expect((await getTask(s.taskId))!.state).toBe("REVIEWING");
+    const message = await expectRefused(s, client);
+    expect(message).toContain("round 2");
+  });
+
+  it("round 1 findings, round 2 clean: the PR is recorded exactly as before", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "findings",
+        findings: [{ severity: "warning", description: "d", action: "a" }],
+      }),
+    );
+    expectOk(await callOn(client, "report_review_started", { round: 2 }));
+    expectOk(
+      await callOn(client, "report_review_result", { round: 2, verdict: "clean", findings: [] }),
+    );
+
+    expect(await callOn(client, "report_pr_created", PR_ARGS)).toEqual({
+      isError: false,
+      data: { ok: true },
+    });
+
+    const prs = await db.query.pullRequests.findMany({
+      where: (t, { eq }) => eq(t.taskId, s.taskId),
+    });
+    expect(prs).toHaveLength(1);
+    expect(prs[0]).toMatchObject({ executionId: s.executionId, number: 7, headSha: "cafe" });
+    expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
+    const execution = await getExecution(s.executionId);
+    expect(execution!.state).toBe("COMPLETED");
+    expect(execution!.toolsTokenHash).toBeNull();
+  });
+
+  it("a refused call leaves the session able to review and then open the PR", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    const client = await connect(s.token);
+    await expectRefused(s, client);
+
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    expectOk(
+      await callOn(client, "report_review_result", { round: 1, verdict: "clean", findings: [] }),
+    );
+    expectOk(await callOn(client, "report_pr_created", PR_ARGS));
     expect((await getTask(s.taskId))!.state).toBe("CI_RUNNING");
   });
 });
