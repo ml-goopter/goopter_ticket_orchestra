@@ -1,4 +1,6 @@
-import { and, desc, eq, exists, inArray, sql } from "drizzle-orm";
+import type { ReviewVerdict } from "@orchestra/core";
+import { and, desc, eq, exists, gt, inArray, sql } from "drizzle-orm";
+import { executionEvents } from "../schema/events.js";
 import {
   executionUsage,
   executions,
@@ -445,6 +447,68 @@ export async function upsertDraftSpecificationRevision(
     throw new Error("upsertDraftSpecificationRevision: insert returned no row");
   }
   return { ...row, created: true };
+}
+
+export interface LatestReviewRound {
+  round: number;
+  /** `null` when the round has no `review.result` yet. */
+  verdict: ReviewVerdict | null;
+}
+
+/**
+ * The execution's latest review round and its verdict, for the
+ * `report_pr_created` gate (design.md §8, D14, GOT.97). The latest round is
+ * the round of the execution's last `review.started` event. Its verdict is
+ * the last `review.result` event for that same round written after that
+ * start, so a result from an earlier start of the same round number, or
+ * one for another round, does not count. `null` when the execution never
+ * started a round.
+ *
+ * Ordered by `execution_events.id`, which follows per-task commit order
+ * (`appendEvent`'s advisory lock). `taskId` lets both reads use the
+ * `(task_id, id)` index.
+ */
+export async function latestReviewRound(
+  db: DbOrTx,
+  taskId: string,
+  executionId: string,
+): Promise<LatestReviewRound | null> {
+  const [start] = await db
+    .select({ id: executionEvents.id, payload: executionEvents.payload })
+    .from(executionEvents)
+    .where(
+      and(
+        eq(executionEvents.taskId, taskId),
+        eq(executionEvents.executionId, executionId),
+        eq(executionEvents.type, "review.started"),
+      ),
+    )
+    .orderBy(desc(executionEvents.id))
+    .limit(1);
+  if (!start) return null;
+
+  const round = (start.payload as { round: number }).round;
+  const [result] = await db
+    .select({ payload: executionEvents.payload })
+    .from(executionEvents)
+    .where(
+      and(
+        eq(executionEvents.taskId, taskId),
+        eq(executionEvents.executionId, executionId),
+        eq(executionEvents.type, "review.result"),
+        gt(executionEvents.id, start.id),
+        sql`(${executionEvents.payload} ->> 'round')::int = ${round}`,
+      ),
+    )
+    .orderBy(desc(executionEvents.id))
+    .limit(1);
+
+  return {
+    round,
+    verdict: result
+      ? (result.payload as { verdict: ReviewVerdict }).verdict
+      : null,
+  };
 }
 
 /**
