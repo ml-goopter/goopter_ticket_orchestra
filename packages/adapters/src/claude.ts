@@ -660,6 +660,13 @@ function* mapMessage(
     case "user":
       for (const block of contentBlocks(message.message)) {
         if (!isToolResultBlock(block)) continue;
+        // An errored result for a backgrounded Agent/Task call means the
+        // delegation never started (denied, invalid input): no task_started
+        // or task_notification follows, so the entry added at the tool_use
+        // (line ~654) must be cleared here or it never settles (GOT.101-B F1).
+        if (block.is_error === true) {
+          context.backgroundSubagents.delete(block.tool_use_id);
+        }
         yield {
           type: "tool_result",
           // The SDK does not repeat the tool name on the result, so it comes

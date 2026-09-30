@@ -2063,14 +2063,21 @@ describe("ClaudeAdapter background subagents at turn end (GOT.101)", () => {
         content: [{ type: "tool_use", id, name, input }],
       },
     });
-  const toolResult = (id: string) =>
+  const toolResult = (id: string, options: { isError?: boolean } = {}) =>
     cast({
       type: "user",
       session_id: SESSION_ID,
       parent_tool_use_id: null,
       message: {
         role: "user",
-        content: [{ type: "tool_result", tool_use_id: id, content: "launched" }],
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: id,
+            content: "launched",
+            ...(options.isError === true ? { is_error: true } : {}),
+          },
+        ],
       },
     });
   const taskStarted = (fields: Record<string, unknown>) =>
@@ -2127,6 +2134,19 @@ describe("ClaudeAdapter background subagents at turn end (GOT.101)", () => {
       finalText: "Now I'll delegate.",
       backgroundSubagents: 1,
     });
+  });
+
+  it("drops a background Agent call whose tool_result errored before any task message (GOT.101-B F1)", async () => {
+    expect(
+      await turnDone([
+        systemInit,
+        toolUse("toolu_a", "Agent", { ...delegate, run_in_background: true }),
+        // Denied or invalid input: the delegation never started, so no
+        // task_started or task_notification follows.
+        toolResult("toolu_a", { isError: true }),
+        resultSuccess(),
+      ]),
+    ).toEqual({ type: "turn_done", finalText: "Opened PR #12." });
   });
 
   it("counts a Task call with run_in_background true the same way", async () => {
@@ -2255,13 +2275,39 @@ describe("ClaudeAdapter background subagents at turn end (GOT.101)", () => {
     ).toEqual({ type: "turn_done", finalText: "Opened PR #12." });
   });
 
-  it("starts every stream with no outstanding subagents", async () => {
+  it("does not leak an outstanding background subagent from a start stream into a resume stream", async () => {
+    let call = 0;
     const adapter = new ClaudeAdapter({
-      query: scripted([systemInit, resultSuccess()]).fn,
+      query: () => {
+        call += 1;
+        // The start stream ends with an Agent call still running in the
+        // background and no settling task message; the resumed stream is a
+        // fresh CLI process, so it must start with an empty set even though
+        // the first stream's context object is still reachable.
+        const messages =
+          call === 1
+            ? [
+                systemInit,
+                toolUse("toolu_a", "Agent", { ...delegate, run_in_background: true }),
+                toolResult("toolu_a"),
+                resultSuccess(),
+              ]
+            : [systemInit, resultSuccess()];
+        return (async function* () {
+          for (const message of messages) yield message;
+        })();
+      },
     });
-    await collect(
+
+    const started = await collect(
       adapter.start(startRequest, new AbortController().signal),
     );
+    expect(started.at(-1)).toEqual({
+      type: "turn_done",
+      finalText: "Opened PR #12.",
+      backgroundSubagents: 1,
+    });
+
     const resumed = await collect(
       adapter.resume(resumeRequest, new AbortController().signal),
     );
