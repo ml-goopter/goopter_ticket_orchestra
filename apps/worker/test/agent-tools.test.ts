@@ -1901,7 +1901,12 @@ describe("report_pr_created review gate (GOT.97, D14)", () => {
   const prRows = (taskId: string) =>
     db.query.pullRequests.findMany({ where: (t, { eq }) => eq(t.taskId, taskId) });
 
-  async function expectRefused(s: Seeded, client?: Client) {
+  async function expectRefused(
+    s: Seeded,
+    client?: Client,
+    opts: { orchestraReview?: boolean } = {},
+  ) {
+    const { orchestraReview = true } = opts;
     const before = await snapshot(s);
     const prsBefore = await prRows(s.taskId);
 
@@ -1911,8 +1916,10 @@ describe("report_pr_created review gate (GOT.97, D14)", () => {
 
     expect(result).toMatchObject({ isError: true, code: "REVIEW_REQUIRED" });
     const message = (result as { message: string }).message;
-    expect(message).toContain("orchestra-review");
-    expect(message).toContain("clean");
+    if (orchestraReview) {
+      expect(message).toContain("orchestra-review");
+      expect(message).toContain("clean");
+    }
 
     const after = await snapshot(s);
     expect({ ...after, events: 0, leaseExpiresAt: 0 }).toEqual({
@@ -2169,16 +2176,68 @@ describe("report_pr_created review gate (GOT.97, D14)", () => {
     expect(prs[0]!.headSha).toBe("beef");
   });
 
-  it.each(["IMPLEMENTING", "CI_RUNNING", "NEEDS_HUMAN"] as const)(
-    "refuses with REVIEW_REQUIRED when the task is %s even though the latest round is clean",
-    async (taskState) => {
-      const s = await seed({ taskState });
-      await seedReviewRound(s, 1, "clean");
-      const message = await expectRefused(s);
-      expect(message).toContain(taskState);
-      expect(message).toContain("REVIEWING");
-    },
-  );
+  it("refuses with REVIEW_REQUIRED when the task is IMPLEMENTING even though the latest round is clean, and tells the agent to review again (F1)", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING" });
+    await seedReviewRound(s, 1, "clean");
+    const message = await expectRefused(s);
+    expect(message).toContain("IMPLEMENTING");
+    expect(message).toContain("REVIEWING");
+    expect(message).toContain("orchestra-review");
+  });
+
+  it("refuses with REVIEW_REQUIRED when the task is CI_RUNNING, without instructing another review round (F1)", async () => {
+    const s = await seed({ taskState: "CI_RUNNING" });
+    await seedReviewRound(s, 1, "clean");
+    const message = await expectRefused(s, undefined, { orchestraReview: false });
+    expect(message).toContain("CI_RUNNING");
+    expect(message).toContain("cannot be opened");
+    expect(message).not.toContain("orchestra-review");
+  });
+
+  it("refuses with REVIEW_REQUIRED when the task is NEEDS_HUMAN, pointing to report_failed instead of another review round (F1)", async () => {
+    const s = await seed({ taskState: "NEEDS_HUMAN" });
+    await seedReviewRound(s, 1, "clean");
+    const message = await expectRefused(s, undefined, { orchestraReview: false });
+    expect(message).toContain("NEEDS_HUMAN");
+    expect(message).toContain("report_failed");
+    expect(message).not.toContain("orchestra-review");
+  });
+
+  it("after a review round-limit escalation (NEEDS_HUMAN, execution still RUNNING) points to report_failed, not orchestra-review (F1)", async () => {
+    const s = await seed({ taskState: "IMPLEMENTING", maxReviewRounds: 1 });
+    const client = await connect(s.token);
+    expectOk(await callOn(client, "report_review_started", { round: 1 }));
+    const data = expectOk(
+      await callOn(client, "report_review_result", {
+        round: 1,
+        verdict: "clean",
+        findings: [],
+      }),
+    );
+    expect(data.instruction).toBeUndefined();
+
+    // Second round exceeds the limit: task escalates to NEEDS_HUMAN, but the
+    // execution stays RUNNING (report_review_result.ts).
+    expectOk(await callOn(client, "report_review_started", { round: 2 }));
+    const escalated = expectOk(
+      await callOn(client, "report_review_result", {
+        round: 2,
+        verdict: "clean",
+        findings: [],
+      }),
+    );
+    expect(escalated.instruction).toContain("report_failed");
+    const task = await getTask(s.taskId);
+    expect(task!.state).toBe("NEEDS_HUMAN");
+    expect((await getExecution(s.executionId))!.state).toBe("RUNNING");
+
+    const result = await callOn(client, "report_pr_created", PR_ARGS);
+    expect(result).toMatchObject({ isError: true, code: "REVIEW_REQUIRED" });
+    const message = (result as { message: string }).message;
+    expect(message).toContain("NEEDS_HUMAN");
+    expect(message).toContain("report_failed");
+    expect(message).not.toContain("orchestra-review");
+  });
 });
 
 // ================================================================= AC3

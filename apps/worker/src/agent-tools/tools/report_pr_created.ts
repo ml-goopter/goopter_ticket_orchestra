@@ -21,6 +21,12 @@ const REVIEW_REQUIRED_INSTRUCTION =
  * round followed by a move back to IMPLEMENTING (a CI failure) no longer
  * covers the code. Throws `ReviewRequiredError` before any write otherwise,
  * so the tool's transaction writes nothing.
+ *
+ * The refusal message only tells the agent to run orchestra-review again
+ * when the task is IMPLEMENTING (start a new round). NEEDS_HUMAN (for
+ * example a review round-limit escalation, `report_review_result.ts`) points
+ * to `report_failed` instead, and any other state just says a PR cannot be
+ * opened here — never a contradicting instruction to keep reviewing.
  */
 async function requireCleanReview(
   tx: Tx,
@@ -44,14 +50,24 @@ async function requireCleanReview(
     );
   }
   const state = await getTaskState(tx, taskId);
-  if (state !== "REVIEWING") {
-    const next =
-      state === "IMPLEMENTING" ? "Call report_review_started for a new round. " : "";
+  if (state === "REVIEWING") return;
+
+  if (state === "IMPLEMENTING") {
     throw new ReviewRequiredError(
-      `The task is ${state ?? "missing"}, not REVIEWING, so review round ${latest.round} no longer covers the changes. ` +
-        `${next}${REVIEW_REQUIRED_INSTRUCTION}`,
+      `The task is IMPLEMENTING, not REVIEWING, so review round ${latest.round} no longer covers the changes. ` +
+        `Call report_review_started for a new round. ${REVIEW_REQUIRED_INSTRUCTION}`,
     );
   }
+
+  if (state === "NEEDS_HUMAN") {
+    throw new ReviewRequiredError(
+      `The task is NEEDS_HUMAN, so a pull request cannot be opened in this state. Call report_failed.`,
+    );
+  }
+
+  throw new ReviewRequiredError(
+    `The task is ${state ?? "missing"}, not REVIEWING, so a pull request cannot be opened in this state.`,
+  );
 }
 
 /**

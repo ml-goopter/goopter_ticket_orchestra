@@ -784,9 +784,9 @@ System prompt, static per role, covers:
 - who the agent is and what it may not do (no product decisions, no editing the spec, no force push, no merging)
 - the agent-tools contract: when to call which tool, that a blocking `raise_issue` means stop
 - the review protocol for the implementation role: after tests pass, run `orchestra-review`, read its findings JSON, fix valid findings, add a regression test per fixed finding, run it again, repeat until `clean` or the tool says stop, then commit, push, `gh pr create`, and call `report_pr_created`
+- the resume contract: on resume, the prompt begins with a header saying what happened since the last turn
 
 The prompt is not the only enforcement of that protocol (GOT.97). The Claude adapter passes `disallowedTools: ["Skill"]` for the implementation role, which removes the `Skill` tool from the session even under `bypassPermissions` (section 7.1), so a built-in review skill cannot stand in for `orchestra-review`, and `report_pr_created` refuses until the latest review round is clean (section 8). The Codex runtime's tool policy is unchanged and relies on the `report_pr_created` gate alone.
-- the resume contract: on resume, the prompt begins with a header saying what happened since the last turn
 
 User prompt, assembled per start or resume:
 
