@@ -30,6 +30,14 @@
  *                                 (styles/base.css, not this file)
  *   Page topbar   (Topbar)       .topbar, .topbar__crumbs, .topbar__crumb-current,
  *                                 .topbar__spacer, .topbar__actions
+ *   Page area     (Page)         .page — fills the main area right of the
+ *                                 sidebar (no max-width, no centring) and
+ *                                 keeps padding for its content. A `.topbar`
+ *                                 nested anywhere inside a `.page` (as the
+ *                                 first thing in the page's content) breaks
+ *                                 out of that padding via negative margins,
+ *                                 so it spans the main area edge to edge
+ *                                 while later content keeps the page padding.
  */
 
 /* --------------------------------------------------------------------
@@ -469,6 +477,17 @@
  * Page topbar (UR1): a page-level header row with breadcrumbs, for a
  * later view task to place inside its own `.page` content (not rendered
  * by AppLayout itself, since breadcrumbs are page-specific).
+ *
+ * When used, it is the first thing rendered inside a page's content (for
+ * example `<main class="page"><main><div class="topbar">...</div>...rest
+ * of the page...</main></main>`). Its negative top/side margins cancel out
+ * `.page`'s own padding on exactly those edges, so the topbar's background
+ * and border reach the top and both sides of the main area, while its own
+ * padding keeps its inner content inset. Its positive bottom margin puts
+ * the page's top padding back below it, so the rest of the page's content
+ * still sits inset by the normal page padding. This only breaks out
+ * correctly when nothing between the topbar and `.page` adds its own
+ * padding or border (true for a bare `<main>`/`<div>` wrapper).
  * ------------------------------------------------------------------ */
 .topbar {
   height: 52px;
@@ -479,6 +498,7 @@
   padding: 0 var(--space-5);
   background: var(--color-surface);
   border-bottom: 1px solid var(--color-border);
+  margin: calc(-1 * var(--space-6)) calc(-1 * var(--space-5)) var(--space-6);
 }
 
 .topbar__crumbs {
@@ -511,11 +531,13 @@
 }
 
 /* --------------------------------------------------------------------
- * Page container and header: title plus a right-aligned actions row.
+ * Page container and header: fills the main area right of the sidebar
+ * (no max-width cap, no centring — the old centred/capped layout was for
+ * the removed top-header shell) and keeps padding for its content. See
+ * the `.topbar` rule above for how a page's topbar breaks out of this
+ * padding to span the main area edge to edge.
  * ------------------------------------------------------------------ */
 .page {
-  max-width: 1200px;
-  margin: 0 auto;
   padding: var(--space-6) var(--space-5);
 }
 
