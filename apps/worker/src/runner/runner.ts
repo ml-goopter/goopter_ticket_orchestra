@@ -466,6 +466,11 @@ class RunState {
   stopReason: StopReason | null = null;
   /** Set with a `budget_exceeded` stop: the end_detail `afterTurn` records. */
   stopDetail: string | undefined;
+  /**
+   * Set once a turn got its token, so the execution was live when the agent
+   * started; a later COMPLETED is its own `report_pr_created` (GOT.98).
+   */
+  sessionOpened = false;
   readonly stopped: Promise<void>;
   done: Promise<void> = Promise.resolve();
   private resolveStopped!: () => void;
@@ -874,6 +879,12 @@ export function createRunner(deps: RunnerDeps): Runner {
    * never renews an execution that is no longer ASSIGNED or RUNNING; that
    * result aborts the run. Returns only once every renewal it started has
    * settled, so none outlives the run (GOT.78).
+   *
+   * GOT.98: the one exception is an execution COMPLETED under an open
+   * session, which only its agent's `report_pr_created` does (§8). The turn
+   * still owes its closing text and the `result` message that carries the
+   * usage (§9.3, §9.7), so it is not aborted at once: like a blocking raise
+   * (§8), it must end within `blockingGraceMs`, and is stopped after that.
    */
   async function withLease(
     state: RunState,
@@ -883,26 +894,41 @@ export function createRunner(deps: RunnerDeps): Runner {
     body: () => Promise<void>,
   ): Promise<void> {
     if (ctx.execution.role !== "implementation") return body();
+    let graceTimer: unknown;
     const renew = async (): Promise<void> => {
+      if (graceTimer !== undefined) return;
       try {
         const expiresAt = await renewExecutionLease(db, ctx.execution.id, now());
-        if (expiresAt === null) {
-          log.info({}, "lease not renewable: execution no longer live, aborting");
-          state.stop("gone");
+        if (expiresAt !== null) return;
+        if (
+          state.sessionOpened &&
+          (await getExecutionState(db, ctx.execution.id)) === "COMPLETED"
+        ) {
+          if (graceTimer === undefined && state.stopReason === null) {
+            log.info({}, "execution completed by its agent; turn must end within the grace period");
+            graceTimer = setTimer(() => state.stop("gone"), timings.blockingGraceMs);
+          }
+          return;
         }
+        log.info({}, "lease not renewable: execution no longer live, aborting");
+        state.stop("gone");
       } catch (err) {
         log.error({ err: errMessage(err) }, "lease renewal failed");
       }
     };
-    await runWithRenewal(
-      renew,
-      {
-        intervalMs: timings.leaseRenewMs,
-        renewNow,
-        shouldRun: () => state.stopReason === null,
-      },
-      body,
-    );
+    try {
+      await runWithRenewal(
+        renew,
+        {
+          intervalMs: timings.leaseRenewMs,
+          renewNow,
+          shouldRun: () => state.stopReason === null,
+        },
+        body,
+      );
+    } finally {
+      if (graceTimer !== undefined) clearTimer(graceTimer);
+    }
   }
 
   // ---------------------------------------------------------- the session
@@ -959,6 +985,7 @@ export function createRunner(deps: RunnerDeps): Runner {
         state.stop("gone");
         return;
       }
+      state.sessionOpened = true;
       const redact = <T>(value: T): T => redactToken(value, token);
 
       // Agent-tools calls renew through the default, state-gated helper.
