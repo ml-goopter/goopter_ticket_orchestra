@@ -91,6 +91,7 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | fixes | GOT.97 | worker: a PR opens only after a clean review round; no Skill tool for implementation | #96 |
 | ui redesign | UR7 | web: admin restyle, dense tables, create/edit side sheet | #97 |
 | ui redesign | UR2 | web: board restyle, column dots, card rows; no viewport break-out | #98 |
+| ui redesign | UR1c | web: topbar headings centred (no margin) | #99 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 

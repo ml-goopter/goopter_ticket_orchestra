@@ -488,6 +488,8 @@
  * still sits inset by the normal page padding. This only breaks out
  * correctly when nothing between the topbar and `.page` adds its own
  * padding or border (true for a bare `<main>`/`<div>` wrapper).
+ * Headings (h1-h6) inside .topbar have their margins reset to 0 so they
+ * remain vertically centred within the topbar.
  * ------------------------------------------------------------------ */
 .topbar {
   height: 52px;
@@ -528,6 +530,15 @@
   align-items: center;
   gap: var(--space-2);
   flex-shrink: 0;
+}
+
+.topbar h1,
+.topbar h2,
+.topbar h3,
+.topbar h4,
+.topbar h5,
+.topbar h6 {
+  margin: 0;
 }
 
 /* --------------------------------------------------------------------
