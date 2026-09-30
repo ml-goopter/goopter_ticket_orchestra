@@ -145,6 +145,62 @@ export function mergeTimelineEvents(
   return [...byId.values()].sort((a, b) => a.id - b.id);
 }
 
+/** One newest-first calendar-day group of timeline items, see `groupTimelineItemsByDay`. */
+export interface TimelineDayGroup {
+  /** Stable per-group key (`"<year>-<month>-<date>"` in the viewer's local time zone). */
+  key: string;
+  /** "Today", "Yesterday", or a formatted date (e.g. "Jun 10, 2026"). */
+  label: string;
+  /** Newest first. */
+  items: TimelineItem[];
+}
+
+const DAY_LABEL_FORMATTER = new Intl.DateTimeFormat("en-US", { dateStyle: "medium" });
+
+function startOfLocalDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function localDayKey(date: Date): string {
+  const start = startOfLocalDay(date);
+  return `${start.getFullYear()}-${start.getMonth()}-${start.getDate()}`;
+}
+
+function dayLabel(date: Date, now: Date): string {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const diffDays = Math.round((startOfLocalDay(now).getTime() - startOfLocalDay(date).getTime()) / dayMs);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return DAY_LABEL_FORMATTER.format(date);
+}
+
+/**
+ * Groups an ascending `items` list into newest-first day groups, keyed by
+ * the viewer's local calendar day (design.md §14 Task detail): "Today",
+ * "Yesterday", or a formatted date for anything older. Both the groups and
+ * each group's `items` are newest first, so a live item appended to the end
+ * of an ascending list lands first overall -- at the top of its (usually
+ * "Today") group. `now` is injectable for tests; defaults to `new Date()`.
+ */
+export function groupTimelineItemsByDay(
+  items: readonly TimelineItem[],
+  now: Date = new Date(),
+): TimelineDayGroup[] {
+  const groups: TimelineDayGroup[] = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]!;
+    const date = new Date(item.createdAt);
+    const key = localDayKey(date);
+    const currentGroup = groups.at(-1);
+    if (currentGroup && currentGroup.key === key) {
+      currentGroup.items.push(item);
+    } else {
+      groups.push({ key, label: dayLabel(date, now), items: [item] });
+    }
+  }
+  return groups;
+}
+
 /**
  * Builds the ascending list of render items from an ascending, deduplicated
  * event list (AC4). Recomputed from the full event list on every change:
