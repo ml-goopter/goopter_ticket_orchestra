@@ -701,7 +701,7 @@ Uses `@anthropic-ai/claude-agent-sdk`.
 | text | `assistant` messages, text blocks |
 | review subagent | native `Agent` tool is allowed, but the instructions tell the agent to use `orchestra-review` so both runtimes share one path |
 | tool policy `spec` | `Read, Glob, Grep, Bash(git log:*), Bash(git show:*), mcp__orchestra__propose_spec, mcp__orchestra__raise_issue` |
-| tool policy `implementation` | all built-ins plus `mcp__orchestra__*` |
+| tool policy `implementation` | all built-ins except `Skill`, plus `mcp__orchestra__*`. `Skill` is also passed as `disallowedTools`, because `bypassPermissions` ignores the allow list (GOT.97) |
 | tool policy `review` | `Read, Glob, Grep, Bash(git diff:*), Bash(git log:*)`, plus the repository's test command |
 
 ### 7.2 Codex adapter
@@ -781,7 +781,7 @@ System prompt, static per role, covers:
 - the agent-tools contract: when to call which tool, that a blocking `raise_issue` means stop
 - the review protocol for the implementation role: after tests pass, run `orchestra-review`, read its findings JSON, fix valid findings, add a regression test per fixed finding, run it again, repeat until `clean` or the tool says stop, then commit, push, `gh pr create`, and call `report_pr_created`
 
-The prompt is not the only enforcement of that protocol (GOT.97). The `Skill` tool is unavailable to the implementation role's Claude sessions, so a built-in review skill cannot stand in for `orchestra-review`, and `report_pr_created` refuses until the latest review round is clean (section 8). The Codex runtime's tool policy is unchanged and relies on the `report_pr_created` gate alone.
+The prompt is not the only enforcement of that protocol (GOT.97). The Claude adapter passes `disallowedTools: ["Skill"]` for the implementation role, which removes the `Skill` tool from the session even under `bypassPermissions` (section 7.1), so a built-in review skill cannot stand in for `orchestra-review`, and `report_pr_created` refuses until the latest review round is clean (section 8). The Codex runtime's tool policy is unchanged and relies on the `report_pr_created` gate alone.
 - the resume contract: on resume, the prompt begins with a header saying what happened since the last turn
 
 User prompt, assembled per start or resume:
