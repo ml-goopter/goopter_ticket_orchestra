@@ -121,7 +121,14 @@ describe("IssueDetailView", () => {
 
     expect(screen.getByTestId("thread-message").textContent).toContain("Any preference on pagination?");
 
-    expect(screen.getByRole("link", { name: "TSK-70" }).getAttribute("href")).toBe("/tasks/task-1");
+    // The task's key links twice: once in the topbar breadcrumb, once in
+    // the meta row next to its state badge (AC1, AC2).
+    const taskLinks = screen.getAllByRole("link", { name: "TSK-70" });
+    expect(taskLinks).toHaveLength(2);
+    for (const link of taskLinks) {
+      expect(link.getAttribute("href")).toBe("/tasks/task-1");
+    }
+    expect(screen.getByRole("link", { name: "Board" }).getAttribute("href")).toBe("/");
     expect(screen.getByRole("link", { name: "Spec revision" }).getAttribute("href")).toBe("/tasks/task-1/spec");
     const executionLine = screen.getByTestId("issue-execution").textContent ?? "";
     expect(executionLine).toContain("implementation");
@@ -237,6 +244,22 @@ describe("IssueDetailView", () => {
     expect((screen.getByRole("button", { name: "This changes the spec" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it("shows a one-line explanation under each resolve button on a blocking issue (AC5)", async () => {
+    const client = makeFakeClient();
+    renderIssue(client);
+
+    await waitFor(() => expect(screen.getByTestId("issue-status")).toBeTruthy());
+
+    expect(
+      screen.getByText("The agent resumes with your decision. The spec is unchanged."),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "This creates a draft revision from the approved spec with your decision appended, and reopens the spec builder. Continue?",
+      ),
+    ).toBeTruthy();
+  });
+
   it("shows the confirm before a spec_revision resolve, sends kind spec_revision, and navigates to the spec builder (AC5)", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const resolveIssue = vi.fn().mockResolvedValue({
@@ -339,6 +362,7 @@ describe("IssueDetailView", () => {
     });
     await waitFor(() => expect(screen.getByTestId("thread-live-reply").textContent).toContain("Cursor"));
     expect(screen.getByTestId("thread-live-reply").getAttribute("data-final")).toBe("false");
+    expect(screen.getByTestId("thread-live-typing")).toBeTruthy();
 
     act(() => {
       currentSource().emit(
@@ -357,6 +381,7 @@ describe("IssueDetailView", () => {
     });
     await waitFor(() => expect(screen.getByTestId("thread-live-reply").textContent).toContain("Cursor pagination it is."));
     expect(screen.getByTestId("thread-live-reply").getAttribute("data-final")).toBe("true");
+    expect(screen.queryByTestId("thread-live-typing")).toBeNull();
 
     getIssue.mockClear();
     act(() => {

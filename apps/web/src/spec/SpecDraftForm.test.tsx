@@ -50,3 +50,21 @@ describe("SpecDraftForm repository field (GOT.81, D2: chosen at session start, f
     expect(onChange).not.toHaveBeenCalled();
   });
 });
+
+describe("SpecDraftForm highlighted fields (UR4, design.md §14: agent-changed fields get an 'Updated by agent' tag)", () => {
+  it("shows the 'Updated by agent' tag on a highlighted field, and not on an unhighlighted one", () => {
+    renderForm({ highlightedFields: new Set(["objective"]) });
+
+    expect(screen.getByTestId("spec-field-objective-updated").textContent).toBe("Updated by agent");
+    expect(screen.getByTestId("spec-field-objective").getAttribute("data-highlighted")).toBe("true");
+
+    expect(screen.queryByTestId("spec-field-scope-updated")).toBeNull();
+    expect(screen.getByTestId("spec-field-scope").getAttribute("data-highlighted")).toBe("false");
+  });
+
+  it("shows no 'Updated by agent' tags when nothing is highlighted", () => {
+    renderForm({ highlightedFields: new Set() });
+
+    expect(screen.queryByText("Updated by agent")).toBeNull();
+  });
+});
