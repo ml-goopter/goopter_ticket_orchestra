@@ -15,6 +15,7 @@ import type {
 import {
   allowedToolsFor,
   builtinToolsFor,
+  disallowedToolsFor,
   InvalidTestCommandError,
   permissionModeFor,
   settingSourcesFor,
@@ -411,6 +412,10 @@ function baseOptions(req: StartRequest | ResumeRequest): Options {
   };
   const tools = builtinToolsFor(policy, policyOpts);
   if (tools !== undefined) options.tools = tools;
+  // GOT.97: `bypassPermissions` ignores the allow list, so a tool the
+  // implementation role must not use has to be removed outright.
+  const disallowed = disallowedToolsFor(policy);
+  if (disallowed !== undefined) options.disallowedTools = disallowed;
   // The SDK ignores `bypassPermissions` unless this companion flag is set.
   if (permissionMode === "bypassPermissions") {
     options.allowDangerouslySkipPermissions = true;

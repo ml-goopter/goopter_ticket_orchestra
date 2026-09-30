@@ -430,6 +430,42 @@ describe("ClaudeAdapter query options (design.md §7.1)", () => {
     expect(fake.calls[0]?.options).not.toHaveProperty("tools");
   });
 
+  it("disallows the Skill tool for implementation on start and resume (GOT.97, design.md §9.2)", async () => {
+    // bypassPermissions auto-approves every tool, so leaving Skill out of
+    // allowedTools would restrict nothing. disallowedTools removes it from
+    // the model's context regardless of permission mode.
+    const fake = scripted([systemInit, resultSuccess()]);
+    const adapter = new ClaudeAdapter({ query: fake.fn });
+
+    await collect(adapter.start(startRequest, new AbortController().signal));
+    await collect(adapter.resume(resumeRequest, new AbortController().signal));
+
+    expect(fake.calls).toHaveLength(2);
+    for (const call of fake.calls) {
+      expect(call.options?.permissionMode).toBe("bypassPermissions");
+      expect(call.options?.disallowedTools).toEqual(["Skill"]);
+      expect(call.options?.allowedTools).not.toContain("Skill");
+    }
+  });
+
+  for (const policy of ["spec", "review"] as const) {
+    it(`sets no disallowedTools for a ${policy} run`, async () => {
+      // The read-only roles already restrict `tools` to a list without
+      // Skill, so their options are unchanged by GOT.97.
+      const fake = scripted([systemInit, resultSuccess()]);
+      const adapter = new ClaudeAdapter({ query: fake.fn });
+
+      await collect(
+        adapter.start(
+          { ...startRequest, allowedTools: policy },
+          new AbortController().signal,
+        ),
+      );
+
+      expect(fake.calls[0]?.options).not.toHaveProperty("disallowedTools");
+    });
+  }
+
   for (const policy of ["spec", "review"] as const) {
     it(`denies anything outside the allow list for a ${policy} run`, async () => {
       // bypassPermissions would auto-approve every tool, which makes the
