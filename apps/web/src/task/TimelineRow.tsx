@@ -77,8 +77,19 @@ function JsonPreview({ value }: { value: unknown }) {
  * available via the `title` attribute.
  */
 export function TimelineRow({ item, taskId }: TimelineRowProps) {
+  // Row tints (UR3 AC5, approved mockup `.row.bad`/`.row.issue`): a failed
+  // tool call gets a danger tint, an issue row gets an attention tint. Only
+  // one can apply per item (`kind` is exclusive), so this is a plain
+  // either/or rather than a combinable class list.
+  const tintClassName =
+    item.kind === "tool_call" && item.toolOk === false
+      ? " timeline-item--danger"
+      : item.kind === "issue"
+        ? " timeline-item--attention"
+        : "";
+
   return (
-    <li className="timeline-item" data-testid="timeline-item" data-type={item.type}>
+    <li className={`timeline-item${tintClassName}`} data-testid="timeline-item" data-type={item.type}>
       <span className="timeline-item__label" title={typeLabel(item.type)}>
         {shortTypeLabel(item.type)}
       </span>

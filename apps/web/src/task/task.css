@@ -1,27 +1,77 @@
 /*
- * Task detail (design.md §14 Task detail): timeline rows and the side
- * panel's cards. Classes here are additive to `../styles/components.css`
- * (`.page`, `.page-header`, `.main-sidebar`, `.card`, `.toolbar`, `.badge`)
- * -- nothing below duplicates a rule already defined there.
+ * Task detail (design.md §14 Task detail, restyled to the approved mockup
+ * by UR3): topbar, header facts, timeline rows, and the side panel.
+ * Classes here are additive to `../styles/components.css` (`.topbar`,
+ * `.page-header`, `.segmented`, `.main-sidebar`, `.card`, `.toolbar`,
+ * `.badge`, `.side-panel__section` and its siblings) -- nothing below
+ * duplicates a rule already defined there.
  */
 
-.task-detail__cost {
+/* --------------------------------------------------------------------
+ * Header (UR3, design.md §14 Task detail, approved mockup): title plus a
+ * facts row (state, total cost, PR/CI when a PR exists, branch).
+ * ------------------------------------------------------------------ */
+.task-detail__head {
+  margin-bottom: var(--space-5);
+}
+
+.task-detail__head .page-header__title {
+  margin-bottom: var(--space-2);
+}
+
+.task-detail__facts {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  flex-wrap: wrap;
   color: var(--color-text-muted);
   font-size: var(--font-size-sm);
 }
 
+.task-detail__fact {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.task-detail__fact-label {
+  color: var(--color-text-faint);
+}
+
+.task-detail__timeline-toolbar {
+  align-items: center;
+  margin-bottom: var(--space-4);
+}
+
+.task-detail__timeline-toolbar h2 {
+  margin: 0;
+}
+
 /* Side panel: sticky on wide screens, stacked below the timeline once
- * `.main-sidebar` itself switches to a column layout (<900px). `top`/
- * `max-height` account for `.app-shell__bar`'s fixed 56px height
- * (components.css) so the panel doesn't stick under the bar. */
+ * `.main-sidebar` itself switches to a column layout (<900px). Nothing on
+ * this page is fixed to the viewport (AC10 fix: the 56px offset here used
+ * to account for an `.app-shell__bar` that no longer exists), so the
+ * sticky panel only needs a small gap from the top of the scrolled
+ * viewport. */
 .task-detail .main-sidebar__aside {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
   position: sticky;
-  top: calc(56px + var(--space-5));
-  max-height: calc(100vh - 56px - var(--space-8));
+  top: var(--space-5);
+  max-height: calc(100vh - var(--space-8));
   overflow-y: auto;
+}
+
+/* --------------------------------------------------------------------
+ * Details panel (UR3 AC6): one panel, `.side-panel__section`s (shared
+ * primitive) inside it rather than one `.card` per section. `.card`
+ * supplies the surface/border/shadow; padding is reset to 0 here since
+ * each section already pads itself.
+ * ------------------------------------------------------------------ */
+.task-detail__panel {
+  padding: 0;
+}
+
+.task-detail__panel > .side-panel__section:last-child {
+  border-bottom: none;
 }
 
 @media (max-width: 900px) {
@@ -30,10 +80,6 @@
     max-height: none;
     overflow-y: visible;
   }
-}
-
-.task-detail__card-title {
-  margin: 0 0 var(--space-3);
 }
 
 .task-detail__side-list {
@@ -84,15 +130,49 @@
   margin-top: var(--space-3);
 }
 
+/* The per-execution cost breakdown sits in its own collapsed `<details>`
+ * inside the Executions section (UR3 AC7), styled like every other
+ * timeline/detail disclosure rather than a bordered box when collapsed. */
+.task-detail__cost-details {
+  margin-top: var(--space-3);
+  border: none;
+  padding: 0;
+  background: transparent;
+}
+
+.task-detail__cost-details > summary {
+  font-weight: 600;
+}
+
 /* --------------------------------------------------------------------
- * Timeline (T1 fix): a compact one-liner per row -- type label, summary,
- * time right-aligned, all on one flex row inside a single ruled list (a
- * left rail), not a ~90px bordered card per row with the label on its own
- * line. A row with genuinely multi-line content (an `agent.message`, an
- * expanded `agent.tool_call`) grows past one line; every other row stays
- * close to `--space-8` (32px) tall.
+ * Timeline (T1 fix, UR3 AC4): a compact one-liner per row -- type label,
+ * summary, time right-aligned. Rows are grouped under a day header
+ * ("Today"/"Yesterday"/a formatted date, `.timeline__day-header`) and a
+ * ruled left-rail list per day (`.timeline__day-rows`, the old `.timeline`
+ * rail moved here since one page can now render several day groups). A row
+ * with genuinely multi-line content (an `agent.message`, an expanded
+ * `agent.tool_call`) grows past one line; every other row stays close to
+ * `--space-8` (32px) tall.
  * ------------------------------------------------------------------ */
 .timeline {
+  margin: 0;
+  padding: 0;
+}
+
+.timeline__day-header {
+  margin: var(--space-5) 0 var(--space-2);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  color: var(--color-text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.timeline__day-header:first-child {
+  margin-top: 0;
+}
+
+.timeline__day-rows {
   margin: 0;
   padding: 0 0 0 var(--space-3);
   list-style: none;
@@ -110,6 +190,17 @@
 
 .timeline-item:last-child {
   border-bottom: none;
+}
+
+/* Row tints (UR3 AC5, approved mockup `.row.bad`/`.row.issue`): a failed
+ * tool call (`toolOk === false`) or an issue row stands out from the
+ * surrounding rows without needing its own icon. */
+.timeline-item--danger {
+  background: var(--color-danger-bg);
+}
+
+.timeline-item--attention {
+  background: var(--color-attention-soft);
 }
 
 .timeline-item__label {
@@ -218,50 +309,6 @@
 }
 
 /* --------------------------------------------------------------------
- * Filter toolbar (T2 fix): compact toggle chips with small checkboxes,
- * not full-width 34px text-input-height boxes inside a bordered fieldset.
- * `base.css`'s `input, select, textarea { height: 34px; width: 100% }`
- * rule targets every `<input>` including checkboxes, so it is overridden
- * here, scoped to this view's toolbar.
- * ------------------------------------------------------------------ */
-.task-detail fieldset.toolbar {
-  border: none;
-  padding: 0;
-  margin: 0 0 var(--space-4);
-}
-
-.task-detail .toolbar legend {
-  padding: 0;
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  color: var(--color-text-muted);
-}
-
-.task-detail .toolbar label {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  width: auto;
-  margin-bottom: 0;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-full);
-  background: var(--color-surface);
-  font-size: var(--font-size-sm);
-  font-weight: 500;
-  color: var(--color-text-muted);
-  cursor: pointer;
-}
-
-.task-detail .toolbar input[type="checkbox"] {
-  display: inline-block;
-  width: 14px;
-  height: 14px;
-  padding: 0;
-  margin: 0;
-}
-
-/* --------------------------------------------------------------------
  * Spec revisions (T4 fix): version, status badge and time on one line;
  * the compare-revisions diff collapsed by default and scrolling
  * horizontally inside its own box instead of overflowing the side panel.
@@ -273,4 +320,30 @@
 .task-detail__revision-diff pre {
   max-width: 100%;
   overflow-x: auto;
+}
+
+/* --------------------------------------------------------------------
+ * Diff colouring (UR3 AC8): added lines green, removed lines red,
+ * `@@`/`===`/`---`/`+++` header lines grey. The diff's own text is
+ * untouched -- only presentation changes, one `<span>` per line
+ * (views/TaskDetailView.tsx's `DiffView`).
+ * ------------------------------------------------------------------ */
+.task-detail__diff-line {
+  display: block;
+  padding: 0 var(--space-2);
+  white-space: pre;
+}
+
+.task-detail__diff-line--add {
+  background: var(--color-success-bg);
+  color: var(--color-success-fg);
+}
+
+.task-detail__diff-line--del {
+  background: var(--color-danger-bg);
+  color: var(--color-danger-fg);
+}
+
+.task-detail__diff-line--header {
+  color: var(--color-text-faint);
 }
