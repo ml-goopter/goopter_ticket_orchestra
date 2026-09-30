@@ -8,51 +8,25 @@
  */
 
 /*
- * Full-bleed break-out (visual fix B1, UR2): AppLayout wraps every routed
- * view in `<main class="page">`, which centres content at max-width 1200px.
- * The topbar and kanban row both need the full viewport width instead (the
- * mockup's topbar border spans edge to edge, and ten columns -- most of
- * them compact -- need to fit without an immediate scrollbar). `calc(50% -
- * 50vw)` centres this element on the viewport regardless of `.page`'s own
- * width/centring. `.board-bleed` itself carries no horizontal padding, so
- * `.topbar` (nested directly) uses its own built-in padding for its edge
- * inset; `.board-bleed__content` (below) restores `.page`'s own horizontal
- * padding (--space-5) for the error/loading text and the kanban row, so
- * they still line up with the topbar's own text inset above them.
+ * Board wrapper (fix F1, UR2 fix round): AppLayout renders every routed
+ * view inside `<main class="page">`, which fills the area right of the
+ * sidebar and keeps its own padding (--space-6 --space-5) for its content
+ * (../styles/components.css, "Page" section). This view's own
+ * `<main class="board">` sits directly inside that `.page`, with `.topbar`
+ * as its first child, so `.topbar`'s existing negative-margin break-out
+ * (components.css) cancels `.page`'s padding and the topbar spans the page
+ * area edge to edge; everything after the topbar keeps `.page`'s own
+ * padding, same as every other view. `.board` itself carries no width,
+ * margin, or overflow rule of its own -- it exists only so the
+ * column-width overrides below can out-specificity components.css's
+ * single-class `.kanban__column` selector. The board therefore never
+ * extends past `.page`'s own box: it cannot overlap the sidebar or run
+ * past the viewport edge, and the document never scrolls horizontally.
  */
-.board-bleed {
-  width: 100vw;
-  margin-left: calc(50% - 50vw);
-  margin-right: calc(50% - 50vw);
-  box-sizing: border-box;
-}
-
-.board-bleed__content {
-  padding: var(--space-4) var(--space-5) var(--space-5);
-  box-sizing: border-box;
-}
-
-/*
- * Scrollbar-width overflow guard (GOT.64): `100vw` above is, per the CSS
- * spec, the *full* viewport width -- including the strip a classic,
- * always-visible vertical scrollbar occupies -- while the page's actual
- * visible width (and `.board-bleed`'s intended right edge) is the viewport
- * width *minus* that scrollbar. On a platform with an always-visible
- * scrollbar (non-macOS: Windows/Linux browsers), `.board-bleed` therefore
- * ends up `scrollbar-width` wider than the document, giving the whole page
- * its own horizontal scrollbar. macOS's overlay scrollbar is 0px wide, so
- * `100vw` already matches the visible width there and this guard changes
- * nothing (no visual change on macOS). `:has()` scopes the guard to only
- * take effect while a `.board-bleed` element is actually mounted (the
- * board view), rather than hiding horizontal overflow on every page.
- */
-body:has(.board-bleed) {
-  overflow-x: hidden;
-}
 
 /*
  * Column widths and gap (B1/B3, U7): three tiers, narrowest first, each
- * overriding the last via selector specificity (`.board-bleed .kanban__column`
+ * overriding the last via selector specificity (`.board .kanban__column`
  * beats components.css's single-class `.kanban__column`; adding a second
  * class beats that in turn), so this doesn't touch components.css itself
  * and doesn't depend on stylesheet import order.
@@ -61,21 +35,24 @@ body:has(.board-bleed) {
  *     nothing in them): narrower, 180px, still a full header+body column.
  *   - empty and not highlighted: collapses to a 96px compact column
  *     (below).
- * The 12px gap (rather than components.css's 16px) is part of fitting all
- * ten columns in the viewport at once (B3). At a 1440px viewport this is
- * 2 highlighted (180px) + 7 compact (96px) + 1 populated (260px) + 9 gaps
- * (12px) = 1,400px, inside the 1,400px board width (U7).
+ * The 12px gap (rather than components.css's 16px) helps fit more columns
+ * before the row needs to scroll (B3). If the ten columns' combined width
+ * still exceeds the page area (the viewport minus the sidebar and `.page`'s
+ * own horizontal padding), `.kanban` scrolls horizontally on its own
+ * (components.css already sets `overflow-x: auto` on `.kanban`); the
+ * document itself never gains a horizontal scrollbar, because neither
+ * `.board` nor `.page` is ever wider than its own container.
  */
-.board-bleed .kanban {
+.board .kanban {
   gap: var(--space-3);
 }
 
-.board-bleed .kanban__column {
+.board .kanban__column {
   flex: 0 0 260px;
   width: 260px;
 }
 
-.board-bleed .kanban__column.board-column--highlighted-empty {
+.board .kanban__column.board-column--highlighted-empty {
   flex: 0 0 180px;
   width: 180px;
 }
@@ -88,7 +65,7 @@ body:has(.board-bleed) {
  * text, so the column's accessible name and heading role are unaffected
  * by the visual collapse.
  */
-.board-bleed .kanban__column.board-column--compact {
+.board .kanban__column.board-column--compact {
   flex: 0 0 96px;
   width: 96px;
 }

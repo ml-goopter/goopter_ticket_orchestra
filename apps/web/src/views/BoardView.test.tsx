@@ -1,5 +1,8 @@
 // @vitest-environment jsdom
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BoardApiClient } from "../api/client.js";
@@ -344,5 +347,22 @@ describe("BoardView", () => {
     renderBoard(client);
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("network down"));
+  });
+
+  it("never breaks the board out to the viewport width (regression, UR2 fix F1)", () => {
+    // `100vw` / `calc(50% - 50vw)` escape `.page`'s own box (the area right
+    // of the sidebar) to the full viewport, overlapping the sidebar and
+    // running past the right edge. The board must instead stay inside
+    // `.page` and rely on `.topbar`'s own shared edge-to-edge break-out.
+    // Note: this file runs under `@vitest-environment jsdom`, whose global
+    // `URL` is jsdom's own (not Node's), so `new URL(relative, import.meta.url)`
+    // would throw when handed to Node's `fileURLToPath`. Resolve via
+    // `node:path` off the already-absolute test file path instead.
+    const testFilePath = fileURLToPath(import.meta.url);
+    const cssPath = join(dirname(testFilePath), "..", "board", "board.css");
+    const css = readFileSync(cssPath, "utf8");
+    expect(css).not.toContain("100vw");
+    expect(css).not.toContain("50vw");
+    expect(css).not.toContain("overflow-x: hidden");
   });
 });
