@@ -1085,6 +1085,9 @@ describe("SpecBuilderView", () => {
     });
     renderSpecBuilder(client);
 
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Revisions (2)" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("tab", { name: "Revisions (2)" }));
+
     await waitFor(() => expect(screen.getByTestId("spec-diff")).toBeTruthy());
     expect(screen.getByTestId("spec-diff").textContent).toContain("objective");
   });
@@ -1125,7 +1128,8 @@ describe("SpecBuilderView", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText("TSK-1: Task A summary")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Task A summary")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "TSK-1" })).toBeTruthy();
     await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
     expect(currentSource().url).toBe("/api/tasks/task-a/stream");
     const sourceA = currentSource();
@@ -1137,8 +1141,10 @@ describe("SpecBuilderView", () => {
       fireEvent.click(screen.getByRole("link", { name: "Go to B" }));
     });
 
-    await waitFor(() => expect(screen.getByText("TSK-2: Task B summary")).toBeTruthy());
-    expect(screen.queryByText("TSK-1: Task A summary")).toBeNull();
+    await waitFor(() => expect(screen.getByText("Task B summary")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "TSK-2" })).toBeTruthy();
+    expect(screen.queryByText("Task A summary")).toBeNull();
+    expect(screen.queryByRole("link", { name: "TSK-1" })).toBeNull();
     expect(screen.queryByTestId("unsaved-changes")).toBeNull();
 
     expect(sourceA.closed).toBe(true);
@@ -1241,6 +1247,9 @@ describe("SpecBuilderView", () => {
     });
     renderSpecBuilder(client);
 
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Revisions (2)" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("tab", { name: "Revisions (2)" }));
+
     await waitFor(() => expect(screen.getByTestId("revision-list")).toBeTruthy());
     const list = screen.getByTestId("revision-list");
     expect(list.querySelectorAll("li")).toHaveLength(2);
@@ -1257,6 +1266,9 @@ describe("SpecBuilderView", () => {
       getTask: vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision()] })),
     });
     renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Revisions (1)" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("tab", { name: "Revisions (1)" }));
 
     await waitFor(() => expect(screen.getByText("Compare revisions")).toBeTruthy());
     const details = screen.getByText("Compare revisions").closest("details");
@@ -1447,5 +1459,31 @@ describe("SpecBuilderView", () => {
     const enabledApproveButton = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
     expect(enabledApproveButton.disabled).toBe(false);
     expect(enabledApproveButton.title).toBe("");
+  });
+
+  it("switches between the Draft and Revisions tabs, mounting only the active tab's panel (UR4, AC4)", async () => {
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress({ revisions: [makeRevision({ content: validSpecContent })] })),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect(screen.getByLabelText("Objective")).toBeTruthy());
+    const draftTab = screen.getByRole("tab", { name: "Draft v1" });
+    const revisionsTab = screen.getByRole("tab", { name: "Revisions (1)" });
+    expect(draftTab.getAttribute("aria-selected")).toBe("true");
+    expect(revisionsTab.getAttribute("aria-selected")).toBe("false");
+    expect(screen.queryByTestId("revision-list")).toBeNull();
+
+    fireEvent.click(revisionsTab);
+
+    expect(screen.getByTestId("revision-list")).toBeTruthy();
+    expect(screen.queryByLabelText("Objective")).toBeNull();
+    expect(revisionsTab.getAttribute("aria-selected")).toBe("true");
+    expect(draftTab.getAttribute("aria-selected")).toBe("false");
+
+    fireEvent.click(draftTab);
+
+    expect(screen.getByLabelText("Objective")).toBeTruthy();
+    expect(screen.queryByTestId("revision-list")).toBeNull();
   });
 });
