@@ -145,6 +145,17 @@ describe("TaskDetailView", () => {
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("network down"));
   });
 
+  it("shows a Board / KEY breadcrumb in the topbar, with Board linking to / (AC1)", async () => {
+    const client = makeClient();
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("task-state")).toBeTruthy());
+
+    const boardLink = screen.getByRole("link", { name: "Board" });
+    expect(boardLink.getAttribute("href")).toBe("/");
+    expect(screen.getByText("TSK-70")).toBeTruthy();
+  });
+
   it("renders the seeded aggregate: revisions, both executions, the issue, the decision, review findings, and the PR (AC2)", async () => {
     const client = makeClient();
     renderDetail(client);
@@ -172,8 +183,12 @@ describe("TaskDetailView", () => {
     const decisionsSection = screen.getByRole("region", { name: "Decisions" });
     expect(within(decisionsSection).getByText(/Use cursor pagination\./)).toBeTruthy();
 
-    const prSection = screen.getByRole("region", { name: "Pull request" });
-    expect(within(prSection).getByRole("link", { name: "#42" })).toBeTruthy();
+    // The PR/CI/branch facts moved into the header (AC2, AC6): no separate
+    // "Pull request" card any more.
+    const prFact = screen.getByTestId("task-pr");
+    expect(within(prFact).getByRole("link", { name: "#42" })).toBeTruthy();
+    expect(within(prFact).getByText("Running")).toBeTruthy();
+    expect(screen.getByText("tsk-70")).toBeTruthy();
   });
 
   it("appends a live SSE event to the timeline without a reload, and does not duplicate a redelivered event (AC3)", async () => {
@@ -259,10 +274,10 @@ describe("TaskDetailView", () => {
 
     await waitFor(() => expect(within(screen.getByTestId("timeline")).getAllByTestId("timeline-item").length).toBeGreaterThanOrEqual(2));
 
-    // Uncheck every family except "Issues".
+    // Toggle off every family except "Issues".
     for (const label of ["State", "Agent", "Review", "PR & CI"]) {
       await act(async () => {
-        fireEvent.click(screen.getByRole("checkbox", { name: label }));
+        fireEvent.click(screen.getByRole("button", { name: label }));
       });
     }
 
@@ -271,6 +286,37 @@ describe("TaskDetailView", () => {
       expect(items).toHaveLength(1);
       expect(items[0]!.getAttribute("data-type")).toBe("issue.created");
     });
+  });
+
+  it("groups the timeline newest-first by the viewer's local calendar day, under Today/Yesterday headers (AC4)", async () => {
+    // Built from the real current local time, not a fixed UTC literal: the
+    // component groups by `new Date()` at render time, so the test must
+    // derive "today"/"yesterday" from the same clock and zone to stay
+    // correct regardless of the runner's own time zone (AC11).
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 9, 0, 0).toISOString();
+    const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 9, 0, 0).toISOString();
+
+    const events = [
+      makeTimelineEvent({ id: 1, type: "issue.created", payload: { title: "older-item" }, createdAt: yesterday }),
+      makeTimelineEvent({ id: 2, type: "issue.created", payload: { title: "newer-item" }, createdAt: today }),
+    ];
+    const client = makeClient({ getTimeline: vi.fn().mockResolvedValue({ events, nextAfter: 2 }) });
+    renderDetail(client);
+
+    await waitFor(() =>
+      expect(within(screen.getByTestId("timeline")).getAllByTestId("timeline-item")).toHaveLength(2),
+    );
+
+    const timeline = screen.getByTestId("timeline");
+    const headers = within(timeline)
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    expect(headers).toEqual(["Today", "Yesterday"]);
+
+    const items = within(timeline).getAllByTestId("timeline-item");
+    expect(items[0]!.textContent).toContain("newer-item");
+    expect(items[1]!.textContent).toContain("older-item");
   });
 
   it("cancels with confirmation, retry is gated on NEEDS_HUMAN, and a failed action shows visible text (AC6)", async () => {
@@ -285,7 +331,7 @@ describe("TaskDetailView", () => {
     expect((screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement).disabled).toBe(true);
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      fireEvent.click(screen.getByRole("button", { name: "Cancel task" }));
     });
 
     expect(confirmSpy).toHaveBeenCalled();
@@ -339,6 +385,24 @@ describe("TaskDetailView", () => {
 
     await waitFor(() => expect(screen.getByTestId("spec-diff")).toBeTruthy());
     expect(screen.getByTestId("spec-diff").textContent).toContain("objective");
+  });
+
+  it("colours diff lines: added green, removed red, and the hunk/section header lines grey (AC8)", async () => {
+    const client = makeClient();
+    renderDetail(client);
+
+    await waitFor(() => expect(screen.getByTestId("spec-diff")).toBeTruthy());
+    const diff = screen.getByTestId("spec-diff");
+
+    const added = diff.querySelector(".task-detail__diff-line--add");
+    const removed = diff.querySelector(".task-detail__diff-line--del");
+    const header = diff.querySelector(".task-detail__diff-line--header");
+
+    expect(added?.textContent?.startsWith("+")).toBe(true);
+    expect(removed?.textContent?.startsWith("-")).toBe(true);
+    expect(header?.textContent).toMatch(/^(@@|===|---|\+\+\+)/);
+    // The diff's own text is unchanged by the colouring, just wrapped in spans.
+    expect(diff.textContent).toContain("objective");
   });
 
   it("refetches the aggregate and catches up the timeline from the last id on reconnect (AC8)", async () => {
@@ -407,7 +471,7 @@ describe("TaskDetailView", () => {
     expect(getTimeline.mock.calls.length).toBeGreaterThanOrEqual(2);
   }, 10000);
 
-  it("keeps a live event delivered before the first timeline page lands, merged once and in id order (F1)", async () => {
+  it("keeps a live event delivered before the first timeline page lands, merged once and displayed newest-first (F1, AC4)", async () => {
     let resolveTimeline!: (page: TimelinePage) => void;
     const timelinePromise = new Promise<TimelinePage>((resolve) => {
       resolveTimeline = resolve;
@@ -443,9 +507,11 @@ describe("TaskDetailView", () => {
       expect(items).toHaveLength(2);
     });
 
+    // Newest first (AC4): id 50 (i-live) sorts after id 10 (i-backlog) in
+    // the deduped/merged list, so it displays first.
     const items = within(screen.getByTestId("timeline")).getAllByTestId("timeline-item");
-    expect(items[0]!.textContent).toContain("i-backlog");
-    expect(items[1]!.textContent).toContain("i-live");
+    expect(items[0]!.textContent).toContain("i-live");
+    expect(items[1]!.textContent).toContain("i-backlog");
   });
 
   it("resets all task-scoped state on an in-app navigation from one task to another (GOT.41-fix2, F1/F2)", async () => {
@@ -575,7 +641,7 @@ describe("TaskDetailView", () => {
       const { unmount } = renderDetail(client);
 
       await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe(humanizeEnum(state)));
-      expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByRole("button", { name: "Cancel task" }) as HTMLButtonElement).disabled).toBe(true);
       unmount();
     }
 
@@ -583,7 +649,7 @@ describe("TaskDetailView", () => {
     renderDetail(client);
 
     await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Implementing"));
-    expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Cancel task" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("titles the Cancel button with the disabled reason when disabled and no title when enabled (GOT.66)", async () => {
@@ -592,7 +658,7 @@ describe("TaskDetailView", () => {
     const { unmount } = renderDetail(client);
 
     await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Done"));
-    const cancelButton = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    const cancelButton = screen.getByRole("button", { name: "Cancel task" }) as HTMLButtonElement;
     expect(cancelButton.disabled).toBe(true);
     expect(cancelButton.title).toContain("Cannot cancel a task");
     unmount();
@@ -601,7 +667,7 @@ describe("TaskDetailView", () => {
     renderDetail(enabledClient);
 
     await waitFor(() => expect(screen.getByTestId("task-state").textContent).toBe("Implementing"));
-    const enabledCancelButton = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    const enabledCancelButton = screen.getByRole("button", { name: "Cancel task" }) as HTMLButtonElement;
     expect(enabledCancelButton.disabled).toBe(false);
     expect(enabledCancelButton.title).toBe("");
   });
@@ -660,15 +726,64 @@ describe("TaskDetailView", () => {
     expect(within(screen.getByTestId("task-state")).getAllByText("Implementing")).toHaveLength(1);
   });
 
-  it("renders the filter toggle checkboxes with accessible names, each queryable by role and label (T2)", async () => {
+  it("renders the filter toggles as buttons with accessible names and aria-pressed, each queryable by role and label (T2)", async () => {
     const client = makeClient({ getTimeline: vi.fn().mockResolvedValue(emptyPage()) });
     renderDetail(client);
 
     await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
 
     for (const name of ["All", "State", "Agent", "Issues", "Review", "PR & CI"]) {
-      expect(screen.getByRole("checkbox", { name })).toBeTruthy();
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeTruthy();
+      expect(button.getAttribute("aria-pressed")).toBe("true");
     }
+  });
+
+  it("shows each filter's count of loaded events in that family, All as the total, and toggles each independently via aria-pressed (AC3)", async () => {
+    const events = [
+      makeTimelineEvent({ id: 1, type: "issue.created", payload: {} }),
+      makeTimelineEvent({ id: 2, type: "issue.created", payload: {} }),
+      makeTimelineEvent({ id: 3, type: "review.started", payload: { round: 1 } }),
+    ];
+    const client = makeClient({ getTimeline: vi.fn().mockResolvedValue({ events, nextAfter: 3 }) });
+    renderDetail(client);
+
+    await waitFor(() =>
+      expect(within(screen.getByTestId("timeline")).getAllByTestId("timeline-item")).toHaveLength(3),
+    );
+
+    const allButton = screen.getByRole("button", { name: "All" });
+    const issuesButton = screen.getByRole("button", { name: "Issues" });
+    const reviewButton = screen.getByRole("button", { name: "Review" });
+    const stateButton = screen.getByRole("button", { name: "State" });
+
+    expect(within(allButton).getByText("3")).toBeTruthy();
+    expect(within(issuesButton).getByText("2")).toBeTruthy();
+    expect(within(reviewButton).getByText("1")).toBeTruthy();
+    expect(within(stateButton).getByText("0")).toBeTruthy();
+
+    expect(allButton.getAttribute("aria-pressed")).toBe("true");
+    expect(issuesButton.getAttribute("aria-pressed")).toBe("true");
+    expect(reviewButton.getAttribute("aria-pressed")).toBe("true");
+
+    await act(async () => {
+      fireEvent.click(reviewButton);
+    });
+
+    // Toggling one family off unpresses it and "All", but leaves the others
+    // (and their counts) alone.
+    expect(reviewButton.getAttribute("aria-pressed")).toBe("false");
+    expect(allButton.getAttribute("aria-pressed")).toBe("false");
+    expect(issuesButton.getAttribute("aria-pressed")).toBe("true");
+    expect(within(issuesButton).getByText("2")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(allButton);
+    });
+
+    // "All" toggles every family back on.
+    expect(allButton.getAttribute("aria-pressed")).toBe("true");
+    expect(reviewButton.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("keeps the compare-revisions diff inside a closed-by-default <details> element (T4)", async () => {
