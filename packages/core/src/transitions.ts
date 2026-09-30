@@ -56,6 +56,10 @@ export const TASK_TRANSITIONS = [
   { entity: "task", from: TaskState.SPEC_APPROVED, trigger: "spec.approved", to: TaskState.IMPLEMENTING },
   { entity: "task", from: TaskState.READY, trigger: "task.claimed", to: TaskState.IMPLEMENTING },
   { entity: "task", from: TaskState.IMPLEMENTING, trigger: "review.started", to: TaskState.REVIEWING },
+  // GOT.97 (user decision): a new review round may start while the task is
+  // already REVIEWING, for a retry execution started in REVIEWING (§9.5) or
+  // after an `ask_user` verdict and its clarification.
+  { entity: "task", from: TaskState.REVIEWING, trigger: "review.started", to: TaskState.REVIEWING },
   { entity: "task", from: TaskState.REVIEWING, trigger: "review.findings", to: TaskState.IMPLEMENTING },
   { entity: "task", from: TaskState.REVIEWING, trigger: "pull_request.created", to: TaskState.CI_RUNNING },
   { entity: "task", from: TaskState.CI_RUNNING, trigger: "ci.failed", to: TaskState.IMPLEMENTING },

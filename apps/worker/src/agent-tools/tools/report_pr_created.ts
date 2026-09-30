@@ -1,5 +1,6 @@
 import {
   appendEvent,
+  getTaskState,
   latestReviewRound,
   transition,
   upsertPullRequest,
@@ -16,8 +17,10 @@ const REVIEW_REQUIRED_INSTRUCTION =
 /**
  * D14 order is implement, review loop, push, PR (design.md §8, GOT.97). The
  * latest round is the last `review.started` of this execution, and it must
- * have a `clean` `review.result`. Throws `ReviewRequiredError` before any
- * write otherwise, so the tool's transaction writes nothing.
+ * have a `clean` `review.result`. The task must also be REVIEWING: a clean
+ * round followed by a move back to IMPLEMENTING (a CI failure) no longer
+ * covers the code. Throws `ReviewRequiredError` before any write otherwise,
+ * so the tool's transaction writes nothing.
  */
 async function requireCleanReview(
   tx: Tx,
@@ -38,6 +41,15 @@ async function requireCleanReview(
   if (latest.verdict !== "clean") {
     throw new ReviewRequiredError(
       `Review round ${latest.round} ended with verdict ${latest.verdict}. ${REVIEW_REQUIRED_INSTRUCTION}`,
+    );
+  }
+  const state = await getTaskState(tx, taskId);
+  if (state !== "REVIEWING") {
+    const next =
+      state === "IMPLEMENTING" ? "Call report_review_started for a new round. " : "";
+    throw new ReviewRequiredError(
+      `The task is ${state ?? "missing"}, not REVIEWING, so review round ${latest.round} no longer covers the changes. ` +
+        `${next}${REVIEW_REQUIRED_INSTRUCTION}`,
     );
   }
 }
