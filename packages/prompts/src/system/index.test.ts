@@ -66,6 +66,13 @@ describe("systemPromptFor (design.md §9.2)", () => {
       expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("terminal agent-tools call");
     });
 
+    it("requires run_in_background: false explicitly on every Agent call, since background is the tool's default", () => {
+      expect(DELEGATION_PROTOCOL).toContain("run_in_background: false");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("background by default");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).not.toContain("never set `run_in_background`");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).not.toMatch(/never set.*run_in_background/);
+    });
+
     it("requires resumed or retried sessions to start new subagents, never message old ones", () => {
       expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("resumed or retried session");
       expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("new subagents");

@@ -48,7 +48,7 @@ Simple, model \`haiku\`: mechanical work whose pattern already exists in this re
 
 ### Foreground only
 
-- Every \`Agent\` call is foreground. Never set \`run_in_background\`. Wait for each subagent's result before continuing.
+- The \`Agent\` tool runs subagents in the background by default. Always pass \`run_in_background: false\` explicitly on every \`Agent\` call. Wait for each subagent's result before continuing.
 - Never end your turn while any subagent is still running. Your turn ends only with a terminal agent-tools call, as the rest of this prompt requires; a subagent's result is not that call, so you still owe one after it returns.
 - A resumed or retried session starts new subagents. Never message, resume, or wait for a subagent from an earlier session or execution — it is gone with that session.
 
