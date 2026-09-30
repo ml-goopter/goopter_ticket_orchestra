@@ -11,7 +11,7 @@ import { useEventStream, type EventSourceFactory } from "../sse/useEventStream.j
 import "../task/task.css";
 import { EVENT_FAMILIES, FAMILY_LABELS, familyOf, type EventFamily } from "../task/eventFamilies.js";
 import { TimelineRow } from "../task/TimelineRow.js";
-import { buildTimelineItems, mergeTimelineEvents } from "../task/timelineItems.js";
+import { buildTimelineItems, groupTimelineItemsByDay, mergeTimelineEvents } from "../task/timelineItems.js";
 import { humanizeEnum } from "../ui/humanizeEnum.js";
 import { StateBadge } from "../ui/StateBadge.js";
 import { Time } from "../ui/Time.js";
@@ -56,11 +56,46 @@ const REOPENABLE_TASK_STATES = new Set<string>(
   ).map((row) => row.from),
 );
 
+/** Unified diff line prefixes rendered grey, as a hunk or section header rather than a change (UR3 AC8). */
+const DIFF_HEADER_PREFIXES = ["@@", "===", "--- ", "+++ "];
+
+function diffLineClassName(line: string): string {
+  if (DIFF_HEADER_PREFIXES.some((prefix) => line.startsWith(prefix))) {
+    return "task-detail__diff-line task-detail__diff-line--header";
+  }
+  if (line.startsWith("+")) {
+    return "task-detail__diff-line task-detail__diff-line--add";
+  }
+  if (line.startsWith("-")) {
+    return "task-detail__diff-line task-detail__diff-line--del";
+  }
+  return "task-detail__diff-line";
+}
+
+/**
+ * The `diffSpecs` unified diff, coloured line by line (UR3 AC8): added
+ * lines green, removed lines red, `@@`/`===`/`---`/`+++` header lines grey.
+ * The diff's text content is otherwise untouched -- each line is rendered
+ * verbatim inside its own `<span>`.
+ */
+function DiffView({ diffText }: { diffText: string }) {
+  return (
+    <pre className="task-detail__diff" data-testid="spec-diff">
+      {diffText.split("\n").map((line, index) => (
+        <span key={index} className={diffLineClassName(line)}>
+          {line}
+        </span>
+      ))}
+    </pre>
+  );
+}
+
 /**
  * Task detail (design.md §14 Task detail row, §12.2, §12.6, task contract
- * C): timeline with live SSE append, family filters, a side panel with
- * spec/approval/decision/execution/PR detail, and the cancel/retry actions.
- * Replaces the GOT.38 placeholder.
+ * C; restyled to the approved mockup by UR3): timeline with live SSE
+ * append, family filters, a side panel with spec/approval/decision/
+ * execution detail, and the cancel/retry/reopen actions. Replaces the
+ * GOT.38 placeholder.
  *
  * This routed shell only reads `id` and picks/creates the api client. All
  * task-scoped state lives in `TaskDetailPanel`, which is remounted with
@@ -218,6 +253,26 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
       }),
     [items, selectedFamilies],
   );
+  const dayGroups = useMemo(() => groupTimelineItemsByDay(visibleItems), [visibleItems]);
+
+  // Counts on every filter toggle button (UR3 AC3): the number of loaded
+  // `execution_events` in that family, over every loaded event regardless
+  // of the current filter selection, so unchecking a family doesn't change
+  // its own count.
+  const familyCounts = useMemo(() => {
+    const counts = Object.fromEntries(EVENT_FAMILIES.map((family) => [family, 0])) as Record<
+      EventFamily,
+      number
+    >;
+    for (const event of events) {
+      const family = familyOf(event.type);
+      if (family !== null) {
+        counts[family] += 1;
+      }
+    }
+    return counts;
+  }, [events]);
+  const totalEventCount = EVENT_FAMILIES.reduce((sum, family) => sum + familyCounts[family], 0);
 
   function toggleFamily(family: EventFamily) {
     setSelectedFamilies((prev) => {
@@ -325,33 +380,24 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
   const canCancel = CANCELLABLE_TASK_STATES.has(aggregate.task.state);
   const canReopen = REOPENABLE_TASK_STATES.has(aggregate.task.state);
   const branch = aggregate.latestExecutions.implementation?.branch ?? null;
+  const pullRequest = aggregate.pullRequest;
 
   return (
     <main className="task-detail">
-      <div className="page-header">
-        <div>
-          <h1 className="page-header__title">
-            {aggregate.task.jiraKey}: {aggregate.task.jiraSummary}
-          </h1>
-          <p className="task-detail__cost">
-            <span data-testid="task-state">
-              <StateBadge state={aggregate.task.state} />
-            </span>
-            {" · Total cost "}
-            <span data-testid="task-cost">{formatUsd(aggregate.cost.costUsd)}</span>
-          </p>
+      <div className="topbar">
+        <div className="topbar__crumbs">
+          <Link to="/">Board</Link>
+          <span aria-hidden="true">/</span>
+          <span className="topbar__crumb-current">{aggregate.task.jiraKey}</span>
         </div>
-        <div className="page-header__actions" aria-label="Actions">
+        <div className="topbar__spacer" />
+        <div className="topbar__actions" aria-label="Actions">
+          <Link className="btn" to={`/tasks/${aggregate.task.id}/spec`}>
+            Open spec builder
+          </Link>
           <button
             type="button"
-            disabled={!canCancel}
-            title={canCancel ? undefined : `Cannot cancel a task in ${humanizeEnum(aggregate.task.state)}.`}
-            onClick={() => void handleCancel()}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
+            className="btn"
             disabled={!canRetry}
             title={canRetry ? undefined : "Retry is only available while the task needs human input."}
             onClick={() => void handleRetry()}
@@ -360,15 +406,51 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
           </button>
           <button
             type="button"
+            className="btn"
             disabled={!canReopen}
             title={canReopen ? undefined : `Cannot reopen a task in ${humanizeEnum(aggregate.task.state)}.`}
             onClick={() => void handleReopen()}
           >
             Reopen
           </button>
-          <Link to={`/tasks/${aggregate.task.id}/spec`}>Open spec builder</Link>
+          <button
+            type="button"
+            className="btn btn--danger"
+            disabled={!canCancel}
+            title={canCancel ? undefined : `Cannot cancel a task in ${humanizeEnum(aggregate.task.state)}.`}
+            onClick={() => void handleCancel()}
+          >
+            Cancel task
+          </button>
         </div>
       </div>
+
+      <div className="task-detail__head">
+        <h1 className="page-header__title">
+          {aggregate.task.jiraKey}: {aggregate.task.jiraSummary}
+        </h1>
+        <div className="task-detail__facts">
+          <span data-testid="task-state">
+            <StateBadge state={aggregate.task.state} />
+          </span>
+          <span className="task-detail__fact">
+            <span className="task-detail__fact-label">Total cost</span>
+            <span data-testid="task-cost">{formatUsd(aggregate.cost.costUsd)}</span>
+          </span>
+          {pullRequest && (
+            <span className="task-detail__fact" data-testid="task-pr">
+              <span className="task-detail__fact-label">PR</span>
+              <a href={pullRequest.url}>#{pullRequest.number}</a>
+              <StateBadge state={pullRequest.ciState} />
+            </span>
+          )}
+          <span className="task-detail__fact">
+            <span className="task-detail__fact-label">Branch</span>
+            <span className="task-detail__mono">{branch ?? "no branch"}</span>
+          </span>
+        </div>
+      </div>
+
       {actionError && (
         <p role="alert" className="alert alert--error">
           {actionError}
@@ -378,89 +460,158 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
       <div className="main-sidebar">
         <div className="main-sidebar__main">
           <section aria-label="Timeline">
-            <h2>Timeline</h2>
-            <fieldset className="toolbar">
-              <legend className="task-detail__card-title">Filters</legend>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={selectedFamilies.size === EVENT_FAMILIES.length}
-                  onChange={toggleAll}
-                />
-                All
-              </label>
-              {EVENT_FAMILIES.map((family) => (
-                <label key={family}>
-                  <input
-                    type="checkbox"
-                    checked={selectedFamilies.has(family)}
-                    onChange={() => toggleFamily(family)}
-                  />
-                  {FAMILY_LABELS[family]}
-                </label>
-              ))}
-            </fieldset>
+            <div className="toolbar task-detail__timeline-toolbar">
+              <h2>Timeline</h2>
+              <div className="segmented" role="group" aria-label="Filters">
+                <button
+                  type="button"
+                  className={`segmented__button${
+                    selectedFamilies.size === EVENT_FAMILIES.length ? " segmented__button--active" : ""
+                  }`}
+                  aria-pressed={selectedFamilies.size === EVENT_FAMILIES.length}
+                  aria-label="All"
+                  onClick={toggleAll}
+                >
+                  All <span className="segmented__count">{totalEventCount}</span>
+                </button>
+                {EVENT_FAMILIES.map((family) => (
+                  <button
+                    key={family}
+                    type="button"
+                    className={`segmented__button${
+                      selectedFamilies.has(family) ? " segmented__button--active" : ""
+                    }`}
+                    aria-pressed={selectedFamilies.has(family)}
+                    aria-label={FAMILY_LABELS[family]}
+                    onClick={() => toggleFamily(family)}
+                  >
+                    {FAMILY_LABELS[family]} <span className="segmented__count">{familyCounts[family]}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
             {visibleItems.length === 0 ? (
               <p className="empty-state">No events match the selected filters.</p>
             ) : (
-              <ul className="timeline" data-testid="timeline">
-                {visibleItems.map((item) => (
-                  <TimelineRow key={item.key} item={item} taskId={aggregate.task.id} />
+              <div className="timeline" data-testid="timeline">
+                {dayGroups.map((group) => (
+                  <div key={group.key}>
+                    <h3 className="timeline__day-header">{group.label}</h3>
+                    <ul className="timeline__day-rows">
+                      {group.items.map((item) => (
+                        <TimelineRow key={item.key} item={item} taskId={aggregate.task.id} />
+                      ))}
+                    </ul>
+                  </div>
                 ))}
-              </ul>
+              </div>
             )}
           </section>
         </div>
 
-        <aside className="main-sidebar__aside" aria-label="Details">
-          <section className="card" aria-label="Specification revisions">
-            <h2 className="task-detail__card-title">Specification revisions</h2>
-            <ul className="task-detail__side-list">
-              {aggregate.revisions.map((revision) => (
-                <li key={revision.id}>
-                  <div className="task-detail__side-row">
-                    <span>v{revision.version}</span>
-                    <StateBadge state={revision.status} label={humanizeEnum(revision.status)} />
-                    <Time value={revision.createdAt} />
-                  </div>
-                </li>
-              ))}
-            </ul>
-            {revisions.length > 0 && (
-              <details className="task-detail__revision-diff">
-                <summary>Compare revisions</summary>
-                <label>
-                  Compare from
-                  <select
-                    value={fromRevisionId ?? ""}
-                    onChange={(event) => setFromRevisionId(event.target.value)}
-                  >
-                    {revisions.map((revision) => (
-                      <option key={revision.id} value={revision.id}>
-                        v{revision.version}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  Compare to
-                  <select value={toRevisionId ?? ""} onChange={(event) => setToRevisionId(event.target.value)}>
-                    {revisions.map((revision) => (
-                      <option key={revision.id} value={revision.id}>
-                        v{revision.version}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {diffText && <pre data-testid="spec-diff">{diffText}</pre>}
-              </details>
+        <aside className="card task-detail__panel main-sidebar__aside" aria-label="Details">
+          <section className="side-panel__section" aria-label="Executions">
+            <div className="side-panel__section-title">
+              Executions <span className="side-panel__count">{aggregate.executions.length}</span>
+            </div>
+            {aggregate.executions.length === 0 ? (
+              <p className="side-panel__empty">None</p>
+            ) : (
+              <ul className="task-detail__side-list">
+                {aggregate.executions.map((execution) => (
+                  <li key={execution.id}>
+                    <div className="task-detail__side-row">
+                      <StateBadge state={execution.state} />
+                      <span>
+                        {execution.role} attempt {execution.attempt}: {execution.state} ({execution.runtime}/
+                        {execution.model}) - {formatUsd(Number(execution.costUsd))}
+                      </span>
+                    </div>
+                    {execution.endReason && (
+                      <p className="task-detail__side-meta">End reason: {humanizeEnum(execution.endReason)}</p>
+                    )}
+                    <ul>
+                      {aggregate.reviewResults
+                        .filter((review) => review.executionId === execution.id)
+                        .map((review) => (
+                          <li key={review.id}>
+                            Round {review.round}: {review.verdict}
+                            <ul>
+                              {review.findings.map((finding, index) => (
+                                <li key={index}>
+                                  {finding.severity}: {finding.description}
+                                </li>
+                              ))}
+                            </ul>
+                          </li>
+                        ))}
+                    </ul>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <details className="task-detail__cost-details">
+              <summary>Cost breakdown</summary>
+              <CostBreakdown taskId={aggregate.task.id} request={apiClient.request} />
+            </details>
+          </section>
+
+          <section className="side-panel__section" aria-label="Specification revisions">
+            <div className="side-panel__section-title">
+              Spec revisions <span className="side-panel__count">{revisions.length}</span>
+            </div>
+            {revisions.length === 0 ? (
+              <p className="side-panel__empty">None</p>
+            ) : (
+              <>
+                <ul className="task-detail__side-list">
+                  {revisions.map((revision) => (
+                    <li key={revision.id}>
+                      <div className="task-detail__side-row">
+                        <span>v{revision.version}</span>
+                        <StateBadge state={revision.status} label={humanizeEnum(revision.status)} />
+                        <Time value={revision.createdAt} />
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                <details className="task-detail__revision-diff">
+                  <summary>Compare revisions</summary>
+                  <label>
+                    Compare from
+                    <select
+                      value={fromRevisionId ?? ""}
+                      onChange={(event) => setFromRevisionId(event.target.value)}
+                    >
+                      {revisions.map((revision) => (
+                        <option key={revision.id} value={revision.id}>
+                          v{revision.version}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Compare to
+                    <select value={toRevisionId ?? ""} onChange={(event) => setToRevisionId(event.target.value)}>
+                      {revisions.map((revision) => (
+                        <option key={revision.id} value={revision.id}>
+                          v{revision.version}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {diffText && <DiffView diffText={diffText} />}
+                </details>
+              </>
             )}
           </section>
 
-          <section className="card" aria-label="Approvals">
-            <h2 className="task-detail__card-title">Approvals</h2>
+          <section className="side-panel__section" aria-label="Approvals">
+            <div className="side-panel__section-title">
+              Approvals <span className="side-panel__count">{aggregate.approvals.length}</span>
+            </div>
             {aggregate.approvals.length === 0 ? (
-              <p className="empty-state">No approvals yet.</p>
+              <p className="side-panel__empty">None</p>
             ) : (
               <ul className="task-detail__side-list">
                 {aggregate.approvals.map((approval) => {
@@ -484,10 +635,12 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
             )}
           </section>
 
-          <section className="card" aria-label="Issues">
-            <h2 className="task-detail__card-title">Issues</h2>
+          <section className="side-panel__section" aria-label="Issues">
+            <div className="side-panel__section-title">
+              Issues <span className="side-panel__count">{aggregate.issues.length}</span>
+            </div>
             {aggregate.issues.length === 0 ? (
-              <p className="empty-state">No issues yet.</p>
+              <p className="side-panel__empty">None</p>
             ) : (
               <ul className="task-detail__side-list">
                 {aggregate.issues.map((issue) => (
@@ -499,10 +652,12 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
             )}
           </section>
 
-          <section className="card" aria-label="Decisions">
-            <h2 className="task-detail__card-title">Decisions</h2>
+          <section className="side-panel__section" aria-label="Decisions">
+            <div className="side-panel__section-title">
+              Decisions <span className="side-panel__count">{aggregate.decisions.length}</span>
+            </div>
             {aggregate.decisions.length === 0 ? (
-              <p className="empty-state">No decisions yet.</p>
+              <p className="side-panel__empty">None</p>
             ) : (
               <ul className="task-detail__side-list">
                 {aggregate.decisions.map((decision) => (
@@ -516,60 +671,12 @@ function TaskDetailPanel({ id, client: apiClient, createEventSource }: TaskDetai
             )}
           </section>
 
-          <section className="card" aria-label="Executions">
-            <h2 className="task-detail__card-title">Executions</h2>
-            <ul className="task-detail__side-list">
-              {aggregate.executions.map((execution) => (
-                <li key={execution.id}>
-                  <div className="task-detail__side-row">
-                    <StateBadge state={execution.state} />
-                    <span>
-                      {execution.role} attempt {execution.attempt}: {execution.state} ({execution.runtime}/
-                      {execution.model}) - {formatUsd(Number(execution.costUsd))}
-                    </span>
-                  </div>
-                  {execution.endReason && (
-                    <p className="task-detail__side-meta">End reason: {humanizeEnum(execution.endReason)}</p>
-                  )}
-                  <ul>
-                    {aggregate.reviewResults
-                      .filter((review) => review.executionId === execution.id)
-                      .map((review) => (
-                        <li key={review.id}>
-                          Round {review.round}: {review.verdict}
-                          <ul>
-                            {review.findings.map((finding, index) => (
-                              <li key={index}>
-                                {finding.severity}: {finding.description}
-                              </li>
-                            ))}
-                          </ul>
-                        </li>
-                      ))}
-                  </ul>
-                </li>
-              ))}
-            </ul>
-            <CostBreakdown taskId={aggregate.task.id} request={apiClient.request} />
-          </section>
-
-          <section className="card" aria-label="Pull request">
-            <h2 className="task-detail__card-title">Pull request</h2>
-            {aggregate.pullRequest ? (
-              <p>
-                <a href={aggregate.pullRequest.url}>#{aggregate.pullRequest.number}</a> -{" "}
-                {aggregate.pullRequest.state} <StateBadge state={aggregate.pullRequest.ciState} />
-              </p>
-            ) : (
-              <p className="empty-state">No pull request yet.</p>
-            )}
-            <p className="task-detail__mono task-detail__side-meta">Branch: {branch ?? "no branch"}</p>
-          </section>
-
-          <section className="card" aria-label="Dependencies">
-            <h2 className="task-detail__card-title">Dependencies</h2>
+          <section className="side-panel__section" aria-label="Dependencies">
+            <div className="side-panel__section-title">
+              Dependencies <span className="side-panel__count">{aggregate.dependencies.length}</span>
+            </div>
             {aggregate.dependencies.length === 0 ? (
-              <p className="empty-state">No dependencies.</p>
+              <p className="side-panel__empty">None</p>
             ) : (
               <ul className="task-detail__side-list">
                 {aggregate.dependencies.map((dependency) => (
