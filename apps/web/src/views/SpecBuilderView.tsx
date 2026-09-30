@@ -2,8 +2,8 @@ import type { FormEvent } from "react";
 import type { Runtime, SpecContent } from "@orchestra/core";
 import { validateSpecForApproval } from "@orchestra/core";
 import { diffSpecs, renderSpecMarkdown } from "@orchestra/prompts";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { Link, useParams } from "react-router";
 import { ApiError, createApiClient, type SpecApiClient } from "../api/client.js";
 import {
   TimelineEventSchema,
@@ -117,8 +117,12 @@ interface SpecBuilderPanelProps {
   createEventSource?: EventSourceFactory;
 }
 
+type DraftTab = "draft" | "revisions";
+
 function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuilderPanelProps) {
   const { begin, isCurrent } = useLatestRequest();
+  const baseId = useId();
+  const [activeTab, setActiveTab] = useState<DraftTab>("draft");
 
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [aggregate, setAggregate] = useState<TaskAggregate | null>(null);
@@ -695,6 +699,12 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   // three-way split the pane body already uses below.
   const draftPaneHeading = formContent ? "Draft" : showApprovedReadOnly ? "Specification" : "Draft";
 
+  // The tab label carries whichever version is actually showing in the
+  // draft tab (the draft's, or the read-only approved one when there's no
+  // draft), matching the mockup's "Draft v2" -- not a fixed word.
+  const draftTabVersion = draftRevision?.version ?? (showApprovedReadOnly ? approvedRevision?.version : undefined);
+  const draftTabLabel = draftTabVersion !== undefined ? `Draft v${draftTabVersion}` : "Draft";
+
   // S3 (coordinator visual check, SCRUM-93): every disabled footer/composer
   // action gets a `title` explaining why, derived from task state, so a
   // disabled button is never silent.
@@ -723,13 +733,19 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
 
   return (
     <>
-      <div className="page-header">
-        <h1 className="page-header__title">
-          {aggregate.task.jiraKey}: {aggregate.task.jiraSummary}
-        </h1>
-        <div className="page-header__actions">
-          <StateBadge state={taskState} />
-        </div>
+      <div className="topbar spec-builder__topbar">
+        <nav className="topbar__crumbs" aria-label="Breadcrumb">
+          <Link to="/">Board</Link>
+          <span aria-hidden="true">/</span>
+          <Link to={`/tasks/${id}`} className="spec-builder__crumb-key">
+            {aggregate.task.jiraKey}
+          </Link>
+          <span aria-hidden="true">/</span>
+          <span className="topbar__crumb-current">Spec</span>
+        </nav>
+        <StateBadge state={taskState} />
+        <div className="topbar__spacer" />
+        <span className="spec-builder__topbar-summary">{aggregate.task.jiraSummary}</span>
       </div>
       {/* Kept for tests that assert the raw state string; StateBadge above is the human-readable one. */}
       <p data-testid="task-state" className="spec-builder__sr-only">
@@ -746,9 +762,9 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
           <div className="spec-builder__chat-header">
             <h2>Chat</h2>
             {showStartSessionButton && (
-              <div>
+              <div className="spec-builder__start-session">
                 {offerRepositoryDropdown && !confirmingStart && (
-                  <label>
+                  <label className="field spec-builder__repo-select">
                     Repository
                     <select
                       value={selectedRepositoryId}
@@ -764,20 +780,21 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
                   </label>
                 )}
                 {confirmingStart ? (
-                  <span role="group" aria-label="Confirm start spec session">
+                  <span role="group" aria-label="Confirm start spec session" className="spec-builder__confirm-start">
                     <span>
                       Start spec session on {startRepositoryName}? The repository can&apos;t be changed afterwards.
                     </span>
-                    <button type="button" disabled={startingSession} onClick={() => void handleStartSession()}>
+                    <button type="button" className="btn" disabled={startingSession} onClick={() => void handleStartSession()}>
                       Confirm
                     </button>
-                    <button type="button" disabled={startingSession} onClick={() => setConfirmingStart(false)}>
+                    <button type="button" className="btn" disabled={startingSession} onClick={() => setConfirmingStart(false)}>
                       Cancel
                     </button>
                   </span>
                 ) : (
                   <button
                     type="button"
+                    className="btn btn--primary"
                     disabled={!canStartSession || startingSession}
                     onClick={() => setConfirmingStart(true)}
                   >
@@ -791,7 +808,9 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
             {chatEntries.map((item) =>
               item.kind === "tool_call" ? (
                 <li key={item.key} className="spec-builder__tool-line">
-                  <span data-testid="tool-chip">{item.toolName}</span>
+                  <span className="tag" data-testid="tool-chip">
+                    {item.toolName}
+                  </span>
                 </li>
               ) : (
                 <li
@@ -807,7 +826,13 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
                   </div>
                   <div data-testid="chat-message" className="spec-builder__bubble-text">
                     <Markdown>{item.text ?? ""}</Markdown>
-                    {item.kind === "agent" && !item.final && " ..."}
+                    {item.kind === "agent" && !item.final && (
+                      <span className="spec-builder__typing" data-testid="typing-indicator" aria-hidden="true">
+                        <i></i>
+                        <i></i>
+                        <i></i>
+                      </span>
+                    )}
                   </div>
                 </li>
               ),
@@ -828,7 +853,12 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
                   onChange={(event) => setMessageText(event.target.value)}
                 />
               </label>
-              <button type="submit" disabled={chatDisabledReason !== null || messageText.trim() === ""} title={chatSendTitle}>
+              <button
+                type="submit"
+                className="btn btn--primary"
+                disabled={chatDisabledReason !== null || messageText.trim() === ""}
+                title={chatSendTitle}
+              >
                 Send
               </button>
             </form>
@@ -836,73 +866,156 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
         </section>
 
         <section aria-label="Spec draft" className="split__pane spec-builder__draft-pane">
-          <h2>{draftPaneHeading}</h2>
-          {isDirty && (
-            <p data-testid="unsaved-changes" className="spec-builder__unsaved">
-              Unsaved changes
-            </p>
-          )}
-          {formContent ? (
-            <SpecDraftForm
-              content={formContent}
-              highlightedFields={highlightedFields}
-              disabled={taskState !== "SPEC_IN_PROGRESS"}
-              onChange={setFormContent}
-            />
-          ) : showApprovedReadOnly && approvedRevision ? (
-            <div className="spec-builder__approved" data-testid="approved-spec">
-              <h3>Approved specification, version {approvedRevision.version}</h3>
-              {approvedApproval && (
-                <p className="spec-builder__approved-meta">
-                  Approved <Time value={approvedApproval.approvedAt} />
-                </p>
-              )}
-              <Markdown>{renderSpecMarkdown(approvedRevision.content)}</Markdown>
-            </div>
-          ) : (
-            <div className="empty-state">
-              <p>{taskState === "NEEDS_SPEC" ? "Start a spec session to begin." : "No draft revision."}</p>
-            </div>
-          )}
+          <div className="tabs spec-builder__draft-tabs" role="tablist" aria-label="Draft and revisions">
+            <button
+              type="button"
+              role="tab"
+              id={`${baseId}-tab-draft`}
+              aria-selected={activeTab === "draft"}
+              aria-controls={`${baseId}-panel-draft`}
+              className={activeTab === "draft" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
+              onClick={() => setActiveTab("draft")}
+            >
+              {draftTabLabel}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              id={`${baseId}-tab-revisions`}
+              aria-selected={activeTab === "revisions"}
+              aria-controls={`${baseId}-panel-revisions`}
+              className={activeTab === "revisions" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
+              onClick={() => setActiveTab("revisions")}
+            >
+              {`Revisions (${revisions.length})`}
+            </button>
+            {isDirty && (
+              <span data-testid="unsaved-changes" className="spec-builder__unsaved">
+                Unsaved changes
+              </span>
+            )}
+          </div>
+
+          <div className="spec-builder__draft-body">
+            {activeTab === "draft" ? (
+              <div role="tabpanel" id={`${baseId}-panel-draft`} aria-labelledby={`${baseId}-tab-draft`}>
+                <h2>{draftPaneHeading}</h2>
+                {formContent ? (
+                  <SpecDraftForm
+                    content={formContent}
+                    highlightedFields={highlightedFields}
+                    disabled={taskState !== "SPEC_IN_PROGRESS"}
+                    onChange={setFormContent}
+                  />
+                ) : showApprovedReadOnly && approvedRevision ? (
+                  <div className="spec-builder__approved" data-testid="approved-spec">
+                    <h3>Approved specification, version {approvedRevision.version}</h3>
+                    {approvedApproval && (
+                      <p className="spec-builder__approved-meta">
+                        Approved <Time value={approvedApproval.approvedAt} />
+                      </p>
+                    )}
+                    <Markdown>{renderSpecMarkdown(approvedRevision.content)}</Markdown>
+                  </div>
+                ) : (
+                  <div className="empty-state">
+                    <p>{taskState === "NEEDS_SPEC" ? "Start a spec session to begin." : "No draft revision."}</p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div role="tabpanel" id={`${baseId}-panel-revisions`} aria-labelledby={`${baseId}-tab-revisions`}>
+                <ul className="spec-builder__revision-list" data-testid="revision-list">
+                  {revisions.map((revision) => (
+                    <li key={revision.id} className="spec-builder__revision-row">
+                      <span className="spec-builder__revision-version">v{revision.version}</span>
+                      <StateBadge state={revision.status} />
+                      <Time value={revision.createdAt} />
+                    </li>
+                  ))}
+                </ul>
+                {revisions.length > 0 && (
+                  <details className="spec-builder__revision-details">
+                    <summary>Compare revisions</summary>
+                    <label>
+                      Compare from
+                      <select value={fromRevisionId ?? ""} onChange={(event) => setFromRevisionId(event.target.value)}>
+                        {revisions.map((revision) => (
+                          <option key={revision.id} value={revision.id}>
+                            v{revision.version}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Compare to
+                      <select value={toRevisionId ?? ""} onChange={(event) => setToRevisionId(event.target.value)}>
+                        {revisions.map((revision) => (
+                          <option key={revision.id} value={revision.id}>
+                            v{revision.version}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {diffText && <pre data-testid="spec-diff">{diffText}</pre>}
+
+                    <label>
+                      View revision
+                      <select value={readRevisionId ?? ""} onChange={(event) => setReadRevisionId(event.target.value)}>
+                        {revisions.map((revision) => (
+                          <option key={revision.id} value={revision.id}>
+                            v{revision.version}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {readMarkdown && <pre data-testid="spec-read-view">{readMarkdown}</pre>}
+                  </details>
+                )}
+              </div>
+            )}
+          </div>
 
           <div className="spec-builder__draft-actions" aria-label="Actions">
             {formContent ? (
               <>
+                {!validation.ok && (
+                  <p className="alert alert--error spec-builder__blocker" data-testid="approve-blocker">
+                    {validation.errors[0]}
+                  </p>
+                )}
                 <div className="toolbar">
-                  <button type="button" disabled={!canSaveDraft} title={saveDraftTitle} onClick={() => void handleSaveDraft()}>
+                  <button type="button" className="btn" disabled={!canSaveDraft} title={saveDraftTitle} onClick={() => void handleSaveDraft()}>
                     Save Draft
+                  </button>
+                  <button type="button" className="btn" disabled={!canSendBack} title={sendBackTitle} onClick={() => void handleSendBack()}>
+                    Send Back
                   </button>
                   <button
                     type="button"
+                    className="btn"
                     disabled={!canRequestReview}
                     title={requestReviewTitle}
                     onClick={() => void handleRequestReview()}
                   >
                     Request Review
                   </button>
-                  <button type="button" disabled={!canSendBack} title={sendBackTitle} onClick={() => void handleSendBack()}>
-                    Send Back
-                  </button>
-                  <label>
+                  <span className="spec-builder__actions-sep" aria-hidden="true" />
+                  <label className="spec-builder__runtime">
                     Runtime
                     <select value={runtimeValue} onChange={(event) => setRuntimeOverride(event.target.value as Runtime)}>
                       <option value="claude">claude</option>
                       <option value="codex">codex</option>
                     </select>
                   </label>
-                  <button type="button" disabled={!canApprove} title={approveTitle} onClick={() => void handleApprove()}>
+                  <button type="button" className="btn btn--primary" disabled={!canApprove} title={approveTitle} onClick={() => void handleApprove()}>
                     Approve
                   </button>
                 </div>
-                {!validation.ok && (
-                  <p className="alert alert--error" data-testid="approve-blocker">
-                    {validation.errors[0]}
-                  </p>
-                )}
               </>
             ) : (
               <div className="toolbar">
-                <button type="button" disabled={!canRevise} title={reviseTitle} onClick={() => void handleRevise()}>
+                <button type="button" className="btn btn--primary" disabled={!canRevise} title={reviseTitle} onClick={() => void handleRevise()}>
                   Revise
                 </button>
               </div>
@@ -910,57 +1023,6 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
           </div>
         </section>
       </div>
-
-      <section aria-label="Specification revisions" className="card spec-builder__revisions">
-        <h2>Specification revisions</h2>
-        <ul className="spec-builder__revision-list" data-testid="revision-list">
-          {revisions.map((revision) => (
-            <li key={revision.id} className="spec-builder__revision-row">
-              <span className="spec-builder__revision-version">v{revision.version}</span>
-              <StateBadge state={revision.status} />
-              <Time value={revision.createdAt} />
-            </li>
-          ))}
-        </ul>
-        {revisions.length > 0 && (
-          <details className="spec-builder__revision-details">
-            <summary>Compare revisions</summary>
-            <label>
-              Compare from
-              <select value={fromRevisionId ?? ""} onChange={(event) => setFromRevisionId(event.target.value)}>
-                {revisions.map((revision) => (
-                  <option key={revision.id} value={revision.id}>
-                    v{revision.version}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Compare to
-              <select value={toRevisionId ?? ""} onChange={(event) => setToRevisionId(event.target.value)}>
-                {revisions.map((revision) => (
-                  <option key={revision.id} value={revision.id}>
-                    v{revision.version}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {diffText && <pre data-testid="spec-diff">{diffText}</pre>}
-
-            <label>
-              View revision
-              <select value={readRevisionId ?? ""} onChange={(event) => setReadRevisionId(event.target.value)}>
-                {revisions.map((revision) => (
-                  <option key={revision.id} value={revision.id}>
-                    v{revision.version}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {readMarkdown && <pre data-testid="spec-read-view">{readMarkdown}</pre>}
-          </details>
-        )}
-      </section>
     </>
   );
 }
