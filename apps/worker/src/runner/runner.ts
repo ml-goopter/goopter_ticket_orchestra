@@ -468,7 +468,8 @@ class RunState {
   stopDetail: string | undefined;
   /**
    * Set once a turn got its token, so the execution was live when the agent
-   * started; a later COMPLETED is its own `report_pr_created` (GOT.98).
+   * started; a later COMPLETED, or FAILED with `agent_gave_up`, is its own
+   * `report_pr_created` or `report_failed` (GOT.98).
    */
   sessionOpened = false;
   readonly stopped: Promise<void>;
@@ -873,6 +874,20 @@ export function createRunner(deps: RunnerDeps): Runner {
     ctx.project.maxBudgetUsd === null ? undefined : Number(ctx.project.maxBudgetUsd);
 
   /**
+   * GOT.98: whether an implementation execution was ended by its agent's
+   * own terminal call (§8): COMPLETED, which only `report_pr_created` sets,
+   * or FAILED with `agent_gave_up`, which only `report_failed` sets. A
+   * FAILED with any other reason (the sweeper's `lease_expired`, the
+   * runner's own failures) and CANCELLED are not.
+   */
+  async function endedByOwnAgent(executionId: string): Promise<boolean> {
+    const current = await loadRunnerContext(db, executionId);
+    if (!current) return false;
+    const { state, endReason } = current.execution;
+    return state === "COMPLETED" || (state === "FAILED" && endReason === "agent_gave_up");
+  }
+
+  /**
    * §6.4: renews the lease every `leaseRenewMs` while `body` runs. Spec
    * sessions hold no lease, so only implementation renews. `renewNow` also
    * renews once before `body`. The state-gated helper (carry-forward, PR #17)
@@ -880,11 +895,11 @@ export function createRunner(deps: RunnerDeps): Runner {
    * result aborts the run. Returns only once every renewal it started has
    * settled, so none outlives the run (GOT.78).
    *
-   * GOT.98: the one exception is an execution COMPLETED under an open
-   * session, which only its agent's `report_pr_created` does (§8). The turn
-   * still owes its closing text and the `result` message that carries the
-   * usage (§9.3, §9.7), so it is not aborted at once: like a blocking raise
-   * (§8), it must end within `blockingGraceMs`, and is stopped after that.
+   * GOT.98: the one exception is an execution its own agent ended under an
+   * open session (`endedByOwnAgent`). The turn still owes its closing text
+   * and the `result` message that carries the usage (§9.3, §9.7), so it is
+   * not aborted at once: like a blocking raise (§8), it must end within
+   * `blockingGraceMs`, and is stopped after that.
    */
   async function withLease(
     state: RunState,
@@ -900,12 +915,9 @@ export function createRunner(deps: RunnerDeps): Runner {
       try {
         const expiresAt = await renewExecutionLease(db, ctx.execution.id, now());
         if (expiresAt !== null) return;
-        if (
-          state.sessionOpened &&
-          (await getExecutionState(db, ctx.execution.id)) === "COMPLETED"
-        ) {
+        if (state.sessionOpened && (await endedByOwnAgent(ctx.execution.id))) {
           if (graceTimer === undefined && state.stopReason === null) {
-            log.info({}, "execution completed by its agent; turn must end within the grace period");
+            log.info({}, "execution ended by its agent; turn must end within the grace period");
             graceTimer = setTimer(() => state.stop("gone"), timings.blockingGraceMs);
           }
           return;

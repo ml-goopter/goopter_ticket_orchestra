@@ -250,6 +250,28 @@ async function completeViaTool(executionId: string): Promise<void> {
   });
 }
 
+/**
+ * FAILED as the agent's own `report_failed` leaves it (`agent_gave_up`, §8),
+ * or as the lease sweeper does (`lease_expired`, §6.4).
+ */
+async function failExecution(
+  executionId: string,
+  endReason: "agent_gave_up" | "lease_expired",
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    await transition(tx, {
+      entity: "execution",
+      id: executionId,
+      trigger: "execution.failed",
+      actor:
+        endReason === "agent_gave_up"
+          ? { kind: "agent", id: executionId }
+          : { kind: "worker", id: "sweeper" },
+      set: { endReason, endDetail: "test", endedAt: new Date() },
+    });
+  });
+}
+
 async function cancelViaApi(taskId: string, executionId: string): Promise<void> {
   await db.transaction(async (tx) => {
     await transition(tx, { entity: "task", id: taskId, trigger: "task.cancelled", actor: { kind: "user" } });
@@ -1066,15 +1088,19 @@ describe("usage after report_pr_created (GOT.98, §9.7)", () => {
    * container mode the CLI is a process started through the container
    * spawner, killed on abort as the SDK does.
    */
-  function reportThenResult(resultAfterMs: number): Script {
+  function reportThenResult(
+    resultAfterMs: number,
+    tool: "report_pr_created" | "report_failed" = "report_pr_created",
+  ): Script {
     return async function* ({ executionId, signal, spawn, token }) {
       if (spawn) {
         const proc = spawn(CLAUDE_CONTAINER_COMMAND, ["--print"], { cwd: "/w", env: { ORCHESTRA_TOKEN: token } });
         signal.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
       }
       yield { type: "session", sessionId: `sess-${executionId}` };
-      yield { type: "tool_call", name: "mcp__orchestra__report_pr_created", input: {} };
-      await completeViaTool(executionId);
+      yield { type: "tool_call", name: `mcp__orchestra__${tool}`, input: {} };
+      if (tool === "report_failed") await failExecution(executionId, "agent_gave_up");
+      else await completeViaTool(executionId);
       await Promise.race([sleep(resultAfterMs), aborted(signal)]);
       // An aborted SDK query ends the stream without its result.
       if (signal.aborted) return;
@@ -1227,5 +1253,89 @@ describe("usage after report_pr_created (GOT.98, §9.7)", () => {
     const row = await execution(s.executionId);
     expect(row.state).toBe("FAILED");
     expect(row.endReason).toBe("agent_hung");
+  });
+
+  it("a turn that ended its execution with report_failed records the result's usage in host and container mode", async () => {
+    const timings = { leaseRenewMs: 50, blockingGraceMs: 5_000, blockingPollMs: 50 };
+    const recorded = [];
+    let processes: FakeProcessControl[] = [];
+    for (const agentContainer of [false, true]) {
+      const s = await seedClaimed({ agentContainer });
+      const h = makeRunner({ workerId: s.workerId, timings });
+      if (agentContainer) processes = liveProcesses(h);
+      const adapter = agentContainer ? h.adapter : h.hostAdapter;
+      adapter.script = reportThenResult(300, "report_failed");
+
+      await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+
+      recorded.push(await usageOf(s.executionId));
+      expect((await execution(s.executionId)).endReason).toBe("agent_gave_up");
+      if (agentContainer) expect(h.containers.removes).toEqual([s.executionId]);
+      await h.runner.shutdown(2000);
+    }
+
+    const [host, container] = recorded;
+    expect(host!.rows).toHaveLength(2);
+    expect(host!.costUsd).toBe("0.537400");
+    expect(host!.usageEvents).toBe(2);
+    expect(host!.agentMessage).toBe(true);
+    expect(host!.state).toBe("FAILED");
+    expect(container).toEqual(host);
+    expect(processes).toHaveLength(1);
+    expect(processes[0]!.kills).toEqual([]);
+  });
+
+  it("an agent still working after report_failed is stopped once the grace runs out", async () => {
+    const s = await seedClaimed();
+    const h = makeRunner({
+      workerId: s.workerId,
+      timings: { leaseRenewMs: 50, blockingGraceMs: 400, blockingPollMs: 50 },
+    });
+    const processes = liveProcesses(h);
+    h.adapter.script = reportThenResult(60_000, "report_failed");
+
+    const started = Date.now();
+    await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeGreaterThanOrEqual(400);
+    expect(elapsed).toBeLessThan(5_000);
+    expect(processes[0]!.kills).toEqual(["SIGTERM"]);
+    const row = await execution(s.executionId);
+    expect(row.state).toBe("FAILED");
+    expect(row.endReason).toBe("agent_gave_up");
+  });
+
+  it("a renewal that finds the execution FAILED with lease_expired stops the turn at once in host and container mode", async () => {
+    for (const agentContainer of [false, true]) {
+      const s = await seedClaimed({ agentContainer });
+      const h = makeRunner({
+        workerId: s.workerId,
+        timings: { leaseRenewMs: 50, blockingGraceMs: 60_000, blockingPollMs: 50 },
+      });
+      const processes = liveProcesses(h);
+      const adapter = agentContainer ? h.adapter : h.hostAdapter;
+      adapter.script = async function* ({ executionId, signal, spawn }) {
+        if (spawn) {
+          const proc = spawn(CLAUDE_CONTAINER_COMMAND, ["--print"], { cwd: "/w", env: {} });
+          signal.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
+        }
+        yield { type: "session", sessionId: `sess-${executionId}` };
+        await aborted(signal);
+      };
+      const run = h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+      await waitFor(async () => ((await execution(s.executionId)).state === "RUNNING" ? true : undefined));
+
+      const failed = Date.now();
+      await failExecution(s.executionId, "lease_expired");
+      await run;
+
+      expect(Date.now() - failed).toBeLessThan(5_000);
+      if (agentContainer) expect(processes[0]!.kills).toEqual(["SIGTERM"]);
+      const row = await execution(s.executionId);
+      expect(row.state).toBe("FAILED");
+      expect(row.endReason).toBe("lease_expired");
+      await h.runner.shutdown(2000);
+    }
   });
 });
