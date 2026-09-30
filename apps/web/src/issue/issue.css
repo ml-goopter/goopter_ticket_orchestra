@@ -1,8 +1,9 @@
 /**
- * Issue detail (U4, docs/design.md §14 Issue detail row). Builds on
- * `.page-header`, `.card`, `.badge`, `.field`, `.alert`, `.toolbar`,
- * `.markdown` from styles/components.css; only classes local to this view
- * live here.
+ * Issue detail (U4, UR5, docs/design.md §14 Issue detail row; approved
+ * mockup nimbalyst-local/mockups/issue-detail.mockup.html). Builds on
+ * `.topbar`, `.page-header`, `.card`, `.badge`, `.btn`, `.field`, `.alert`,
+ * `.split`/`.split__pane`, `.markdown` from styles/components.css; only
+ * classes local to this view live here.
  */
 
 /* Visually hides a machine-readable helper node (e.g. the raw issue-status
@@ -36,78 +37,194 @@
 }
 
 .issue-detail__question {
-  margin-bottom: var(--space-4);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-weight: 500;
 }
 
-/* Resolution card: bottom margin so "Thread" below isn't flush against it;
- * kind + resolved time render as one muted line (`.issue-detail__meta`
- * styling), e.g. "Spec revision · 3 hr ago". */
-.issue-detail__resolution {
-  margin-bottom: var(--space-4);
+.issue-detail__question p {
+  margin: 0;
 }
 
+/* Two-column body (UR5 AC3): agent explanation + decision/resolution on
+ * the left, the thread on the right, built on the shared `.split`
+ * primitive. */
+.issue-detail__body {
+  margin-top: var(--space-2);
+}
+
+.issue-detail__left {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.issue-detail__section-title {
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-faint);
+  margin-bottom: var(--space-2);
+}
+
+/* Resolution card: kind + resolved time render as one muted line
+ * (`.issue-detail__meta` styling), e.g. "Spec revision · 3 hr ago". */
 .issue-detail__resolution-meta {
   margin: 0;
   font-size: var(--font-size-sm);
   color: var(--color-text-muted);
 }
 
-.issue-detail__question p {
-  margin: 0;
+/* Decision card ("Your decision", UR5 AC3-AC5). */
+.issue-detail__decision-header {
   font-weight: 600;
+  padding-bottom: var(--space-3);
+  margin-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
 }
 
-.issue-detail__options {
-  margin: 0 0 var(--space-4);
-  border: none;
-  padding: 0;
-}
-
-.issue-detail__options legend {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-muted);
-  margin-bottom: var(--space-2);
-}
-
-.issue-detail__options label {
-  display: block;
-  margin-bottom: var(--space-2);
-}
-
-.issue-detail__resolve-card .field + .field {
+.issue-detail__decision .field + .field {
   margin-top: var(--space-3);
 }
 
-.issue-detail__resolve-card .toolbar {
-  margin-top: var(--space-4);
-  margin-bottom: 0;
+/* Suggested options as selectable cards (UR5 AC4): native radio semantics
+ * kept (same name/value/checked), styling only wraps the label. */
+.issue-detail__options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
 }
 
-.issue-detail__thread {
-  list-style: none;
-  margin: 0 0 var(--space-4);
-  padding: 0;
+.issue-detail__option {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.issue-detail__option input {
+  margin-top: 3px;
+}
+
+.issue-detail__option--selected {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+
+.issue-detail__option-tradeoff {
+  display: block;
+  margin-top: var(--space-1);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+}
+
+/* Resolve buttons plus their one-line explanations (UR5 AC5). */
+.issue-detail__resolve {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+@media (max-width: 720px) {
+  .issue-detail__resolve {
+    grid-template-columns: 1fr;
+  }
+}
+
+.issue-detail__resolve-action {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  align-items: flex-start;
+}
+
+.issue-detail__resolve-why {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+}
+
+/* Thread column (UR5 AC6): avatar-plus-text bubbles, composer pinned to
+ * the bottom of the scrolling pane via `position: sticky`. */
+.issue-detail__thread-pane {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
 }
 
-.issue-detail__bubble {
-  max-width: 85%;
-  background: var(--color-surface-raised);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-3);
+.issue-detail__thread {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  flex: 1 1 auto;
 }
 
-.issue-detail__bubble--live {
-  align-self: flex-start;
+.issue-detail__bubble {
+  display: grid;
+  grid-template-columns: 26px 1fr;
+  gap: var(--space-2);
+}
+
+.issue-detail__avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-full);
+  display: grid;
+  place-items: center;
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.issue-detail__avatar--agent {
+  background: var(--color-text);
+  color: var(--color-surface);
+}
+
+.issue-detail__avatar--user {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
 }
 
 .issue-detail__bubble-meta {
   margin-bottom: var(--space-1);
   font-size: var(--font-size-xs);
   color: var(--color-text-faint);
+}
+
+.issue-detail__bubble-meta strong {
+  color: var(--color-text-muted);
+  text-transform: capitalize;
+}
+
+.issue-detail__typing {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: var(--space-1);
+  vertical-align: middle;
+}
+
+.issue-detail__typing i {
+  width: 4px;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--color-text-faint);
+  opacity: 0.6;
+}
+
+.issue-detail__composer {
+  position: sticky;
+  bottom: 0;
 }
 
 .issue-detail__composer .field {

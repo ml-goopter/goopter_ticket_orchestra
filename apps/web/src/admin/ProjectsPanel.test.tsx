@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client.js";
 import { DeleteBlockedError, type AdminApi, type Project } from "../api/admin.js";
@@ -79,6 +79,7 @@ describe("ProjectsPanel", () => {
     render(<ProjectsPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("No projects yet.")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
 
     const createForm = screen.getByRole("form", { name: "Create project" });
     fireEvent.change(within(createForm, "Key"), { target: { value: "GOOP" } });
@@ -100,6 +101,8 @@ describe("ProjectsPanel", () => {
     );
     await waitFor(() => expect(listProjects).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByText("GOOP")).toBeTruthy());
+    // The sheet closes once the create succeeds.
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("blocks a negative limit client-side with an inline message and never calls the api", async () => {
@@ -108,6 +111,7 @@ describe("ProjectsPanel", () => {
     render(<ProjectsPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("No projects yet.")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
 
     const createForm = screen.getByRole("form", { name: "Create project" });
     fireEvent.change(within(createForm, "Key"), { target: { value: "GOOP" } });
@@ -126,6 +130,7 @@ describe("ProjectsPanel", () => {
     render(<ProjectsPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("No projects yet.")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
 
     const createForm = screen.getByRole("form", { name: "Create project" });
     fireEvent.change(within(createForm, "Key"), { target: { value: "GOOP" } });
@@ -224,6 +229,61 @@ describe("ProjectsPanel", () => {
       await waitFor(() => expect(deleteButton.hasAttribute("disabled")).toBe(true));
       resolveDelete();
       confirmSpy.mockRestore();
+    });
+  });
+
+  describe("create/edit sheet (UR7)", () => {
+    it("opens the create sheet as a labelled dialog and closes it on Cancel, returning focus to the trigger", async () => {
+      const adminApi = fakeAdminApi();
+      render(<ProjectsPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("No projects yet.")).toBeTruthy());
+      expect(screen.queryByRole("dialog")).toBeNull();
+
+      const trigger = screen.getByRole("button", { name: "Create project" });
+      fireEvent.click(trigger);
+
+      const dialog = screen.getByRole("dialog", { name: "Create project" });
+      expect(dialog.contains(document.activeElement)).toBe(true);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(trigger);
+    });
+
+    it("closes the create sheet on Escape, returning focus to the trigger", async () => {
+      const adminApi = fakeAdminApi();
+      render(<ProjectsPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("No projects yet.")).toBeTruthy());
+      const trigger = screen.getByRole("button", { name: "Create project" });
+      fireEvent.click(trigger);
+      expect(screen.getByRole("dialog", { name: "Create project" })).toBeTruthy();
+
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      });
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(trigger);
+    });
+
+    it("opens the edit sheet from a row's Edit button and returns focus to it on Cancel", async () => {
+      const adminApi = fakeAdminApi({ listProjects: vi.fn().mockResolvedValue([project()]) });
+      render(<ProjectsPanel adminApi={adminApi} />);
+
+      await waitFor(() => expect(screen.getByText("GOOP")).toBeTruthy());
+      const editButton = screen.getByRole("button", { name: "Edit" });
+      fireEvent.click(editButton);
+
+      const dialog = screen.getByRole("dialog", { name: "Edit project" });
+      expect(dialog.contains(document.activeElement)).toBe(true);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(editButton);
     });
   });
 });

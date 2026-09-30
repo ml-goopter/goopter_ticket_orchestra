@@ -98,6 +98,7 @@ describe("UsersPanel", () => {
     render(<UsersPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("No users yet.")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Create user" }));
 
     const createForm = screen.getByRole("form", { name: "Create user" });
     fireEvent.change(within(createForm, "Email"), { target: { value: "newuser@example.com" } });
@@ -143,6 +144,7 @@ describe("UsersPanel", () => {
     render(<UsersPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("No users yet.")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Create user" }));
 
     const createForm = screen.getByRole("form", { name: "Create user" });
     fireEvent.change(within(createForm, "Email"), { target: { value: "dup@example.com" } });

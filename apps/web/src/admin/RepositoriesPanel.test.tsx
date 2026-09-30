@@ -92,11 +92,30 @@ describe("RepositoriesPanel", () => {
     render(<RepositoriesPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("goopter_odoo_modules")).toBeTruthy());
-    expect(screen.getByText("git@example.com:goopter/goopter_odoo_modules.git")).toBeTruthy();
+    expect(screen.getByText((_, el) => el?.textContent === "git@example.com:goopter/goopter_odoo_modules.git · main")).toBeTruthy();
     expect(screen.getByText("docker")).toBeTruthy();
     expect(screen.getByText("pnpm test")).toBeTruthy();
-    expect(screen.getByText("Yes")).toBeTruthy();
+    // Containerised: the image name renders as a success badge, not the row's default branch project name.
     expect(screen.getByText("orchestra/agent:custom")).toBeTruthy();
+  });
+
+  it("shows 'Host' for a non-containerised repository", async () => {
+    const adminApi = fakeAdminApi({
+      listRepositories: vi.fn().mockResolvedValue([repository({ agentContainer: false, agentImage: null })]),
+    });
+    render(<RepositoriesPanel adminApi={adminApi} />);
+
+    await waitFor(() => expect(screen.getByText("goopter_odoo_modules")).toBeTruthy());
+    expect(screen.getByText("Host")).toBeTruthy();
+  });
+
+  it("shows the repository's project by name", async () => {
+    const adminApi = fakeAdminApi({
+      listRepositories: vi.fn().mockResolvedValue([repository({ projectId: "proj-1" })]),
+    });
+    render(<RepositoriesPanel adminApi={adminApi} />);
+
+    await waitFor(() => expect(screen.getByText("Goopter")).toBeTruthy());
   });
 
   it("applies the project filter to the list call", async () => {
@@ -119,6 +138,7 @@ describe("RepositoriesPanel", () => {
     render(<RepositoriesPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("No repositories yet.")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Create repository" }));
 
     const createForm = screen.getByRole("form", { name: "Create repository" });
     fireEvent.change(within(createForm, "Project"), { target: { value: "proj-1" } });
@@ -210,6 +230,7 @@ describe("RepositoriesPanel", () => {
     render(<RepositoriesPanel adminApi={adminApi} />);
 
     await waitFor(() => expect(screen.getByText("No repositories yet.")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Create repository" }));
 
     const createForm = screen.getByRole("form", { name: "Create repository" });
     fireEvent.change(within(createForm, "Project"), { target: { value: "proj-1" } });

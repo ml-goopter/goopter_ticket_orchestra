@@ -28,6 +28,19 @@ type LoadState = "loading" | "loaded" | "not_found" | "error";
 const ISSUE_STREAM_TYPES = ["agent.message.delta", "agent.message", "issue.message", "issue.resolved"] as const;
 
 /**
+ * Same string used both for the `window.confirm` prompt and the one-line
+ * explanation rendered under "This changes the spec" on a blocking issue
+ * (UR5 AC5, spec §19): a single source so the two can never drift apart.
+ */
+const SPEC_REVISION_CONFIRM_TEXT =
+  "This creates a draft revision from the approved spec with your decision appended, and reopens the spec builder. Continue?";
+
+/** Initials for the thread bubble avatar (UR5 AC6), keyed by `authorKind`. */
+function authorInitials(authorKind: "agent" | "user"): string {
+  return authorKind === "agent" ? "AI" : "U";
+}
+
+/**
  * Renders `${code}: ${message}` for an api error so a 409's exact reason
  * (design.md §10.2-§10.5) is always visible, except for the one code the
  * contract maps to a friendlier composer message.
@@ -207,9 +220,7 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
   }, [submitResolve]);
 
   const handleResolveSpecRevision = useCallback(() => {
-    const confirmed = window.confirm(
-      "This creates a draft revision from the approved spec with your decision appended, and reopens the spec builder. Continue?",
-    );
+    const confirmed = window.confirm(SPEC_REVISION_CONFIRM_TEXT);
     if (!confirmed) return;
     void submitResolve("spec_revision");
   }, [submitResolve]);
@@ -248,6 +259,22 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
 
   return (
     <main>
+      <div className="topbar">
+        <div className="topbar__crumbs">
+          <Link to="/">Board</Link>
+          <span>/</span>
+          <Link to={`/tasks/${task.id}`}>{task.jira_key}</Link>
+          <span>/</span>
+          <span className="topbar__crumb-current">Issue</span>
+        </div>
+        <div className="topbar__spacer" />
+        <div className="topbar__actions">
+          <Link className="btn" to={`/tasks/${task.id}/spec`}>
+            Spec revision
+          </Link>
+        </div>
+      </div>
+
       <div className="page-header">
         <h1 className="page-header__title">{issue.title}</h1>
         <div className="page-header__actions">
@@ -268,154 +295,204 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
         <span className="issue-detail__meta-item" data-testid="issue-execution">
           Execution: {execution.role} <StateBadge state={execution.state} /> ({execution.runtime})
         </span>
-        <span className="issue-detail__meta-item">
-          <Link to={`/tasks/${task.id}/spec`}>Spec revision</Link>
-        </span>
       </div>
 
-      <section aria-label="Details">
-        <Markdown>{issue.description}</Markdown>
-
-        {issue.question && (
-          <div className="card issue-detail__question">
-            <p data-testid="issue-question">{issue.question}</p>
+      <div className="split issue-detail__body">
+        <section className="split__pane issue-detail__left" aria-label="Details">
+          <div>
+            <h2 className="issue-detail__section-title">Agent explanation</h2>
+            <Markdown>{issue.description}</Markdown>
           </div>
-        )}
 
-        {isOpen && (
-          <div className="card issue-detail__resolve-card">
-            {options.length > 0 && (
-              <fieldset className="issue-detail__options">
-                <legend>Suggested options</legend>
-                {options.map((option) => (
-                  <label key={option.id}>
-                    <input
-                      type="radio"
-                      name="chosen-option"
-                      value={option.id}
-                      checked={chosenOptionId === option.id}
-                      onChange={() => setChosenOptionId(option.id)}
-                    />
-                    {option.description} ({option.tradeoff})
-                    {issue.recommendedOption === option.id && " - recommended"}
-                  </label>
-                ))}
-              </fieldset>
-            )}
+          {issue.question && (
+            <div className="card issue-detail__question">
+              <p data-testid="issue-question">{issue.question}</p>
+            </div>
+          )}
 
-            <label className="field">
-              Decision
-              <textarea
-                data-testid="decision-text"
-                value={decisionText}
-                onChange={(event) => setDecisionText(event.target.value)}
-              />
-            </label>
-            <label className="field">
-              Clarification (optional)
-              <textarea
-                data-testid="clarification-text"
-                value={clarificationText}
-                onChange={(event) => setClarificationText(event.target.value)}
-              />
-            </label>
+          {isOpen && (
+            <div className="card issue-detail__decision">
+              <div className="issue-detail__decision-header">Your decision</div>
 
-            <div className="toolbar" aria-label="Resolve">
-              <button
-                type="button"
-                disabled={decisionText.trim().length === 0 || resolving}
-                onClick={handleResolveClarification}
-              >
-                Resolve as clarification
-              </button>
-              {issue.blocking ? (
-                <button
-                  type="button"
-                  disabled={decisionText.trim().length === 0 || resolving}
-                  onClick={handleResolveSpecRevision}
-                >
-                  This changes the spec
-                </button>
-              ) : (
-                <p>The agent is not paused and will not be resumed.</p>
+              {options.length > 0 && (
+                <div className="issue-detail__options" role="radiogroup" aria-label="Suggested options">
+                  {options.map((option) => (
+                    <label
+                      key={option.id}
+                      className={`issue-detail__option${
+                        chosenOptionId === option.id ? " issue-detail__option--selected" : ""
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="chosen-option"
+                        value={option.id}
+                        checked={chosenOptionId === option.id}
+                        onChange={() => setChosenOptionId(option.id)}
+                      />
+                      <span>
+                        <strong>{option.description}</strong>
+                        <span className="issue-detail__option-tradeoff">{option.tradeoff}</span>
+                      </span>
+                      {issue.recommendedOption === option.id && (
+                        <span className="badge badge--success">Recommended</span>
+                      )}
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              <label className="field">
+                Decision
+                <textarea
+                  data-testid="decision-text"
+                  value={decisionText}
+                  onChange={(event) => setDecisionText(event.target.value)}
+                />
+              </label>
+              <label className="field">
+                Clarification (optional)
+                <textarea
+                  data-testid="clarification-text"
+                  value={clarificationText}
+                  onChange={(event) => setClarificationText(event.target.value)}
+                />
+              </label>
+
+              <div className="issue-detail__resolve" aria-label="Resolve">
+                <div className="issue-detail__resolve-action">
+                  <button
+                    type="button"
+                    disabled={decisionText.trim().length === 0 || resolving}
+                    onClick={handleResolveClarification}
+                  >
+                    Resolve as clarification
+                  </button>
+                  {issue.blocking && (
+                    <p className="issue-detail__resolve-why">
+                      The agent resumes with your decision. The spec is unchanged.
+                    </p>
+                  )}
+                </div>
+                {issue.blocking ? (
+                  <div className="issue-detail__resolve-action">
+                    <button
+                      type="button"
+                      disabled={decisionText.trim().length === 0 || resolving}
+                      onClick={handleResolveSpecRevision}
+                    >
+                      This changes the spec
+                    </button>
+                    <p className="issue-detail__resolve-why">{SPEC_REVISION_CONFIRM_TEXT}</p>
+                  </div>
+                ) : (
+                  <p>The agent is not paused and will not be resumed.</p>
+                )}
+              </div>
+              {resolveError && (
+                <p className="alert alert--error" role="alert">
+                  {resolveError}
+                </p>
               )}
             </div>
-            {resolveError && (
-              <p className="alert alert--error" role="alert">
-                {resolveError}
+          )}
+
+          {!isOpen && (
+            <div className="card issue-detail__resolution" aria-label="Resolution">
+              <h2 className="issue-detail__section-title">Resolution</h2>
+              <p data-testid="resolution-decision">
+                {decision?.decision ?? issue.resolution ?? "No decision recorded."}
+              </p>
+              <p className="issue-detail__resolution-meta">
+                <span data-testid="resolution-kind">{humanizeEnum(issue.resolutionKind ?? issue.status)}</span>
+                {" · "}
+                <span data-testid="resolution-time">
+                  <Time value={issue.resolvedAt} />
+                </span>
+              </p>
+            </div>
+          )}
+        </section>
+
+        <aside className="split__pane issue-detail__thread-pane" aria-label="Thread">
+          <h2 className="issue-detail__section-title">Thread</h2>
+          <ul data-testid="thread" className="issue-detail__thread">
+            {messages.map((message) => (
+              <li key={message.id} data-testid="thread-message" className="issue-detail__bubble">
+                <span
+                  className={`issue-detail__avatar issue-detail__avatar--${message.authorKind}`}
+                  aria-hidden="true"
+                >
+                  {authorInitials(message.authorKind)}
+                </span>
+                <div>
+                  <div className="issue-detail__bubble-meta">
+                    <strong>{message.authorKind}</strong> <Time value={message.createdAt} />
+                  </div>
+                  <div className="issue-detail__bubble-text">{message.body}</div>
+                </div>
+              </li>
+            ))}
+            {liveReply && (
+              <li
+                data-testid="thread-live-reply"
+                data-final={liveReply.final}
+                className="issue-detail__bubble issue-detail__bubble--live"
+              >
+                <span className="issue-detail__avatar issue-detail__avatar--agent" aria-hidden="true">
+                  {authorInitials("agent")}
+                </span>
+                <div>
+                  <div className="issue-detail__bubble-meta">
+                    <strong>agent</strong>
+                  </div>
+                  <div className="issue-detail__bubble-text">
+                    {liveReply.text}
+                    {!liveReply.final && (
+                      <span className="issue-detail__typing" data-testid="thread-live-typing" aria-hidden="true">
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </li>
+            )}
+          </ul>
+
+          <section aria-label="Composer" className="card issue-detail__composer">
+            <label className="field">
+              Message
+              <textarea
+                data-testid="composer-text"
+                value={messageText}
+                disabled={composerDisabledReason !== null || posting}
+                onChange={(event) => setMessageText(event.target.value)}
+              />
+            </label>
+            <div className="toolbar">
+              <button
+                type="button"
+                disabled={composerDisabledReason !== null || posting || messageText.trim().length === 0}
+                onClick={() => void handleSend()}
+              >
+                Send
+              </button>
+            </div>
+            {composerDisabledReason && (
+              <p className="issue-detail__disabled-reason" role="alert">
+                {composerDisabledReason}
               </p>
             )}
-          </div>
-        )}
-
-        {!isOpen && (
-          <div className="card issue-detail__resolution" aria-label="Resolution">
-            <h2>Resolution</h2>
-            <p data-testid="resolution-decision">{decision?.decision ?? issue.resolution ?? "No decision recorded."}</p>
-            <p className="issue-detail__resolution-meta">
-              <span data-testid="resolution-kind">{humanizeEnum(issue.resolutionKind ?? issue.status)}</span>
-              {" · "}
-              <span data-testid="resolution-time">
-                <Time value={issue.resolvedAt} />
-              </span>
-            </p>
-          </div>
-        )}
-      </section>
-
-      <section aria-label="Thread">
-        <h2>Thread</h2>
-        <ul data-testid="thread" className="issue-detail__thread">
-          {messages.map((message) => (
-            <li key={message.id} data-testid="thread-message" className="issue-detail__bubble">
-              <div className="issue-detail__bubble-meta">
-                <strong>{message.authorKind}</strong> <Time value={message.createdAt} />
-              </div>
-              {message.body}
-            </li>
-          ))}
-          {liveReply && (
-            <li data-testid="thread-live-reply" data-final={liveReply.final} className="issue-detail__bubble issue-detail__bubble--live">
-              <div className="issue-detail__bubble-meta">
-                <strong>agent</strong>
-              </div>
-              {liveReply.text}
-              {!liveReply.final && " ..."}
-            </li>
-          )}
-        </ul>
-      </section>
-
-      <section aria-label="Composer" className="card issue-detail__composer">
-        <label className="field">
-          Message
-          <textarea
-            data-testid="composer-text"
-            value={messageText}
-            disabled={composerDisabledReason !== null || posting}
-            onChange={(event) => setMessageText(event.target.value)}
-          />
-        </label>
-        <div className="toolbar">
-          <button
-            type="button"
-            disabled={composerDisabledReason !== null || posting || messageText.trim().length === 0}
-            onClick={() => void handleSend()}
-          >
-            Send
-          </button>
-        </div>
-        {composerDisabledReason && (
-          <p className="issue-detail__disabled-reason" role="alert">
-            {composerDisabledReason}
-          </p>
-        )}
-        {messageError && (
-          <p className="alert alert--error" role="alert">
-            {messageError}
-          </p>
-        )}
-      </section>
+            {messageError && (
+              <p className="alert alert--error" role="alert">
+                {messageError}
+              </p>
+            )}
+          </section>
+        </aside>
+      </div>
     </main>
   );
 }

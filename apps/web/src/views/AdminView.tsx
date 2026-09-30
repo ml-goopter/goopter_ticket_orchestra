@@ -38,9 +38,9 @@ export function AdminView({ request }: AdminViewProps = {}) {
 
   return (
     <>
-      <div className="page-header">
-        <h1 className="page-header__title">Admin</h1>
-      </div>
+      <header className="topbar">
+        <h1 className="topbar__crumb-current">Admin</h1>
+      </header>
 
       <div className="tabs" role="tablist" aria-label="Admin sections">
         {TABS.map((t) => (
