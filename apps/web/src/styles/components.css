@@ -1,167 +1,300 @@
 /**
- * Component classes (U1, docs/design.md §14 layouts). Every class below is
- * shared: later view tasks (board, spec builder, issue detail, task
- * detail, admin, costs) may use these plus their own local classes in
- * their own stylesheet files, but must not invent duplicates of these.
- * Naming: BEM-ish, `.block`, `.block__part`, `.block--modifier`.
+ * Component classes (U1, docs/design.md §14 layouts; approved mockups
+ * nimbalyst-local/mockups/{board,attention-inbox,task-detail,admin}.mockup.html,
+ * UR1). Every class below is shared: later view tasks (board, spec
+ * builder, issue detail, task detail, admin, costs, login) may use these
+ * plus their own local classes in their own stylesheet files, but must
+ * not invent duplicates of these. Naming: BEM-ish, `.block`, `.block__part`,
+ * `.block--modifier`.
+ *
+ * Primitive reference (UR1 mockup primitives; search this file for the
+ * section heading in parentheses):
+ *   Status badge  (Badge)        .badge, .badge--attention|progress|success|
+ *                                 danger|neutral, .badge--dot
+ *   Buttons       (Buttons)      .btn, .btn--primary, .btn--danger,
+ *                                 .btn--small, .btn--link, .btn--disabled
+ *                                 (or native `:disabled`)
+ *   Segmented     (Segmented)    .segmented, .segmented__button,
+ *                                 .segmented__button--active, .segmented__count
+ *   Mono tag      (Tag)          .tag
+ *   Side panel    (Side panel)   .side-panel, .side-panel--left|--right,
+ *                                 .side-panel__backdrop, .side-panel__header,
+ *                                 .side-panel__title, .side-panel__close,
+ *                                 .side-panel__body, .side-panel__footer,
+ *                                 .side-panel__section, .side-panel__section-title,
+ *                                 .side-panel__count, .side-panel__empty,
+ *                                 .side-panel__list, .side-panel__item,
+ *                                 .side-panel__item-text, .side-panel__item-title,
+ *                                 .side-panel__item-meta, .side-panel__item-action
+ *   Table         (base.css)     bare `table`/`th`/`td` plus `.zebra`/`.num`
+ *                                 (styles/base.css, not this file)
+ *   Page topbar   (Topbar)       .topbar, .topbar__crumbs, .topbar__crumb-current,
+ *                                 .topbar__spacer, .topbar__actions
+ *   Page area     (Page)         .page — fills the main area right of the
+ *                                 sidebar (no max-width, no centring) and
+ *                                 keeps padding for its content. A `.topbar`
+ *                                 nested anywhere inside a `.page` (as the
+ *                                 first thing in the page's content) breaks
+ *                                 out of that padding via negative margins,
+ *                                 so it spans the main area edge to edge
+ *                                 while later content keeps the page padding.
  */
 
 /* --------------------------------------------------------------------
- * App shell: fixed top bar (brand, nav, user, attention trigger) plus the
- * page area below it. Used once, by layout/AppLayout.tsx.
+ * App shell: a left sidebar (design.md §14, UR1) plus the page area next
+ * to it. Used once, by layout/AppLayout.tsx.
  * ------------------------------------------------------------------ */
 .app-shell {
   min-height: 100vh;
+  display: flex;
+  align-items: stretch;
 }
 
-.app-shell__bar {
-  position: fixed;
-  inset: 0 0 auto 0;
-  z-index: 20;
-  height: 56px;
+.app-shell__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar {
+  flex: 0 0 var(--sidebar-width);
+  width: var(--sidebar-width);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-3) var(--space-2);
+  background: var(--color-surface);
+  border-right: 1px solid var(--color-border);
+}
+
+.sidebar__brand {
   display: flex;
   align-items: center;
-  gap: var(--space-6);
-  padding: 0 var(--space-5);
-  background: var(--color-surface);
-  border-bottom: 1px solid var(--color-border);
-}
-
-.app-shell__brand {
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2) var(--space-4);
   font-weight: 700;
   font-size: var(--font-size-md);
   color: var(--color-text);
 }
 
-.app-shell__nav {
+.sidebar__brand-mark {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: var(--radius-md);
+  background: var(--color-text);
+  color: var(--color-surface);
+  display: grid;
+  place-items: center;
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.sidebar__nav-label {
+  padding: var(--space-4) var(--space-2) var(--space-1);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  color: var(--color-text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Shared by the "Attention" row, the Board/Costs/Admin `NavLink`s, and the
+   Log out button, so a `<button>`'s native styles (base.css) and an
+   `<a>`'s (none) end up identical. */
+.sidebar__nav-item {
   display: flex;
   align-items: center;
-  gap: var(--space-4);
-  flex: 1;
-}
-
-.app-shell__nav-link {
-  color: var(--color-text-muted);
-  font-weight: 600;
-  font-size: var(--font-size-sm);
-  text-decoration: none;
-  padding: var(--space-2) 0;
-  border-bottom: 2px solid transparent;
-}
-
-.app-shell__nav-link:hover {
-  color: var(--color-text);
-}
-
-.app-shell__nav-link--active {
-  color: var(--color-text);
-  border-bottom-color: var(--color-accent);
-}
-
-.app-shell__user {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-}
-
-.app-shell__user-name {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-muted);
-}
-
-.app-shell__main {
-  padding-top: 56px;
-}
-
-/*
- * Attention trigger: an ordinary flex item in the top bar (AppLayout.tsx
- * renders `<AttentionDrawer>` between the nav and the user block), so it
- * takes its natural width and never overlaps neighbouring controls. Its
- * open drawer panel and backdrop are `position: fixed` (below), so they
- * still cover the full viewport regardless of where the trigger sits in
- * the DOM.
- */
-.attention-trigger__button {
+  justify-content: flex-start;
+  gap: var(--space-2);
+  width: 100%;
+  height: auto;
+  padding: var(--space-2);
+  border: none;
+  border-radius: var(--radius-md);
   background: none;
-  border: none;
   color: var(--color-text-muted);
+  font-family: inherit;
+  font-weight: 500;
+  font-size: var(--font-size-base);
+  text-decoration: none;
+  cursor: pointer;
 }
 
-.attention-trigger__button:hover:not(:disabled) {
-  color: var(--color-text);
+.sidebar__nav-item:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
   border: none;
 }
 
-.attention-trigger__count {
-  min-width: 18px;
-  height: 18px;
-  padding: 0 var(--space-1);
+.sidebar__nav-item--active {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
+.sidebar__nav-count {
+  margin-left: auto;
+}
+
+/* The five attention sub-rows, indented and rail-connected under the
+   "Attention" row (UR1 `.attn-sub`). */
+.sidebar__sub-nav {
+  display: flex;
+  flex-direction: column;
+  margin: var(--space-1) 0 0 var(--space-4);
+  padding-left: var(--space-2);
+  border-left: 1px solid var(--color-border);
+}
+
+.sidebar__sub-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  height: auto;
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-text-muted);
+  font-family: inherit;
+  font-size: var(--font-size-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar__sub-item:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+  border: none;
+}
+
+.sidebar__sub-item-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-faint);
+}
+
+.sidebar__foot {
+  margin-top: auto;
+  border-top: 1px solid var(--color-border);
+  padding: var(--space-3) var(--space-2) 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sidebar__user-name {
+  font-weight: 500;
+  font-size: var(--font-size-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar__logout {
+  margin-left: auto;
+  flex-shrink: 0;
 }
 
 /* --------------------------------------------------------------------
- * Drawer: slide-over panel from the right (AttentionDrawer), with a
- * backdrop. Closed state simply omits `.drawer` and `.drawer__backdrop`
- * from the DOM.
+ * Side panel (UR1): a slide-over/side-sheet primitive with a scrim.
+ * `--left` anchors the panel's own left edge to `--sidebar-width` (e.g.
+ * the attention panel, opening beside the sidebar); `--right` anchors it
+ * to the viewport's right edge (e.g. a future admin edit sheet). Closed
+ * state simply omits `.side-panel` and `.side-panel__backdrop` from the
+ * DOM.
  * ------------------------------------------------------------------ */
-.drawer__backdrop {
+.side-panel__backdrop {
   position: fixed;
   inset: 0;
   z-index: 30;
   background: rgba(15, 23, 42, 0.35);
 }
 
-.drawer {
+.side-panel {
   position: fixed;
   top: 0;
-  right: 0;
   bottom: 0;
   z-index: 31;
-  width: min(420px, 100vw);
+  width: min(440px, 100vw);
   display: flex;
   flex-direction: column;
   background: var(--color-surface);
+}
+
+.side-panel--left {
+  left: var(--sidebar-width);
+  box-shadow: 8px 0 24px rgba(15, 23, 42, 0.12);
+}
+
+.side-panel--right {
+  right: 0;
   box-shadow: var(--shadow-drawer);
 }
 
-.drawer__header {
+.side-panel__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-3);
   padding: var(--space-4) var(--space-5);
   border-bottom: 1px solid var(--color-border);
 }
 
-.drawer__title {
+.side-panel__title {
   margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   font-size: var(--font-size-lg);
 }
 
-.drawer__close {
+.side-panel__close {
   height: 28px;
   width: 28px;
   padding: 0;
 }
 
-.drawer__body {
+.side-panel__body {
   flex: 1;
   overflow-y: auto;
-  padding: var(--space-4) var(--space-5);
 }
 
-.drawer__section + .drawer__section {
-  margin-top: var(--space-5);
+.side-panel__footer {
+  flex: none;
+  padding: var(--space-2) var(--space-5);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
 }
 
-.drawer__section h2 {
-  font-size: var(--font-size-sm);
+.side-panel__section {
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.side-panel__section-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
-  color: var(--color-text-muted);
+  letter-spacing: 0.04em;
+  color: var(--color-text-faint);
   margin-bottom: var(--space-2);
 }
 
-/* Drawer item rows: no bullets, title/meta/action on one line. */
-.drawer__list {
+.side-panel__count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.side-panel__empty {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-faint);
+}
+
+/* Side panel item rows: no bullets, title/meta/action on one line. */
+.side-panel__list {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -170,7 +303,7 @@
   gap: var(--space-1);
 }
 
-.drawer__list-item {
+.side-panel__item {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -178,7 +311,7 @@
   padding: var(--space-1) 0;
 }
 
-.drawer__item-text {
+.side-panel__item-text {
   display: flex;
   align-items: baseline;
   gap: var(--space-2);
@@ -186,31 +319,225 @@
   flex: 1;
 }
 
-.drawer__item-title {
+.side-panel__item-title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.drawer__item-meta {
+.side-panel__item-meta {
   flex-shrink: 0;
   font-size: var(--font-size-xs);
   color: var(--color-text-faint);
 }
 
-.drawer__item-action {
+.side-panel__item-action {
   flex-shrink: 0;
-  height: 26px;
+}
+
+/* --------------------------------------------------------------------
+ * Buttons (UR1): a class-based primitive so an `<a>` can look like a
+ * button too (e.g. a topbar "Open spec builder" link). Additive to
+ * base.css's bare `button`/`.primary`/`.danger` element styles, which
+ * existing call sites (`className="primary"` on a native `<button>`)
+ * keep using unchanged.
+ * ------------------------------------------------------------------ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 28px;
+  padding: 0 var(--space-3);
+  font-family: inherit;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled):not(.btn--disabled) {
+  background: var(--color-surface-raised);
+}
+
+.btn:disabled,
+.btn--disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.btn--primary {
+  color: var(--color-accent-contrast);
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+.btn--primary:hover:not(:disabled):not(.btn--disabled) {
+  background: var(--color-accent-hover);
+  border-color: var(--color-accent-hover);
+}
+
+.btn--danger {
+  color: var(--color-danger);
+  border-color: var(--color-danger-bg);
+}
+
+.btn--danger:hover:not(:disabled):not(.btn--disabled) {
+  background: var(--color-danger-bg);
+}
+
+.btn--small {
+  height: 24px;
   padding: 0 var(--space-2);
   font-size: var(--font-size-xs);
 }
 
+.btn--link {
+  border-color: transparent;
+  background: transparent;
+  color: var(--color-link);
+  padding: 0 var(--space-1);
+}
+
+.btn--link.btn--danger {
+  color: var(--color-danger);
+}
+
 /* --------------------------------------------------------------------
- * Page container and header: title plus a right-aligned actions row.
+ * Segmented control (UR1): a row of toggle buttons, e.g. the task
+ * detail timeline's type filter.
+ * ------------------------------------------------------------------ */
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--color-surface);
+}
+
+.segmented__button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 26px;
+  padding: 0 var(--space-3);
+  border: none;
+  border-right: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-family: inherit;
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.segmented__button:last-child {
+  border-right: none;
+}
+
+.segmented__button--active {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.segmented__count {
+  color: var(--color-text-faint);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.segmented__button--active .segmented__count {
+  color: var(--color-accent);
+}
+
+/* --------------------------------------------------------------------
+ * Monospace tag (UR1): a small outlined chip for a runtime, branch, or
+ * command name.
+ * ------------------------------------------------------------------ */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  background: var(--color-surface);
+}
+
+/* --------------------------------------------------------------------
+ * Page topbar (UR1): a page-level header row with breadcrumbs, for a
+ * later view task to place inside its own `.page` content (not rendered
+ * by AppLayout itself, since breadcrumbs are page-specific).
+ *
+ * When used, it is the first thing rendered inside a page's content (for
+ * example `<main class="page"><main><div class="topbar">...</div>...rest
+ * of the page...</main></main>`). Its negative top/side margins cancel out
+ * `.page`'s own padding on exactly those edges, so the topbar's background
+ * and border reach the top and both sides of the main area, while its own
+ * padding keeps its inner content inset. Its positive bottom margin puts
+ * the page's top padding back below it, so the rest of the page's content
+ * still sits inset by the normal page padding. This only breaks out
+ * correctly when nothing between the topbar and `.page` adds its own
+ * padding or border (true for a bare `<main>`/`<div>` wrapper).
+ * ------------------------------------------------------------------ */
+.topbar {
+  height: 52px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0 var(--space-5);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  margin: calc(-1 * var(--space-6)) calc(-1 * var(--space-5)) var(--space-6);
+}
+
+.topbar__crumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-faint);
+  font-size: var(--font-size-sm);
+}
+
+.topbar__crumbs a {
+  color: var(--color-text-faint);
+}
+
+.topbar__crumb-current {
+  color: var(--color-text);
+  font-weight: 600;
+  font-size: var(--font-size-md);
+}
+
+.topbar__spacer {
+  flex: 1;
+}
+
+.topbar__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+/* --------------------------------------------------------------------
+ * Page container and header: fills the main area right of the sidebar
+ * (no max-width cap, no centring — the old centred/capped layout was for
+ * the removed top-header shell) and keeps padding for its content. See
+ * the `.topbar` rule above for how a page's topbar breaks out of this
+ * padding to span the main area edge to edge.
  * ------------------------------------------------------------------ */
 .page {
-  max-width: 1200px;
-  margin: 0 auto;
   padding: var(--space-6) var(--space-5);
 }
 
@@ -246,8 +573,10 @@
 }
 
 /* --------------------------------------------------------------------
- * Badge: a small status pill. `.badge--attention|progress|success|danger|
- * neutral` map to the status colour pairs in tokens.css.
+ * Badge: a small status pill, no-dot by default. `.badge--attention|
+ * progress|success|danger|neutral` map to the status colour pairs in
+ * tokens.css. `.badge--dot` (UR1) adds a leading dot in the badge's own
+ * colour, for a badge that needs the mockup's dot-plus-label treatment.
  * ------------------------------------------------------------------ */
 .badge {
   display: inline-flex;
@@ -259,6 +588,15 @@
   font-weight: 700;
   line-height: 1.4;
   white-space: nowrap;
+}
+
+.badge--dot::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: currentColor;
+  opacity: 0.7;
 }
 
 .badge--attention {

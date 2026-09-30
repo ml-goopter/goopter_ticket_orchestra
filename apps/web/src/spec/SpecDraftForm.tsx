@@ -1,6 +1,26 @@
 import type { ReactNode } from "react";
 import type { SpecContent } from "@orchestra/core";
-import { SPEC_FIELD_LABELS, SPEC_LIST_FIELDS } from "./specForm.js";
+import { SPEC_FIELD_LABELS, SPEC_LIST_FIELDS, type SpecListField } from "./specForm.js";
+
+/**
+ * Whether a list field spans the full form-grid row (`true`) or sits paired
+ * with its neighbour in a two-column row (`false`), matching the approved
+ * mockup (UR4, nimbalyst-local/mockups/spec-builder.mockup.html): scope
+ * beside out_of_scope, constraints beside dependencies, everything else
+ * full width. `.form-grid`'s row-by-row auto-placement (styles/components.css)
+ * does the pairing on its own -- two consecutive non-full fields land in the
+ * same row -- so this is the only thing that needs to change per field.
+ */
+const FULL_WIDTH_LIST_FIELD: Record<SpecListField, boolean> = {
+  scope: false,
+  out_of_scope: false,
+  requirements: true,
+  acceptance_criteria: true,
+  validation: true,
+  constraints: false,
+  dependencies: false,
+  risks: true,
+};
 
 export interface SpecDraftFormProps {
   content: SpecContent;
@@ -39,7 +59,14 @@ function FieldWrapper({
     .join(" ");
   return (
     <div className={className} data-testid={`spec-field-${name}`} data-highlighted={highlighted ? "true" : "false"}>
-      <label htmlFor={`spec-field-${name}-input`}>{label}</label>
+      <div className="spec-draft-form__field-header">
+        <label htmlFor={`spec-field-${name}-input`}>{label}</label>
+        {highlighted && (
+          <span className="badge badge--attention" data-testid={`spec-field-${name}-updated`}>
+            Updated by agent
+          </span>
+        )}
+      </div>
       {children}
     </div>
   );
@@ -79,7 +106,7 @@ export function SpecDraftForm({ content, highlightedFields, disabled, onChange }
           name={field}
           label={SPEC_FIELD_LABELS[field]}
           highlighted={highlightedFields.has(field)}
-          full
+          full={FULL_WIDTH_LIST_FIELD[field]}
         >
           <textarea
             id={`spec-field-${field}-input`}

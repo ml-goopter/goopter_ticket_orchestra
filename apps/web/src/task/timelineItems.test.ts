@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { makeTimelineEvent } from "./fixtures.js";
-import { buildTimelineItems, mergeTimelineEvents } from "./timelineItems.js";
+import { buildTimelineItems, groupTimelineItemsByDay, mergeTimelineEvents } from "./timelineItems.js";
 
 describe("mergeTimelineEvents", () => {
   it("dedupes by id and sorts ascending", () => {
@@ -396,5 +396,61 @@ describe("buildTimelineItems", () => {
     expect(items[0]!.kind).toBe("generic");
     expect(items[0]!.payload).toEqual({ execution_id: "exec-1", branch: "tsk-70" });
     expect(typeof items[0]!.payload).not.toBe("string");
+  });
+});
+
+describe("groupTimelineItemsByDay", () => {
+  /**
+   * Every timestamp and `now` below is built from local `Date` field
+   * constructors (`new Date(year, month, date, ...)`), never a fixed UTC
+   * ISO literal: the grouping is defined in terms of the viewer's local
+   * calendar day, so a test asserting it must vary with the runner's own
+   * time zone the same way the component does, rather than assuming UTC
+   * (AC11: timezone-independent).
+   */
+  it("orders items newest-first overall and within each group, and labels Today/Yesterday/an older formatted date (AC4)", () => {
+    const now = new Date(2026, 5, 15, 12, 0, 0);
+    const todayEarlier = new Date(2026, 5, 15, 9, 0, 0);
+    const todayLater = new Date(2026, 5, 15, 10, 30, 0);
+    const yesterday = new Date(2026, 5, 14, 18, 0, 0);
+    const older = new Date(2026, 5, 1, 8, 0, 0);
+
+    const events = [
+      makeTimelineEvent({ id: 1, type: "issue.created", createdAt: older.toISOString() }),
+      makeTimelineEvent({ id: 2, type: "issue.created", createdAt: yesterday.toISOString() }),
+      makeTimelineEvent({ id: 3, type: "issue.created", createdAt: todayEarlier.toISOString() }),
+      makeTimelineEvent({ id: 4, type: "issue.created", createdAt: todayLater.toISOString() }),
+    ];
+
+    const groups = groupTimelineItemsByDay(buildTimelineItems(events), now);
+
+    expect(groups.map((group) => group.label)).toEqual(["Today", "Yesterday", "Jun 1, 2026"]);
+    // Newest first within "Today": id 4 (10:30) before id 3 (09:00).
+    expect(groups[0]!.items.map((item) => item.eventId)).toEqual([4, 3]);
+    expect(groups[1]!.items.map((item) => item.eventId)).toEqual([2]);
+    expect(groups[2]!.items.map((item) => item.eventId)).toEqual([1]);
+  });
+
+  it("puts a live item appended after an older one at the top of its day group (AC4 live SSE placement)", () => {
+    const now = new Date(2026, 5, 15, 12, 0, 0);
+    const earlier = new Date(2026, 5, 15, 9, 0, 0);
+    const justArrived = new Date(2026, 5, 15, 11, 59, 0);
+
+    // Ascending by id, as `mergeTimelineEvents` always keeps the list: the
+    // live event is appended last even though both fall on "Today".
+    const events = [
+      makeTimelineEvent({ id: 1, type: "issue.created", createdAt: earlier.toISOString() }),
+      makeTimelineEvent({ id: 2, type: "issue.created", createdAt: justArrived.toISOString() }),
+    ];
+
+    const groups = groupTimelineItemsByDay(buildTimelineItems(events), now);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.label).toBe("Today");
+    expect(groups[0]!.items.map((item) => item.eventId)).toEqual([2, 1]);
+  });
+
+  it("returns no groups for an empty item list", () => {
+    expect(groupTimelineItemsByDay([])).toEqual([]);
   });
 });

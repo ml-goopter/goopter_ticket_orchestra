@@ -48,7 +48,37 @@ describe("systemPromptFor (design.md §9.2)", () => {
       expect(DELEGATION_PROTOCOL).toContain("Medium, model `sonnet`");
       expect(DELEGATION_PROTOCOL).toContain("Simple, model `haiku`");
       expect(DELEGATION_PROTOCOL).toContain("Never pass `fable`.");
-      expect(DELEGATION_PROTOCOL).toContain("At most two subagents at once.");
+      expect(DELEGATION_PROTOCOL).toContain("At most two foreground `Agent` calls in one message; wait for both results.");
+    });
+
+    it("names the Agent tool instead of Task", () => {
+      expect(DELEGATION_PROTOCOL).toContain("`Agent`");
+      expect(DELEGATION_PROTOCOL).not.toContain("`Task`");
+      expect(DELEGATION_PROTOCOL).not.toMatch(/\bTask tool\b/);
+    });
+
+    it("requires foreground subagent calls and forbids ending the turn while one runs", () => {
+      expect(DELEGATION_PROTOCOL).toContain("run_in_background");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("wait for each subagent's result before continuing");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).toContain(
+        "never end your turn while any subagent is still running",
+      );
+      expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("terminal agent-tools call");
+    });
+
+    it("requires run_in_background: false explicitly on every Agent call, since background is the tool's default", () => {
+      expect(DELEGATION_PROTOCOL).toContain("run_in_background: false");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("background by default");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).not.toContain("never set `run_in_background`");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).not.toMatch(/never set.*run_in_background/);
+    });
+
+    it("requires resumed or retried sessions to start new subagents, never message old ones", () => {
+      expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("resumed or retried session");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).toContain("new subagents");
+      expect(DELEGATION_PROTOCOL.toLowerCase()).toContain(
+        "never message, resume, or wait for a subagent from an earlier session or execution",
+      );
     });
 
     it("leaves the prompt unchanged for runtime codex or no runtime", () => {
