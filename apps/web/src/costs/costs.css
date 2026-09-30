@@ -1,0 +1,146 @@
+/**
+ * Costs-view-only styles (UR6, docs/design.md §14 "Costs" row; approved
+ * mockup nimbalyst-local/mockups/costs.mockup.html). The page topbar,
+ * segmented control, badge, alert, and empty-state classes this view sits
+ * inside (`.topbar`, `.topbar__spacer`, `.topbar__actions`, `.segmented`,
+ * `.segmented__button`, `.segmented__button--active`, `.badge`,
+ * `.badge--neutral`, `.alert`, `.alert--error`, `.empty-state`) already
+ * live in ../styles/components.css and are not duplicated here. The bare
+ * `table`/`th`/`td`/`.num` styles are ../styles/base.css's.
+ */
+
+/* Topbar title: the shared `.topbar__crumb-current` is meant to sit among
+   breadcrumb links (components.css), so it carries no margin reset of its
+   own; this view's title is a lone `<h1>` instead, which needs one so it
+   doesn't add its browser-default block margin inside the flex row. */
+.costs-topbar__title {
+  margin: 0;
+}
+
+/* Space between the topbar and the tiles/table below it. */
+.costs-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+
+.costs-toolbar__label {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+}
+
+/* A single "From"/"To" label+input pair, inline rather than base.css's
+   stacked block label so it fits in the topbar's actions row. */
+.costs-toolbar__date {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: 0;
+  font-size: inherit;
+  font-weight: inherit;
+  color: inherit;
+}
+
+.costs-toolbar__date input {
+  width: auto;
+  height: 28px;
+  border-color: var(--color-border-strong);
+}
+
+/* --------------------------------------------------------------------
+ * Totals tiles: four equal-width cards above the table (mockup `.tiles`/
+ * `.tile`), shown once one or more rows are loaded.
+ * ------------------------------------------------------------------ */
+.costs-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--space-3);
+}
+
+.costs-tile {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-4);
+}
+
+.costs-tile__label {
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  color: var(--color-text-faint);
+}
+
+.costs-tile__value {
+  font-size: var(--font-size-xl);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-top: var(--space-1);
+  letter-spacing: -0.01em;
+}
+
+.costs-tile__sub {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+  margin-top: var(--space-1);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------------
+ * Table: grouped "Tokens"/"Cost by kind" header columns (mockup `.grp`),
+ * a divider on the first column of each group (`.bl`), and a per-row cost
+ * bar sized relative to the largest row cost (`.cost`/`.bar`).
+ * ------------------------------------------------------------------ */
+.costs-table {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.costs-table table {
+  border: none;
+}
+
+.costs-table__group-header {
+  text-align: center;
+}
+
+.costs-table__bl {
+  border-left: 1px solid var(--color-border);
+}
+
+.costs-cost {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.costs-cost b {
+  font-weight: 600;
+  min-width: 60px;
+  text-align: right;
+}
+
+.costs-bar {
+  display: inline-block;
+  width: 100px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--color-surface-sunken);
+  overflow: hidden;
+}
+
+.costs-bar__fill {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+  border-radius: var(--radius-full);
+}
+
+.costs-cost__unpriced {
+  font-size: var(--font-size-xs);
+  color: var(--color-attention-fg);
+  white-space: nowrap;
+}
