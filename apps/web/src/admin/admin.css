@@ -20,30 +20,17 @@
   color: var(--color-text-muted);
 }
 
-/* Small row-action button inside a table cell (e.g. "Edit"). */
-.admin-table__action {
-  height: 26px;
-  padding: 0 var(--space-3);
-  font-size: var(--font-size-xs);
-}
-
-/* Wrapping list of badges inside a table cell, e.g. a worker's capabilities. */
+/* Wrapping list of badges/tags inside a table cell, e.g. a worker's capabilities. */
 .admin-badge-list {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-1);
 }
 
-/* Primary/secondary button row at the end of a create/edit form. */
-.admin-form__actions {
-  display: flex;
-  gap: var(--space-2);
-}
-
-/* Space between a panel's table (or its loading/empty/error state) and its
- * create/edit card below it. `overflow-x: auto` keeps a wide table
- * scrolling inside this wrapper instead of the whole page scrolling
- * horizontally at narrow widths (e.g. 768px). */
+/* Space between a panel's table (or its loading/empty/error state) and
+ * anything below it. `overflow-x: auto` keeps a wide table scrolling inside
+ * this wrapper instead of the whole page scrolling horizontally at narrow
+ * widths (e.g. 768px). */
 .admin-panel__table {
   margin-bottom: var(--space-5);
   overflow-x: auto;
@@ -62,4 +49,90 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
+}
+
+/* A cell stacking a primary value over one or more muted meta lines (UR7
+ * mockup `.stack`), e.g. a repository's name over its git URL and branch. */
+.admin-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.admin-stack__meta {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-faint);
+}
+
+/* Capacity/slots as a small used/max bar (UR7 mockup `.slots`), e.g. a
+ * worker's free vs. max concurrent slots. */
+.admin-slots {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.admin-slots__bar {
+  width: 64px;
+  height: 6px;
+  flex: none;
+  border-radius: var(--radius-full);
+  background: var(--color-surface-sunken);
+  overflow: hidden;
+}
+
+.admin-slots__bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+}
+
+/* --------------------------------------------------------------------
+ * Create/edit sheet (UR7, `AdminSheet.tsx`): dresses the shared
+ * `.side-panel--right` primitive (styles/components.css) for a form.
+ * `.side-panel__body`/`.side-panel__footer` carry no padding of their own
+ * since callers vary; a sheet's form needs both.
+ * ------------------------------------------------------------------ */
+.admin-sheet__form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.admin-sheet__body {
+  padding: var(--space-4) var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.admin-sheet__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.admin-sheet__subtitle {
+  margin-left: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: 400;
+  color: var(--color-text-faint);
+}
+
+/* Header row above a panel's table: title, an optional filter, and a
+ * primary Create button, all on one line (UR7 mockup `.pane-bar`). */
+.admin-panel__filter {
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.admin-panel__filter select {
+  width: auto;
+  height: 28px;
 }

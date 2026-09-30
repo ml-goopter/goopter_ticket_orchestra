@@ -1,7 +1,8 @@
 import type { Runtime } from "@orchestra/core";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { AdminApi, CreateRepositoryInput, PatchRepositoryInput, Project, Repository } from "../api/admin.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
+import { AdminSheet } from "./AdminSheet.js";
 import { describeApiError } from "./format.js";
 import { validateRepositoryInput, type FieldErrors } from "./validation.js";
 
@@ -81,156 +82,180 @@ interface RepositoryFieldsProps {
   projects: Project[];
 }
 
+/** Grouped into the mockup's four sections: General, Agent, Commands, Container. */
 function RepositoryFields({ form, onChange, errors, idPrefix, projects }: RepositoryFieldsProps) {
   return (
     <>
-      <div className="field">
-        <label>
-          Project
-          <select value={form.projectId} onChange={(event) => onChange({ ...form, projectId: event.target.value })}>
-            <option value="">Select a project</option>
-            {projects.map((project) => (
-              <option key={project.id} value={project.id}>
-                {project.key}
-              </option>
-            ))}
-          </select>
-        </label>
-        {errors.projectId && (
-          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-projectId`}>
-            {errors.projectId}
-          </span>
-        )}
+      <div className="side-panel__section">
+        <div className="side-panel__section-title">General</div>
+        <div className="form-grid">
+          <div className="field">
+            <label>
+              Project
+              <select value={form.projectId} onChange={(event) => onChange({ ...form, projectId: event.target.value })}>
+                <option value="">Select a project</option>
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.key}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {errors.projectId && (
+              <span className="field__error" role="alert" data-testid={`${idPrefix}-error-projectId`}>
+                {errors.projectId}
+              </span>
+            )}
+          </div>
+          <div className="field">
+            <label>
+              Name
+              <input value={form.name} onChange={(event) => onChange({ ...form, name: event.target.value })} />
+            </label>
+            {errors.name && (
+              <span className="field__error" role="alert" data-testid={`${idPrefix}-error-name`}>
+                {errors.name}
+              </span>
+            )}
+          </div>
+          <div className="field form-grid__full">
+            <label>
+              Git URL
+              <input value={form.gitUrl} onChange={(event) => onChange({ ...form, gitUrl: event.target.value })} />
+            </label>
+            {errors.gitUrl && (
+              <span className="field__error" role="alert" data-testid={`${idPrefix}-error-gitUrl`}>
+                {errors.gitUrl}
+              </span>
+            )}
+          </div>
+          <div className="field">
+            <label>
+              Default branch
+              <input
+                value={form.defaultBranch}
+                onChange={(event) => onChange({ ...form, defaultBranch: event.target.value })}
+              />
+            </label>
+            {errors.defaultBranch && (
+              <span className="field__error" role="alert" data-testid={`${idPrefix}-error-defaultBranch`}>
+                {errors.defaultBranch}
+              </span>
+            )}
+          </div>
+          <div className="field">
+            <label>
+              Max concurrent worktrees
+              <input
+                type="number"
+                value={form.maxConcurrentWorktrees}
+                onChange={(event) => onChange({ ...form, maxConcurrentWorktrees: Number(event.target.value) })}
+              />
+            </label>
+            <p className="field__help">At least 1.</p>
+            {errors.maxConcurrentWorktrees && (
+              <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxConcurrentWorktrees`}>
+                {errors.maxConcurrentWorktrees}
+              </span>
+            )}
+          </div>
+        </div>
       </div>
-      <div className="field">
-        <label>
-          Name
-          <input value={form.name} onChange={(event) => onChange({ ...form, name: event.target.value })} />
-        </label>
-        {errors.name && (
-          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-name`}>
-            {errors.name}
-          </span>
-        )}
+
+      <div className="side-panel__section">
+        <div className="side-panel__section-title">Agent</div>
+        <div className="form-grid">
+          <div className="field">
+            <label>
+              Default runtime
+              <select
+                value={form.defaultRuntime}
+                onChange={(event) => onChange({ ...form, defaultRuntime: event.target.value as Runtime })}
+              >
+                {RUNTIMES.map((runtime) => (
+                  <option key={runtime} value={runtime}>
+                    {runtime}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="field">
+            <label>
+              Default model
+              <input
+                value={nullableInputValue(form.defaultModel)}
+                onChange={(event) => onChange({ ...form, defaultModel: parseNullableInput(event.target.value) })}
+              />
+            </label>
+            <p className="field__help">Optional; overrides the repository's default model.</p>
+          </div>
+          <div className="field form-grid__full">
+            <label>
+              Required capability
+              <input
+                value={nullableInputValue(form.requiredCapability)}
+                onChange={(event) => onChange({ ...form, requiredCapability: parseNullableInput(event.target.value) })}
+              />
+            </label>
+            <p className="field__help">Optional; matches a worker's capability tags.</p>
+          </div>
+        </div>
       </div>
-      <div className="field form-grid__full">
-        <label>
-          Git URL
-          <input value={form.gitUrl} onChange={(event) => onChange({ ...form, gitUrl: event.target.value })} />
-        </label>
-        {errors.gitUrl && (
-          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-gitUrl`}>
-            {errors.gitUrl}
-          </span>
-        )}
+
+      <div className="side-panel__section">
+        <div className="side-panel__section-title">Commands</div>
+        <div className="form-grid">
+          <div className="field form-grid__full">
+            <label>
+              Setup command
+              <input
+                value={nullableInputValue(form.setupCommand)}
+                onChange={(event) => onChange({ ...form, setupCommand: parseNullableInput(event.target.value) })}
+              />
+            </label>
+            <p className="field__help">Optional; run once per fresh worktree.</p>
+          </div>
+          <div className="field form-grid__full">
+            <label>
+              Test command
+              <input
+                value={nullableInputValue(form.testCommand)}
+                onChange={(event) => onChange({ ...form, testCommand: parseNullableInput(event.target.value) })}
+              />
+            </label>
+            <p className="field__help">
+              Optional; must not contain shell metacharacters ( ) * &amp; ; | ` $ &lt; &gt; or a newline.
+            </p>
+          </div>
+        </div>
       </div>
-      <div className="field">
-        <label>
-          Default branch
-          <input
-            value={form.defaultBranch}
-            onChange={(event) => onChange({ ...form, defaultBranch: event.target.value })}
-          />
-        </label>
-        {errors.defaultBranch && (
-          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-defaultBranch`}>
-            {errors.defaultBranch}
-          </span>
-        )}
-      </div>
-      <div className="field">
-        <label>
-          Default runtime
-          <select
-            value={form.defaultRuntime}
-            onChange={(event) => onChange({ ...form, defaultRuntime: event.target.value as Runtime })}
-          >
-            {RUNTIMES.map((runtime) => (
-              <option key={runtime} value={runtime}>
-                {runtime}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-      <div className="field">
-        <label>
-          Default model
-          <input
-            value={nullableInputValue(form.defaultModel)}
-            onChange={(event) => onChange({ ...form, defaultModel: parseNullableInput(event.target.value) })}
-          />
-        </label>
-        <p className="field__help">Optional; overrides the repository's default model.</p>
-      </div>
-      <div className="field">
-        <label>
-          Max concurrent worktrees
-          <input
-            type="number"
-            value={form.maxConcurrentWorktrees}
-            onChange={(event) => onChange({ ...form, maxConcurrentWorktrees: Number(event.target.value) })}
-          />
-        </label>
-        <p className="field__help">At least 1.</p>
-        {errors.maxConcurrentWorktrees && (
-          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxConcurrentWorktrees`}>
-            {errors.maxConcurrentWorktrees}
-          </span>
-        )}
-      </div>
-      <div className="field">
-        <label>
-          Required capability
-          <input
-            value={nullableInputValue(form.requiredCapability)}
-            onChange={(event) => onChange({ ...form, requiredCapability: parseNullableInput(event.target.value) })}
-          />
-        </label>
-        <p className="field__help">Optional; matches a worker's capability tags.</p>
-      </div>
-      <div className="field">
-        <label>
-          Setup command
-          <input
-            value={nullableInputValue(form.setupCommand)}
-            onChange={(event) => onChange({ ...form, setupCommand: parseNullableInput(event.target.value) })}
-          />
-        </label>
-        <p className="field__help">Optional; run once per fresh worktree.</p>
-      </div>
-      <div className="field form-grid__full">
-        <label>
-          Test command
-          <input
-            value={nullableInputValue(form.testCommand)}
-            onChange={(event) => onChange({ ...form, testCommand: parseNullableInput(event.target.value) })}
-          />
-        </label>
-        <p className="field__help">
-          Optional; must not contain shell metacharacters ( ) * &amp; ; | ` $ &lt; &gt; or a newline.
-        </p>
-      </div>
-      <div className="field">
-        <label>
-          <input
-            type="checkbox"
-            checked={form.agentContainer}
-            onChange={(event) => onChange({ ...form, agentContainer: event.target.checked })}
-          />
-          Run agent in a container
-        </label>
-        <p className="field__help">design.md §9.9; runs this repository's agent processes in a container.</p>
-      </div>
-      <div className="field">
-        <label>
-          Agent image
-          <input
-            value={nullableInputValue(form.agentImage)}
-            onChange={(event) => onChange({ ...form, agentImage: parseNullableInput(event.target.value) })}
-          />
-        </label>
-        <p className="field__help">Optional; image override for container mode, built `FROM orchestra/agent`.</p>
+
+      <div className="side-panel__section">
+        <div className="side-panel__section-title">Container</div>
+        <div className="form-grid">
+          <div className="field form-grid__full">
+            <label>
+              <input
+                type="checkbox"
+                checked={form.agentContainer}
+                onChange={(event) => onChange({ ...form, agentContainer: event.target.checked })}
+              />
+              Run agent in a container
+            </label>
+            <p className="field__help">design.md §9.9; runs this repository's agent processes in a container.</p>
+          </div>
+          <div className="field form-grid__full">
+            <label>
+              Agent image
+              <input
+                value={nullableInputValue(form.agentImage)}
+                onChange={(event) => onChange({ ...form, agentImage: parseNullableInput(event.target.value) })}
+              />
+            </label>
+            <p className="field__help">Optional; image override for container mode, built `FROM orchestra/agent`.</p>
+          </div>
+        </div>
       </div>
     </>
   );
@@ -238,11 +263,13 @@ function RepositoryFields({ form, onChange, errors, idPrefix, projects }: Reposi
 
 /**
  * Repositories panel (design.md §14 Admin row, §12.5 `/repositories`, task
- * contract GOT.29; restyled by U5): filter by project, list every column
- * the api stores, create/edit forms for every field. `git_url` format and
- * the review role's composed-command policy on `test_command` are not
- * re-validated client-side (task contract point 2): the api's 400 renders
- * inline next to the field instead.
+ * contract GOT.29; restyled by U5, dense stacked table plus a right-hand
+ * sheet by UR7): filter by project, list every column the api stores,
+ * create/edit forms for every field, grouped into the mockup's General /
+ * Agent / Commands / Container sections. `git_url` format and the review
+ * role's composed-command policy on `test_command` are not re-validated
+ * client-side (task contract point 2): the api's 400 renders inline next
+ * to the field instead.
  */
 export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
   const { begin, isCurrent } = useLatestRequest();
@@ -251,9 +278,11 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
   const [repositories, setRepositories] = useState<Repository[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  const [createOpen, setCreateOpen] = useState(false);
   const [createForm, setCreateForm] = useState<CreateRepositoryInput>(emptyForm(""));
   const [createErrors, setCreateErrors] = useState<FieldErrors>({});
   const [createError, setCreateError] = useState<string | null>(null);
+  const createOpener = useRef<HTMLElement | null>(null);
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<CreateRepositoryInput | null>(null);
@@ -261,6 +290,7 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
   const [deleteError, setDeleteError] = useState<{ id: string; message: string } | null>(null);
   const [editErrors, setEditErrors] = useState<FieldErrors>({});
   const [editError, setEditError] = useState<string | null>(null);
+  const editOpener = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     void adminApi.listProjects().then(setProjects);
@@ -284,6 +314,18 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
     void fetchRepositories();
   }, [fetchRepositories]);
 
+  function openCreate(event: { currentTarget: HTMLElement }) {
+    createOpener.current = event.currentTarget;
+    setCreateForm(emptyForm(filterProjectId));
+    setCreateErrors({});
+    setCreateError(null);
+    setCreateOpen(true);
+  }
+
+  function closeCreate() {
+    setCreateOpen(false);
+  }
+
   async function handleCreate(event: FormEvent) {
     event.preventDefault();
     const errors = validateRepositoryInput(createForm);
@@ -292,14 +334,15 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
     if (Object.keys(errors).length > 0) return;
     try {
       await adminApi.createRepository(createForm);
-      setCreateForm(emptyForm(createForm.projectId));
+      closeCreate();
       await fetchRepositories();
     } catch (err) {
       setCreateError(describeApiError(err, "Failed to create the repository."));
     }
   }
 
-  function startEdit(repository: Repository) {
+  function startEdit(repository: Repository, event: { currentTarget: HTMLElement }) {
+    editOpener.current = event.currentTarget;
     setEditingId(repository.id);
     setEditForm(toFormValues(repository));
     setEditErrors({});
@@ -349,13 +392,15 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
     }
   }
 
+  const projectById = new Map(projects.map((project) => [project.id, project]));
+  const editingRepository = editingId ? (repositories ?? []).find((repository) => repository.id === editingId) ?? null : null;
+
   return (
     <section aria-label="Repositories">
-      <h2>Repositories</h2>
-
-      <div className="toolbar">
-        <div className="field">
-          <label>
+      <div className="page-header">
+        <h2 className="page-header__title">Repositories</h2>
+        <div className="page-header__actions">
+          <label className="admin-panel__filter">
             Filter by project
             <select value={filterProjectId} onChange={(event) => setFilterProjectId(event.target.value)}>
               <option value="">All projects</option>
@@ -366,6 +411,9 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
               ))}
             </select>
           </label>
+          <button type="button" className="primary" onClick={openCreate}>
+            Create repository
+          </button>
         </div>
       </div>
 
@@ -385,98 +433,68 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
           <table>
             <thead>
               <tr>
-                <th scope="col">Name</th>
-                <th scope="col">Git URL</th>
-                <th scope="col">Default branch</th>
+                <th scope="col">Repository</th>
+                <th scope="col">Project</th>
                 <th scope="col">Runtime</th>
-                <th scope="col">Model</th>
+                <th scope="col">Commands</th>
+                <th scope="col">Container</th>
+                <th scope="col">Capability</th>
                 <th scope="col" className="num">
                   Capacity
                 </th>
-                <th scope="col">Capability</th>
-                <th scope="col">Setup command</th>
-                <th scope="col">Test command</th>
-                <th scope="col">Container</th>
-                <th scope="col">Image</th>
                 <th scope="col">Actions</th>
               </tr>
             </thead>
             <tbody>
-              {repositories.map((repository) =>
-                editingId === repository.id && editForm ? (
+              {repositories.map((repository) => {
+                const project = projectById.get(repository.projectId);
+                return (
                   <tr key={repository.id}>
-                    <td colSpan={12}>
-                      <div className="card">
-                        <h3>Edit repository</h3>
-                        <form
-                          aria-label={`Edit ${repository.name}`}
-                          className="form-grid"
-                          onSubmit={(event) => void handleSaveEdit(event, repository)}
-                        >
-                          <RepositoryFields
-                            form={editForm}
-                            onChange={setEditForm}
-                            errors={editErrors}
-                            idPrefix="edit"
-                            projects={projects}
-                          />
-                          {editError && (
-                            <p className="alert alert--error form-grid__full" role="alert" data-testid="edit-error">
-                              {editError}
-                            </p>
-                          )}
-                          <div className="form-grid__full admin-form__actions">
-                            <button type="submit" className="primary">
-                              Save
-                            </button>
-                            <button type="button" onClick={cancelEdit}>
-                              Cancel
-                            </button>
-                          </div>
-                        </form>
+                    <td>
+                      <div className="admin-stack">
+                        <b>{repository.name}</b>
+                        <span className="admin-stack__meta admin-table__mono" title={repository.gitUrl}>
+                          {repository.gitUrl} · {repository.defaultBranch}
+                        </span>
                       </div>
                     </td>
-                  </tr>
-                ) : (
-                  <tr key={repository.id}>
-                    <td>{repository.name}</td>
+                    <td>{project?.name ?? repository.projectId}</td>
                     <td>
-                      <span className="admin-table__mono" title={repository.gitUrl}>
-                        {repository.gitUrl}
-                      </span>
+                      <div className="admin-stack">
+                        <span className="admin-table__mono">{repository.defaultRuntime}</span>
+                        <span className="admin-stack__meta">{repository.defaultModel ?? "—"}</span>
+                      </div>
                     </td>
-                    <td>{repository.defaultBranch}</td>
-                    <td>{repository.defaultRuntime}</td>
-                    <td>{repository.defaultModel ?? "—"}</td>
-                    <td className="num">{repository.maxConcurrentWorktrees}</td>
+                    <td>
+                      <div className="admin-stack">
+                        <span className="admin-table__mono" title={repository.setupCommand ?? undefined}>
+                          {repository.setupCommand ?? "—"}
+                        </span>
+                        <span className="admin-stack__meta admin-table__mono" title={repository.testCommand ?? undefined}>
+                          {repository.testCommand ?? "—"}
+                        </span>
+                      </div>
+                    </td>
+                    <td>
+                      {repository.agentContainer ? (
+                        <span className="badge badge--success">{repository.agentImage ?? "Container"}</span>
+                      ) : (
+                        <span className="admin-table__muted">Host</span>
+                      )}
+                    </td>
                     <td>{repository.requiredCapability ?? "—"}</td>
+                    <td className="num">{repository.maxConcurrentWorktrees}</td>
                     <td>
-                      {repository.setupCommand ? (
-                        <span className="admin-table__mono" title={repository.setupCommand}>
-                          {repository.setupCommand}
-                        </span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td>
-                      {repository.testCommand ? (
-                        <span className="admin-table__mono" title={repository.testCommand}>
-                          {repository.testCommand}
-                        </span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td>{repository.agentContainer ? "Yes" : "No"}</td>
-                    <td>{repository.agentImage ?? "—"}</td>
-                    <td>
-                      <button type="button" className="admin-table__action" onClick={() => startEdit(repository)}>
-                        Edit
-                      </button>{" "}
                       <button
                         type="button"
-                        className="admin-table__action"
+                        className="btn btn--link btn--small"
+                        onClick={(event) => startEdit(repository, event)}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn--link btn--small btn--danger"
                         aria-label={`Delete ${repository.name}`}
                         disabled={deletingId === repository.id}
                         onClick={() => void handleDelete(repository)}
@@ -485,11 +503,11 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
                       </button>
                     </td>
                   </tr>
-                ),
-              )}
+                );
+              })}
               {deleteError && (
                 <tr key={`${deleteError.id}-delete-error`}>
-                  <td colSpan={12}>
+                  <td colSpan={8}>
                     <p
                       className="alert alert--error"
                       role="alert"
@@ -505,22 +523,76 @@ export function RepositoriesPanel({ adminApi }: RepositoriesPanelProps) {
         )}
       </div>
 
-      <div className="card">
-        <h3>Create repository</h3>
-        <form aria-label="Create repository" className="form-grid" onSubmit={(event) => void handleCreate(event)}>
-          <RepositoryFields form={createForm} onChange={setCreateForm} errors={createErrors} idPrefix="create" projects={projects} />
-          {createError && (
-            <p className="alert alert--error form-grid__full" role="alert" data-testid="create-error">
-              {createError}
-            </p>
-          )}
-          <div className="form-grid__full admin-form__actions">
-            <button type="submit" className="primary">
-              Create repository
-            </button>
-          </div>
-        </form>
-      </div>
+      {createOpen && (
+        <AdminSheet title="Create repository" onClose={closeCreate} opener={createOpener.current}>
+          <form
+            aria-label="Create repository"
+            className="admin-sheet__form"
+            onSubmit={(event) => void handleCreate(event)}
+          >
+            <div className="side-panel__body admin-sheet__body">
+              <RepositoryFields
+                form={createForm}
+                onChange={setCreateForm}
+                errors={createErrors}
+                idPrefix="create"
+                projects={projects}
+              />
+              {createError && (
+                <p className="alert alert--error" role="alert" data-testid="create-error">
+                  {createError}
+                </p>
+              )}
+            </div>
+            <div className="side-panel__footer admin-sheet__footer">
+              <button type="button" onClick={closeCreate}>
+                Cancel
+              </button>
+              <button type="submit" className="primary">
+                Save
+              </button>
+            </div>
+          </form>
+        </AdminSheet>
+      )}
+
+      {editingRepository && editForm && (
+        <AdminSheet
+          title="Edit repository"
+          subtitle={editingRepository.name}
+          onClose={cancelEdit}
+          opener={editOpener.current}
+        >
+          <form
+            aria-label={`Edit ${editingRepository.name}`}
+            className="admin-sheet__form"
+            onSubmit={(event) => void handleSaveEdit(event, editingRepository)}
+          >
+            <div className="side-panel__body admin-sheet__body">
+              <RepositoryFields
+                form={editForm}
+                onChange={setEditForm}
+                errors={editErrors}
+                idPrefix="edit"
+                projects={projects}
+              />
+              {editError && (
+                <p className="alert alert--error" role="alert" data-testid="edit-error">
+                  {editError}
+                </p>
+              )}
+            </div>
+            <div className="side-panel__footer admin-sheet__footer">
+              <button type="button" onClick={cancelEdit}>
+                Cancel
+              </button>
+              <button type="submit" className="primary">
+                Save
+              </button>
+            </div>
+          </form>
+        </AdminSheet>
+      )}
     </section>
   );
 }
