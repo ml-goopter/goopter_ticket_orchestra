@@ -38,17 +38,30 @@ function renderCard(card: TaskCardData, highlighted = false) {
 
 describe("TaskCard", () => {
   it("puts the full summary in the title attribute for the clamped text (AC2)", () => {
-    const longSummary = "A very long summary that would otherwise overflow three clamped lines of card text.";
+    const longSummary = "A very long summary that would otherwise overflow two clamped lines of card text.";
     renderCard(makeCard({ jiraSummary: longSummary }));
     expect(screen.getByText(longSummary).getAttribute("title")).toBe(longSummary);
   });
 
-  it("renders the runtime as a neutral badge (AC2)", () => {
+  it("renders the runtime as a tag (AC3)", () => {
     renderCard(makeCard({ runtime: "claude" }));
-    const badge = screen.getByTestId("runtime-badge");
-    expect(badge.textContent).toBe("claude");
-    expect(badge.className).toContain("badge");
-    expect(badge.className).toContain("badge--neutral");
+    const tag = screen.getByTestId("runtime-tag");
+    expect(tag.textContent).toBe("claude");
+    expect(tag.className).toContain("tag");
+  });
+
+  it("puts the key and cost on the top row, and the runtime tag before the age (AC3)", () => {
+    renderCard(makeCard({ jiraKey: "ABC-1", cost: 4.5 }));
+    const card = screen.getByTestId("board-card");
+    const top = card.querySelector(".board-card__top");
+    expect(top).not.toBeNull();
+    expect(top?.contains(screen.getByRole("link", { name: "ABC-1" }))).toBe(true);
+    expect(top?.contains(screen.getByTestId("card-cost"))).toBe(true);
+
+    const meta = card.querySelector(".board-card__meta");
+    expect(meta).not.toBeNull();
+    expect(meta?.contains(screen.getByTestId("runtime-tag"))).toBe(true);
+    expect(meta?.contains(screen.getByTestId("card-age"))).toBe(true);
   });
 
   it("formats cost with formatUsd's sub-cent precision below one cent (AC2)", () => {

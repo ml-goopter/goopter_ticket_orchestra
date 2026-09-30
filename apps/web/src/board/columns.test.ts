@@ -1,7 +1,7 @@
 import { DASHBOARD_COLUMNS } from "@orchestra/core";
 import { describe, expect, it } from "vitest";
 import type { TaskCard } from "../api/types.js";
-import { BOARD_COLUMN_ORDER, groupByColumn, HIGHLIGHTED_COLUMNS } from "./columns.js";
+import { BOARD_COLUMN_ORDER, columnAccent, groupByColumn, HIGHLIGHTED_COLUMNS } from "./columns.js";
 
 function makeCard(overrides: Partial<TaskCard>): TaskCard {
   return {
@@ -39,6 +39,36 @@ describe("HIGHLIGHTED_COLUMNS", () => {
     expect(HIGHLIGHTED_COLUMNS.has("Waiting for You")).toBe(true);
     expect(HIGHLIGHTED_COLUMNS.has("Needs Human")).toBe(true);
     expect(HIGHLIGHTED_COLUMNS.size).toBe(2);
+  });
+});
+
+describe("columnAccent", () => {
+  it("is attention for the two highlighted columns (AC2)", () => {
+    expect(columnAccent("Waiting for You")).toBe("attention");
+    expect(columnAccent("Needs Human")).toBe("attention");
+  });
+
+  it("is progress for the agent-active columns (AC2)", () => {
+    expect(columnAccent("Spec In Progress")).toBe("progress");
+    expect(columnAccent("Implementing")).toBe("progress");
+    expect(columnAccent("CI")).toBe("progress");
+  });
+
+  it("is success for the merge-ready columns (AC2)", () => {
+    expect(columnAccent("Ready for Merge")).toBe("success");
+    expect(columnAccent("Done")).toBe("success");
+  });
+
+  it("is neutral for the remaining triage columns (AC2)", () => {
+    expect(columnAccent("Needs Spec")).toBe("neutral");
+    expect(columnAccent("Awaiting Spec Approval")).toBe("neutral");
+    expect(columnAccent("Ready")).toBe("neutral");
+  });
+
+  it("assigns exactly one accent per column in BOARD_COLUMN_ORDER", () => {
+    for (const column of BOARD_COLUMN_ORDER) {
+      expect(["attention", "progress", "success", "neutral"]).toContain(columnAccent(column));
+    }
   });
 });
 

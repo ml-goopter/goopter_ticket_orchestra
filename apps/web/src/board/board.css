@@ -1,28 +1,34 @@
 /**
- * Board-specific styles (U2, docs/design.md §14 "Board"). The kanban
- * container, column, and badge classes this view sits inside
- * (`.kanban`, `.kanban__column`, `.kanban__column--highlighted`,
- * `.kanban__column-header`, `.kanban__column-body`, `.badge`) already
- * live in ../styles/components.css and are not duplicated here.
+ * Board-specific styles (U2, docs/design.md §14 "Board", approved mockup
+ * UR2). The kanban container, column, badge, and page-topbar classes this
+ * view sits inside (`.kanban`, `.kanban__column`, `.kanban__column--highlighted`,
+ * `.kanban__column-header`, `.kanban__column-body`, `.badge`, `.topbar`,
+ * `.topbar__crumbs`, `.topbar__crumb-current`, `.topbar__spacer`, `.tag`)
+ * already live in ../styles/components.css and are not duplicated here.
  */
 
 /*
- * Full-bleed break-out (visual fix B1): AppLayout wraps every routed view
- * in `<main class="page">`, which centres content at max-width 1200px. The
- * kanban row needs the full viewport width instead, so ten columns (most
- * of them compact) fit without an immediate scrollbar, while the rest of
- * the page (title) stays inside the normal page width. `calc(50% - 50vw)`
- * centres this element on the viewport regardless of `.page`'s own
- * width/centring; the left/right padding then restores `.page`'s own
- * horizontal padding (--space-5) so the kanban row's content still lines
- * up with the page title above it.
+ * Full-bleed break-out (visual fix B1, UR2): AppLayout wraps every routed
+ * view in `<main class="page">`, which centres content at max-width 1200px.
+ * The topbar and kanban row both need the full viewport width instead (the
+ * mockup's topbar border spans edge to edge, and ten columns -- most of
+ * them compact -- need to fit without an immediate scrollbar). `calc(50% -
+ * 50vw)` centres this element on the viewport regardless of `.page`'s own
+ * width/centring. `.board-bleed` itself carries no horizontal padding, so
+ * `.topbar` (nested directly) uses its own built-in padding for its edge
+ * inset; `.board-bleed__content` (below) restores `.page`'s own horizontal
+ * padding (--space-5) for the error/loading text and the kanban row, so
+ * they still line up with the topbar's own text inset above them.
  */
 .board-bleed {
   width: 100vw;
   margin-left: calc(50% - 50vw);
   margin-right: calc(50% - 50vw);
-  padding-left: var(--space-5);
-  padding-right: var(--space-5);
+  box-sizing: border-box;
+}
+
+.board-bleed__content {
+  padding: var(--space-4) var(--space-5) var(--space-5);
   box-sizing: border-box;
 }
 
@@ -150,6 +156,33 @@ body:has(.board-bleed) {
   flex-shrink: 0;
 }
 
+/*
+ * Column header dot (AC2, approved mockup): a non-highlighted column shows
+ * a colour dot next to its name instead of relying on the badge alone --
+ * blue for the three agent-active columns, green for the two merge-ready
+ * ones, grey for the rest. Colour is chosen by `columnAccent()`
+ * (board/columns.ts) and passed in as a `--dot` modifier class.
+ */
+.board-column__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-border-strong);
+  flex-shrink: 0;
+}
+
+.board-column__dot--attention {
+  background: var(--color-attention-fg);
+}
+
+.board-column__dot--progress {
+  background: var(--color-progress-fg);
+}
+
+.board-column__dot--success {
+  background: var(--color-success-fg);
+}
+
 /* List of `.board-card`s inside a `.kanban__column-body`: no bullets or
    indent, so cards stack flush like `.drawer__list`. */
 .board-list {
@@ -180,7 +213,16 @@ body:has(.board-bleed) {
   border-left: 3px solid var(--color-attention-fg);
 }
 
+/* Top row (AC3): key link on the left, cost on the right. */
+.board-card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
 .board-card__key {
+  font-family: var(--font-mono);
   font-weight: 700;
   font-size: var(--font-size-sm);
 }
@@ -188,13 +230,14 @@ body:has(.board-bleed) {
 .board-card__summary {
   margin: 0;
   display: -webkit-box;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
   color: var(--color-text-muted);
   font-size: var(--font-size-sm);
 }
 
+/* Meta row (AC3): runtime tag on the left, age pushed to the right. */
 .board-card__meta {
   display: flex;
   align-items: center;
@@ -203,9 +246,13 @@ body:has(.board-bleed) {
   color: var(--color-text-faint);
 }
 
-.board-card__cost {
+.board-card__age {
   margin-left: auto;
+}
+
+.board-card__cost {
   font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
 }
 
 /* Empty column: a single compact muted line, not the bigger `.empty-state`

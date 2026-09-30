@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { createApiClient, type BoardApiClient } from "../api/client.js";
 import type { TaskCard as TaskCardData } from "../api/types.js";
 import "../board/board.css";
-import { BOARD_COLUMN_ORDER, groupByColumn, HIGHLIGHTED_COLUMNS } from "../board/columns.js";
+import { BOARD_COLUMN_ORDER, columnAccent, groupByColumn, HIGHLIGHTED_COLUMNS } from "../board/columns.js";
 import { TaskCard } from "../board/TaskCard.js";
 import { useRefetchOnReconnect } from "../board/useEventReconnect.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
@@ -75,75 +75,88 @@ export function BoardView({ client, createEventSource, now = () => new Date() }:
   return (
     <main>
       {/*
-       * Both the header and the kanban row live inside `.board-bleed`
-       * (B4): AppLayout's `.page` centres its content at max-width 1200px,
-       * so a title outside the bleed sits at a different left edge than a
-       * full-width board would. Sharing the wrapper keeps the title and
-       * the first column starting at the same x regardless of viewport
-       * width.
+       * The topbar and the kanban row both live inside `.board-bleed` (B4,
+       * UR2): AppLayout's `.page` centres its content at max-width 1200px,
+       * so either one outside the bleed would sit at a different left edge
+       * than a full-width board. Sharing the wrapper keeps the topbar's
+       * border and the first column starting at the same x regardless of
+       * viewport width.
        */}
       <div className="board-bleed">
-        <div className="page-header">
-          <h1 className="page-header__title">Board</h1>
-        </div>
-        {error && (
-          <p role="alert" className="alert alert--error">
-            {error}
-          </p>
-        )}
-        {!error && cards === null && <p>Loading...</p>}
-        {grouped && (
-          <div className="kanban">
-            {BOARD_COLUMN_ORDER.map((column) => {
-              const columnCards = grouped.get(column) ?? [];
-              const highlighted = HIGHLIGHTED_COLUMNS.has(column);
-              const populated = columnCards.length > 0;
-              // Empty, non-highlighted columns collapse to a narrow rail
-              // (header only, name rotated, no card area) so a real
-              // board's mostly-empty columns don't push the populated
-              // ones off screen (B1/B3). An empty but highlighted column
-              // stays full height but narrower than a populated one;
-              // any populated column is always full width.
-              const compact = !highlighted && !populated;
-              const highlightedEmpty = highlighted && !populated;
-              const columnClassName = [
-                "kanban__column",
-                highlighted && "kanban__column--highlighted",
-                compact && "board-column--compact",
-                highlightedEmpty && "board-column--highlighted-empty",
-              ]
-                .filter(Boolean)
-                .join(" ");
-              return (
-                <section
-                  key={column}
-                  aria-label={column}
-                  className={columnClassName}
-                  data-highlighted={highlighted}
-                  data-compact={compact}
-                >
-                  <div className="kanban__column-header">
-                    <h2>{column}</h2>
-                    <span className="badge badge--neutral">{columnCards.length}</span>
-                  </div>
-                  {!compact && (
-                    <div className="kanban__column-body">
-                      {columnCards.length === 0 ? (
-                        <p className="board-empty">No tasks.</p>
-                      ) : (
-                        <ul className="board-list">
-                          {columnCards.map((card) => (
-                            <TaskCard key={card.id} card={card} now={currentTime} highlighted={highlighted} />
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  )}
-                </section>
-              );
-            })}
+        <div className="topbar">
+          <div className="topbar__crumbs">
+            <h1 className="topbar__crumb-current">Board</h1>
+            {/* AC1: "· N tasks" from the already-loaded cards, no extra request. */}
+            {cards !== null && <span>· {cards.length} tasks</span>}
           </div>
-        )}
+          <div className="topbar__spacer" />
+        </div>
+        <div className="board-bleed__content">
+          {error && (
+            <p role="alert" className="alert alert--error">
+              {error}
+            </p>
+          )}
+          {!error && cards === null && <p>Loading...</p>}
+          {grouped && (
+            <div className="kanban">
+              {BOARD_COLUMN_ORDER.map((column) => {
+                const columnCards = grouped.get(column) ?? [];
+                const highlighted = HIGHLIGHTED_COLUMNS.has(column);
+                const populated = columnCards.length > 0;
+                // Empty, non-highlighted columns collapse to a narrow rail
+                // (header only, name rotated, no card area) so a real
+                // board's mostly-empty columns don't push the populated
+                // ones off screen (B1/B3). An empty but highlighted column
+                // stays full height but narrower than a populated one;
+                // any populated column is always full width.
+                const compact = !highlighted && !populated;
+                const highlightedEmpty = highlighted && !populated;
+                const columnClassName = [
+                  "kanban__column",
+                  highlighted && "kanban__column--highlighted",
+                  compact && "board-column--compact",
+                  highlightedEmpty && "board-column--highlighted-empty",
+                ]
+                  .filter(Boolean)
+                  .join(" ");
+                return (
+                  <section
+                    key={column}
+                    aria-label={column}
+                    className={columnClassName}
+                    data-highlighted={highlighted}
+                    data-compact={compact}
+                  >
+                    <div className="kanban__column-header">
+                      <span
+                        aria-hidden="true"
+                        className={`board-column__dot board-column__dot--${columnAccent(column)}`}
+                      />
+                      <h2>{column}</h2>
+                      <span className={highlighted ? "badge badge--attention" : "badge badge--neutral"}>
+                        {columnCards.length}
+                      </span>
+                    </div>
+                    {!compact && (
+                      <div className="kanban__column-body">
+                        {columnCards.length === 0 ? (
+                          <p className="board-empty">No tasks.</p>
+                        ) : (
+                          <ul className="board-list">
+                            {columnCards.map((card) => (
+                              <TaskCard key={card.id} card={card} now={currentTime} highlighted={highlighted} />
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
+                  </section>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
     </main>
   );
