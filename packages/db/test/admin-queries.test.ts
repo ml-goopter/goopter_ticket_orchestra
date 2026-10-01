@@ -915,7 +915,7 @@ describe("updateAdminUser (GOT.61)", () => {
     expect(disabledCount).toBe(1);
   });
 
-  it("concurrent disables of two different users succeed without deadlock when at least three are enabled (GOT.89 F1)", async () => {
+  it("two concurrent disables of different users both succeed without deadlocking when at least three users are enabled (GOT.89)", async () => {
     const idA = await insertTestUser(h.db, { email: "admu9-a@example.com" });
     const idB = await insertTestUser(h.db, { email: "admu9-b@example.com" });
     const idC = await insertTestUser(h.db, { email: "admu9-c@example.com" });
@@ -963,11 +963,17 @@ describe("updateAdminUser (GOT.61)", () => {
 
     // Both disables are now blocked behind the barrier's `FOR SHARE` locks,
     // both trying to take `FOR UPDATE` on the same overlapping row set.
-    await waitFor(async () => (await lockWaiters()) >= 2, 5000);
-
-    release();
-    await blocker;
-    await Promise.allSettled([firstTx, secondTx]);
+    //
+    // (GOT.89 F1) `release`/`blocker`/`firstTx`/`secondTx` all hold or wait
+    // on row locks, so a failure in `waitFor` (e.g. a timeout) must not skip
+    // releasing and settling them -- otherwise they stay open and the next
+    // test's `beforeEach` `delete(users)` hangs forever behind them.
+    try {
+      await waitFor(async () => (await lockWaiters()) >= 2, 5000);
+    } finally {
+      release();
+      await Promise.allSettled([blocker, firstTx, secondTx]);
+    }
 
     expect(errorA).toBeUndefined();
     expect(errorB).toBeUndefined();
@@ -1050,32 +1056,52 @@ describe("updateAdminUser (GOT.61)", () => {
       result = r;
     });
     disablePromise.catch(() => {});
-    await waitFor(async () => settled || (await lockWaiters()) >= 1, 5000);
-    expect(settled).toBe(false); // still blocked behind the barrier on idHigh
 
-    /** Whether a fresh connection can take `FOR UPDATE NOWAIT` on `id` right now. */
+    /** Postgres SQLSTATE for "a row lock is held by another session". */
+    const LOCK_NOT_AVAILABLE = "55P03";
+
+    /**
+     * Whether a fresh connection can take `FOR UPDATE NOWAIT` on `id` right
+     * now. Only a `lock_not_available` error means "row is locked"; any
+     * other error (a bad query, a dropped connection, ...) is a test-harness
+     * failure and must not be read as a passing lock assertion, so it
+     * rethrows instead of also resolving to `false`.
+     */
     async function lockableNowait(id: string): Promise<boolean> {
       try {
         await h.sql.begin(async (tx) => {
           await tx`select 1 from users where id = ${id} for update nowait`;
         });
         return true;
-      } catch {
-        return false;
+      } catch (e) {
+        const code =
+          typeof e === "object" && e !== null && "code" in e
+            ? (e as { code?: unknown }).code
+            : undefined;
+        if (code === LOCK_NOT_AVAILABLE) return false;
+        throw e;
       }
     }
 
-    // With the ordering, the blocked disable has already locked idLow and
-    // idMid on its way to idHigh: neither is available `NOWAIT` from
-    // another connection. Without it, a plain sequential scan would have
-    // blocked on idHigh immediately, having locked neither -- both would
-    // still be free, and these assertions would fail.
-    expect(await lockableNowait(idLow)).toBe(false);
-    expect(await lockableNowait(idMid)).toBe(false);
+    // (GOT.89 F1) `release`/`blocker`/`disablePromise` all hold or wait on
+    // row locks, so a failure in any assertion below must not skip
+    // releasing and settling them -- otherwise they stay open and the next
+    // test's `beforeEach` `delete(users)` hangs forever behind them.
+    try {
+      await waitFor(async () => settled || (await lockWaiters()) >= 1, 5000);
+      expect(settled).toBe(false); // still blocked behind the barrier on idHigh
 
-    release();
-    await blocker;
-    await disablePromise;
+      // With the ordering, the blocked disable has already locked idLow and
+      // idMid on its way to idHigh: neither is available `NOWAIT` from
+      // another connection. Without it, a plain sequential scan would have
+      // blocked on idHigh immediately, having locked neither -- both would
+      // still be free, and these assertions would fail.
+      expect(await lockableNowait(idLow)).toBe(false);
+      expect(await lockableNowait(idMid)).toBe(false);
+    } finally {
+      release();
+      await Promise.allSettled([blocker, disablePromise]);
+    }
 
     expect(result?.status).toBe("ok");
     const rowLow = await getAdminUserById(h.db, idLow);
