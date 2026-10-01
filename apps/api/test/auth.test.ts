@@ -1,4 +1,7 @@
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import {
+  appendEvent,
   findSessionWithUser,
   listSessionsForUser,
   sessions,
@@ -21,7 +24,9 @@ import {
   type TestDb,
   buildTestApp,
   createClock,
+  seedFixtures,
   seedSession,
+  seedTask,
   seedUser,
   sessionCookieHeader,
   startTestDb,
@@ -40,7 +45,18 @@ vi.mock("../src/lib/passwords.js", async (importOriginal) => {
   };
 });
 
+// Wraps the real `deleteSession` so the failed-logout test (AC3) can force
+// one call to reject while every other call keeps the real behaviour.
+vi.mock("@orchestra/db", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@orchestra/db")>();
+  return {
+    ...actual,
+    deleteSession: vi.fn(actual.deleteSession),
+  };
+});
+
 import { PASSWORD_HASH_OPTIONS, verifyPassword } from "../src/lib/passwords.js";
+import { deleteSession } from "@orchestra/db";
 
 function extractCookie(setCookieHeader: string | string[] | undefined): {
   raw: string;
@@ -77,6 +93,107 @@ describe("auth", () => {
     clock = createClock(new Date("2026-01-01T00:00:00Z"));
     app = await buildTestApp(testDb, clock);
     return app;
+  }
+
+  /**
+   * Builds the app and makes it listen on a real port, so a real SSE
+   * socket (not `app.inject`, which only resolves once a response ends)
+   * can be opened against it for the logout stream-closure tests below.
+   */
+  async function withListeningApp(): Promise<{
+    app: FastifyInstance;
+    baseUrl: string;
+  }> {
+    const built = await withApp();
+    await built.listen({ port: 0, host: "127.0.0.1" });
+    const { port } = built.server.address() as AddressInfo;
+    return { app: built, baseUrl: `http://127.0.0.1:${port}` };
+  }
+
+  interface SseFrame {
+    id?: string;
+    event?: string;
+    data?: string;
+  }
+
+  interface SseStreamClient {
+    status: number;
+    ended: boolean;
+    frames: SseFrame[];
+    close(): void;
+  }
+
+  /**
+   * A minimal real SSE client over `node:http`, mirroring stream.test.ts's
+   * `openStream`: reads frames off a real socket so "the stream ended" and
+   * "the stream received this event" are observed, not simulated.
+   */
+  function openSseStream(
+    baseUrl: string,
+    path: string,
+    cookie: string,
+  ): Promise<SseStreamClient> {
+    return new Promise((resolve, reject) => {
+      const req = http.get(
+        `${baseUrl}${path}`,
+        { headers: { cookie } },
+        (res) => {
+          const client: SseStreamClient = {
+            status: res.statusCode ?? 0,
+            ended: false,
+            frames: [],
+            close() {
+              req.destroy();
+            },
+          };
+          let buffer = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk: string) => {
+            buffer += chunk;
+            let split = buffer.indexOf("\n\n");
+            while (split !== -1) {
+              const block = buffer.slice(0, split);
+              buffer = buffer.slice(split + 2);
+              if (!block.startsWith(":")) {
+                const frame: SseFrame = {};
+                for (const line of block.split("\n")) {
+                  const colon = line.indexOf(":");
+                  if (colon === -1) continue;
+                  const field = line.slice(0, colon);
+                  const value = line.slice(colon + 1).replace(/^ /, "");
+                  if (field === "id" || field === "event" || field === "data") {
+                    frame[field] = value;
+                  }
+                }
+                client.frames.push(frame);
+              }
+              split = buffer.indexOf("\n\n");
+            }
+          });
+          res.on("end", () => {
+            client.ended = true;
+          });
+          res.on("close", () => {
+            client.ended = true;
+          });
+          resolve(client);
+        },
+      );
+      req.on("error", (err) => {
+        if ((err as NodeJS.ErrnoException).code !== "ECONNRESET") reject(err);
+      });
+    });
+  }
+
+  async function waitFor(
+    check: () => boolean | Promise<boolean>,
+    timeoutMs = 10000,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await check())) {
+      if (Date.now() > deadline) throw new Error("waitFor timed out");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
   }
 
   it("GET /api/health returns 200 without a cookie", async () => {
@@ -458,106 +575,180 @@ describe("auth", () => {
     });
   });
 
-  describe("logout stream closure (AC1, AC3)", () => {
-    it("calls closeSessionStreams with the session ID after successful logout (AC1)", async () => {
-      const app = await withApp();
-      const closeSessionStreamsSpy = vi.spyOn(app.realtime, "closeSessionStreams");
-
+  describe("logout stream closure (GOT.88)", () => {
+    it("ends a real task stream and a real global stream opened with the logged-out session (AC1)", async () => {
+      const { app, baseUrl } = await withListeningApp();
       const user = await seedUser(testDb.db, {
-        email: "stream-user@example.com",
+        email: "stream-close@example.com",
+        password: "correct horse battery",
+      });
+      const fixtures = await seedFixtures(testDb.db, "SA1");
+      const taskId = await seedTask(testDb.db, fixtures, {
+        jiraKey: "SA1-1",
+        state: "IMPLEMENTING",
+      });
+
+      const loginRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "stream-close@example.com", password: "correct horse battery" },
+      });
+      const cookie = extractCookie(loginRes.headers["set-cookie"]).raw;
+
+      const taskStream = await openSseStream(
+        baseUrl,
+        `/api/tasks/${taskId}/stream`,
+        cookie,
+      );
+      const globalStream = await openSseStream(baseUrl, "/api/stream", cookie);
+      try {
+        expect(taskStream.status).toBe(200);
+        expect(globalStream.status).toBe(200);
+        expect(taskStream.ended).toBe(false);
+        expect(globalStream.ended).toBe(false);
+
+        const logoutRes = await app.inject({
+          method: "POST",
+          url: "/api/auth/logout",
+          headers: { cookie },
+        });
+        expect(logoutRes.statusCode).toBe(200);
+
+        await waitFor(() => taskStream.ended && globalStream.ended);
+      } finally {
+        taskStream.close();
+        globalStream.close();
+      }
+    });
+
+    it("keeps another session of the same user and another user's session open, still delivering a later event (AC2)", async () => {
+      const { app, baseUrl } = await withListeningApp();
+      await seedUser(testDb.db, {
+        email: "stream-a@example.com",
+        password: "correct horse battery",
+      });
+      await seedUser(testDb.db, {
+        email: "stream-b@example.com",
+        password: "correct horse battery",
+      });
+      const fixtures = await seedFixtures(testDb.db, "SA2");
+      const taskId = await seedTask(testDb.db, fixtures, {
+        jiraKey: "SA2-1",
+        state: "IMPLEMENTING",
+      });
+
+      const loginA1 = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "stream-a@example.com", password: "correct horse battery" },
+      });
+      const cookieA1 = extractCookie(loginA1.headers["set-cookie"]).raw;
+
+      const loginA2 = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "stream-a@example.com", password: "correct horse battery" },
+      });
+      const cookieA2 = extractCookie(loginA2.headers["set-cookie"]).raw;
+
+      const loginB = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "stream-b@example.com", password: "correct horse battery" },
+      });
+      const cookieB = extractCookie(loginB.headers["set-cookie"]).raw;
+
+      const streamA1 = await openSseStream(baseUrl, "/api/stream", cookieA1);
+      const streamA2 = await openSseStream(baseUrl, "/api/stream", cookieA2);
+      const streamB = await openSseStream(baseUrl, "/api/stream", cookieB);
+      try {
+        expect([streamA1.status, streamA2.status, streamB.status]).toEqual([
+          200, 200, 200,
+        ]);
+
+        const logoutRes = await app.inject({
+          method: "POST",
+          url: "/api/auth/logout",
+          headers: { cookie: cookieA1 },
+        });
+        expect(logoutRes.statusCode).toBe(200);
+
+        await waitFor(() => streamA1.ended);
+
+        // Give the hub a beat to prove A2 and B were left alone, not just
+        // not-yet-closed.
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(streamA2.ended).toBe(false);
+        expect(streamB.ended).toBe(false);
+
+        const framesBeforeA2 = streamA2.frames.length;
+        const framesBeforeB = streamB.frames.length;
+
+        await testDb.db.transaction((tx) =>
+          appendEvent(tx, {
+            taskId,
+            type: "task.state_changed",
+            payload: { to: "IMPLEMENTING" },
+          }),
+        );
+
+        await waitFor(
+          () =>
+            streamA2.frames.length > framesBeforeA2 &&
+            streamB.frames.length > framesBeforeB,
+        );
+      } finally {
+        streamA1.close();
+        streamA2.close();
+        streamB.close();
+      }
+    });
+
+    it("fails the request, leaves the session row, and does not close the open stream when deleteSession fails (AC3)", async () => {
+      const { app, baseUrl } = await withListeningApp();
+      const closeSessionStreamsSpy = vi.spyOn(app.realtime, "closeSessionStreams");
+      const user = await seedUser(testDb.db, {
+        email: "stream-fail@example.com",
         password: "correct horse battery",
       });
 
       const loginRes = await app.inject({
         method: "POST",
         url: "/api/auth/login",
-        payload: { email: "stream-user@example.com", password: "correct horse battery" },
+        payload: { email: "stream-fail@example.com", password: "correct horse battery" },
       });
-      expect(loginRes.statusCode).toBe(200);
-      const cookie = extractCookie(loginRes.headers["set-cookie"]);
+      const cookie = extractCookie(loginRes.headers["set-cookie"]).raw;
 
-      const sessions = await listSessionsForUser(testDb.db, user.id);
-      expect(sessions).toHaveLength(1);
-      const sessionId = sessions[0]!.id;
+      const sessionsBefore = await listSessionsForUser(testDb.db, user.id);
+      expect(sessionsBefore).toHaveLength(1);
+      const sessionId = sessionsBefore[0]!.id;
 
-      closeSessionStreamsSpy.mockClear();
+      const stream = await openSseStream(baseUrl, "/api/stream", cookie);
+      try {
+        expect(stream.status).toBe(200);
 
-      const logoutRes = await app.inject({
-        method: "POST",
-        url: "/api/auth/logout",
-        headers: { cookie: cookie.raw },
-      });
-      expect(logoutRes.statusCode).toBe(200);
+        vi.mocked(deleteSession).mockImplementationOnce(() =>
+          Promise.reject(new Error("forced db failure")),
+        );
 
-      // Verify closeSessionStreams was called with the session ID
-      expect(closeSessionStreamsSpy).toHaveBeenCalledWith(sessionId);
+        const logoutRes = await app.inject({
+          method: "POST",
+          url: "/api/auth/logout",
+          headers: { cookie },
+        });
+        expect(logoutRes.statusCode).toBe(500);
 
-      // Verify the session is actually deleted
-      const sessionsAfter = await listSessionsForUser(testDb.db, user.id);
-      expect(sessionsAfter).toHaveLength(0);
-    });
+        const sessionsAfter = await listSessionsForUser(testDb.db, user.id);
+        expect(sessionsAfter).toHaveLength(1);
+        expect(sessionsAfter[0]!.id).toBe(sessionId);
 
-    it("does not call closeSessionStreams on failed logout (AC2)", async () => {
-      const app = await withApp();
-      const closeSessionStreamsSpy = vi.spyOn(app.realtime, "closeSessionStreams");
+        expect(closeSessionStreamsSpy).not.toHaveBeenCalled();
 
-      // Call logout without a session
-      const logoutRes = await app.inject({
-        method: "POST",
-        url: "/api/auth/logout",
-      });
-      expect(logoutRes.statusCode).toBe(401);
-
-      // Verify closeSessionStreams was NOT called
-      expect(closeSessionStreamsSpy).not.toHaveBeenCalled();
-    });
-
-    it("keeps sessions and streams from other users open when one user logs out (AC3)", async () => {
-      const app = await withApp();
-      const user1 = await seedUser(testDb.db, {
-        email: "stream-user-1@example.com",
-        password: "correct horse battery",
-      });
-      const user2 = await seedUser(testDb.db, {
-        email: "stream-user-2@example.com",
-        password: "correct horse battery",
-      });
-
-      const loginRes1 = await app.inject({
-        method: "POST",
-        url: "/api/auth/login",
-        payload: { email: "stream-user-1@example.com", password: "correct horse battery" },
-      });
-      const cookie1 = extractCookie(loginRes1.headers["set-cookie"]);
-
-      const loginRes2 = await app.inject({
-        method: "POST",
-        url: "/api/auth/login",
-        payload: { email: "stream-user-2@example.com", password: "correct horse battery" },
-      });
-      const cookie2 = extractCookie(loginRes2.headers["set-cookie"]);
-
-      // Both sessions exist
-      const sessions1Before = await listSessionsForUser(testDb.db, user1.id);
-      const sessions2Before = await listSessionsForUser(testDb.db, user2.id);
-      expect(sessions1Before).toHaveLength(1);
-      expect(sessions2Before).toHaveLength(1);
-
-      // Logout user 1
-      const logoutRes = await app.inject({
-        method: "POST",
-        url: "/api/auth/logout",
-        headers: { cookie: cookie1.raw },
-      });
-      expect(logoutRes.statusCode).toBe(200);
-
-      // Verify session 1 is deleted
-      const sessions1After = await listSessionsForUser(testDb.db, user1.id);
-      expect(sessions1After).toHaveLength(0);
-
-      // Verify session 2 still exists
-      const sessions2After = await listSessionsForUser(testDb.db, user2.id);
-      expect(sessions2After).toHaveLength(1);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(stream.ended).toBe(false);
+      } finally {
+        stream.close();
+      }
     });
   });
 });
