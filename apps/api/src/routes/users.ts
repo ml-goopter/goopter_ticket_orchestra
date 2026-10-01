@@ -1,5 +1,6 @@
 import {
   getAdminUserById,
+  isUuid,
   listAdminUsers,
   updateAdminUser,
   type AdminUserRow,
@@ -47,6 +48,20 @@ function toResponse(row: AdminUserRow) {
 
 function notFound(id: string): AppError {
   return new AppError(404, "NOT_FOUND", `user not found: ${id}`);
+}
+
+/**
+ * Postgres matches `uuid` columns case-insensitively, but the self-disable
+ * check and `updateAdminUser`'s enabled-row lookup both compare ids as
+ * plain strings (GOT.89 F2). Validating and lowercasing here, before either
+ * comparison, makes an uppercase id behave exactly like its lowercase form
+ * everywhere downstream.
+ */
+function parseId(id: string): string {
+  if (!isUuid(id)) {
+    throw new AppError(400, "VALIDATION_ERROR", "id must be a uuid");
+  }
+  return id.toLowerCase();
 }
 
 /**
@@ -99,7 +114,8 @@ export default async function usersRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) {
       throw new AppError(400, "VALIDATION_ERROR", validationMessage(parsed.error));
     }
-    if (parsed.data.disabled === true && request.params.id === request.user!.id) {
+    const id = parseId(request.params.id);
+    if (parsed.data.disabled === true && id === request.user!.id) {
       throw new AppError(
         409,
         "CANNOT_DISABLE_SELF",
@@ -108,7 +124,7 @@ export default async function usersRoutes(app: FastifyInstance): Promise<void> {
     }
     const result = await updateAdminUser(
       app.db,
-      request.params.id,
+      id,
       {
         ...(parsed.data.display_name !== undefined
           ? { displayName: parsed.data.display_name }
@@ -119,7 +135,7 @@ export default async function usersRoutes(app: FastifyInstance): Promise<void> {
       },
       app.now(),
     );
-    if (result.status === "not_found") throw notFound(request.params.id);
+    if (result.status === "not_found") throw notFound(id);
     if (result.status === "last_enabled_user") {
       throw new AppError(
         409,
@@ -130,7 +146,7 @@ export default async function usersRoutes(app: FastifyInstance): Promise<void> {
     if (parsed.data.disabled === true) {
       // The disable has committed; end the user's open SSE streams now,
       // since stream auth only runs when a stream opens (GOT.61 F2).
-      app.realtime.closeUserStreams(request.params.id);
+      app.realtime.closeUserStreams(id);
     }
     return toResponse(result.row);
   });
