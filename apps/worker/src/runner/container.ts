@@ -19,7 +19,7 @@ import { DockerError, type ContainerManager } from "../containers/index.js";
 /** The `ContainerManager` methods the runner uses. Tests inject a fake. */
 export type RunnerContainerOps = Pick<
   ContainerManager,
-  "ensure" | "remove" | "runShell" | "spawner" | "agentHome"
+  "ensure" | "remove" | "removeIf" | "runShell" | "spawner" | "agentHome"
 >;
 
 /** Long-lived credentials a container may receive (§9.9 Environment). */

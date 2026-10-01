@@ -975,6 +975,67 @@ describe("the per-execution container lock and ensure mark (§6.6, §9.9 Recreat
     });
     expect(ensureMark(id)).toBeGreaterThan(0);
   });
+
+  it("removeIf removes and clears the mark when the check passes under the lock (GOT.99)", async () => {
+    const id = exec(++n);
+    const docker = fakeDocker(freshHost());
+    const m = manager(docker.run);
+    await m.ensure(ensureInput({ executionId: id }));
+    expect(ensureMark(id)).toBeGreaterThan(0);
+
+    await expect(m.removeIf(id, async () => true)).resolves.toBe(true);
+    expect(docker.calls.at(-1)!.args).toEqual(["rm", "-f", "-v", `orchestra-exec-${id}`]);
+    expect(ensureMark(id)).toBe(0);
+  });
+
+  it("removeIf keeps the container and its mark when the check fails (GOT.99)", async () => {
+    const id = exec(++n);
+    const docker = fakeDocker(freshHost());
+    const m = manager(docker.run);
+    await m.ensure(ensureInput({ executionId: id }));
+    const mark = ensureMark(id);
+    const before = docker.calls.length;
+
+    await expect(m.removeIf(id, async () => false)).resolves.toBe(false);
+    expect(docker.calls).toHaveLength(before);
+    expect(ensureMark(id)).toBe(mark);
+  });
+
+  it("removeIf waits for an ensure holding the lock and checks only after it, seeing its new mark (GOT.99)", async () => {
+    const id = exec(++n);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let inspecting!: () => void;
+    const inInspect = new Promise<void>((resolve) => (inspecting = resolve));
+    let gated = true;
+    const docker = fakeDocker(freshHost());
+    const run: DockerRunner = async (args, options) => {
+      if (gated && args[0] === "container" && args[1] === "inspect") {
+        gated = false;
+        inspecting();
+        await gate;
+      }
+      return docker.run(args, options);
+    };
+    const m = manager(run);
+    const markBefore = ensureMark(id);
+
+    const ensured = m.ensure(ensureInput({ executionId: id }));
+    await inInspect;
+    let checkedWithMark: number | undefined;
+    const removal = m.removeIf(id, async () => {
+      checkedWithMark = ensureMark(id);
+      return checkedWithMark === markBefore;
+    });
+    for (let i = 0; i < 5; i++) await flush();
+    expect(checkedWithMark).toBeUndefined();
+
+    release();
+    await ensured;
+    await expect(removal).resolves.toBe(false);
+    expect(checkedWithMark).toBeGreaterThan(markBefore);
+    expect(docker.verbs()).not.toContain("rm -f");
+  });
 });
 
 describe("ContainerManager.spawner (design.md §9.9 Launching processes)", () => {
