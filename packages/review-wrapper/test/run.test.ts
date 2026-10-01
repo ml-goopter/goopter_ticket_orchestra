@@ -65,6 +65,8 @@ async function run(
     adapter?: FakeAdapter;
     env?: Record<string, string | undefined>;
     cwd?: string;
+    /** Defaults to a path that does not exist, so the host's own file is never read. */
+    claudeAuthFile?: string;
   } = {},
 ): Promise<Run> {
   const adapter =
@@ -92,6 +94,8 @@ async function run(
       adapterCreated = true;
       return adapter;
     },
+    claudeAuthFile:
+      options.claudeAuthFile ?? path.join(repo.dir, "no-such-dir", "claude-auth"),
   };
   const code = await runReview(deps);
   return { code, stdout, stderr, adapter, adapterCreated, reads };
@@ -251,6 +255,129 @@ describe("session request", () => {
     } finally {
       await nullCommand.cleanup();
     }
+  });
+});
+
+describe("Claude credential file (design.md §9.9 Auth)", () => {
+  const FILE_OAUTH = "dummy-file-oauth-SENTINEL";
+  const FILE_KEY = "dummy-file-apikey-SENTINEL";
+  const ENV_OAUTH = "dummy-env-oauth-SENTINEL";
+  const ENV_KEY = "dummy-env-apikey-SENTINEL";
+
+  const baseEnv = () => ({
+    ORCHESTRA_URL: tools.url,
+    ORCHESTRA_TOKEN: TOKEN,
+    PATH: process.env.PATH,
+  });
+
+  async function authFile(content: string, mode = 0o600): Promise<string> {
+    const file = path.join(repo.dir, "..", `${path.basename(repo.dir)}-claude-auth`);
+    await fs.writeFile(file, content, { mode });
+    return file;
+  }
+
+  afterEach(async () => {
+    await fs.rm(path.join(repo.dir, "..", `${path.basename(repo.dir)}-claude-auth`), {
+      force: true,
+    });
+  });
+
+  function expectNoLeak(result: Run, ...values: string[]): void {
+    for (const value of values) {
+      expect(result.stdout).not.toContain(value);
+      expect(result.stderr).not.toContain(value);
+    }
+  }
+
+  it("adds CLAUDE_CODE_OAUTH_TOKEN from the file when the env has no credential", async () => {
+    const file = await authFile(`CLAUDE_CODE_OAUTH_TOKEN=${FILE_OAUTH}\n`);
+    const result = await run({ env: baseEnv(), claudeAuthFile: file });
+
+    expect(result.code).toBe(1);
+    const env = result.adapter.starts[0]!.env;
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(FILE_OAUTH);
+    expect("ANTHROPIC_API_KEY" in env).toBe(false);
+    expect("ORCHESTRA_TOKEN" in env).toBe(false);
+    expectNoLeak(result, FILE_OAUTH);
+  });
+
+  it("adds ANTHROPIC_API_KEY from the file when the env has no credential", async () => {
+    const file = await authFile(`ANTHROPIC_API_KEY=${FILE_KEY}\n`);
+    const result = await run({ env: baseEnv(), claudeAuthFile: file });
+
+    expect(result.code).toBe(1);
+    const env = result.adapter.starts[0]!.env;
+    expect(env.ANTHROPIC_API_KEY).toBe(FILE_KEY);
+    expect("CLAUDE_CODE_OAUTH_TOKEN" in env).toBe(false);
+    expectNoLeak(result, FILE_KEY);
+  });
+
+  it.each([
+    ["CLAUDE_CODE_OAUTH_TOKEN", ENV_OAUTH],
+    ["ANTHROPIC_API_KEY", ENV_KEY],
+  ])("a %s already in the env wins over the file", async (name, value) => {
+    const file = await authFile(`CLAUDE_CODE_OAUTH_TOKEN=${FILE_OAUTH}\n`);
+    const result = await run({ env: { ...baseEnv(), [name]: value }, claudeAuthFile: file });
+
+    expect(result.code).toBe(1);
+    const env = result.adapter.starts[0]!.env;
+    expect(env[name]).toBe(value);
+    expect(Object.values(env)).not.toContain(FILE_OAUTH);
+    expectNoLeak(result, FILE_OAUTH, value);
+  });
+
+  it("an env credential wins even over a malformed file", async () => {
+    const file = await authFile("garbage-SENTINEL\n");
+    const result = await run({
+      env: { ...baseEnv(), CLAUDE_CODE_OAUTH_TOKEN: ENV_OAUTH },
+      claudeAuthFile: file,
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.adapter.starts[0]!.env.CLAUDE_CODE_OAUTH_TOKEN).toBe(ENV_OAUTH);
+    expectNoLeak(result, ENV_OAUTH);
+  });
+
+  it("a missing file leaves the env unchanged (host mode keeps the keychain)", async () => {
+    const result = await run({
+      env: baseEnv(),
+      claudeAuthFile: path.join(repo.dir, "absent", "claude-auth"),
+    });
+
+    expect(result.code).toBe(1);
+    const env = result.adapter.starts[0]!.env;
+    expect("CLAUDE_CODE_OAUTH_TOKEN" in env).toBe(false);
+    expect("ANTHROPIC_API_KEY" in env).toBe(false);
+    expect(result.stderr).toBe("");
+  });
+
+  it.each([
+    ["an unknown name", `GITHUB_TOKEN=${FILE_OAUTH}\n`],
+    ["two lines", `CLAUDE_CODE_OAUTH_TOKEN=${FILE_OAUTH}\nANTHROPIC_API_KEY=${FILE_KEY}\n`],
+    ["no =", `${FILE_OAUTH}\n`],
+    ["an empty value", "CLAUDE_CODE_OAUTH_TOKEN=\n"],
+    ["an empty file", ""],
+  ])("a file with %s exits 3 without starting a session or echoing the file", async (_label, content) => {
+    const file = await authFile(content);
+    const result = await run({ env: baseEnv(), claudeAuthFile: file });
+
+    expect(result.code).toBe(3);
+    expect(result.adapterCreated).toBe(false);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toMatch(/^orchestra-review: .*claude-auth.* malformed/);
+    expectNoLeak(result, FILE_OAUTH, FILE_KEY, "GITHUB_TOKEN");
+    expect(tools.calls).toEqual([]);
+  });
+
+  it("an unreadable file exits 3 without starting a session", async () => {
+    if (process.getuid?.() === 0) return; // root reads a 0000 file
+    const file = await authFile(`CLAUDE_CODE_OAUTH_TOKEN=${FILE_OAUTH}\n`, 0o000);
+    const result = await run({ env: baseEnv(), claudeAuthFile: file });
+
+    expect(result.code).toBe(3);
+    expect(result.adapterCreated).toBe(false);
+    expect(result.stderr).toMatch(/^orchestra-review: cannot read .*claude-auth/);
+    expectNoLeak(result, FILE_OAUTH);
   });
 });
 

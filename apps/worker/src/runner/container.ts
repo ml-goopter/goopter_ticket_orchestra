@@ -77,6 +77,8 @@ export function agentImageFor(ctx: RunnerContext): string | null {
  * `ContainerManager.ensure`. Nothing else from the worker enters: no
  * `DATABASE_URL`, no Jira credentials. `HOME` is set by the manager, `PATH`
  * is the image's, and `ORCHESTRA_TOKEN` travels with each turn's exec.
+ * `ensure` also writes the Claude credential chosen here into the
+ * container's credential file (§9.9 Auth), so the two always agree.
  */
 export function containerEnv(
   ctx: RunnerContext,
