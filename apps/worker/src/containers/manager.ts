@@ -488,6 +488,34 @@ export class ContainerManager {
     });
   }
 
+  /**
+   * Removes the execution's container only when `removable` resolves true,
+   * run while holding its container lock, so an `ensure` in progress
+   * finishes first and one arriving later waits, then recreates the
+   * container. Clears the ensure mark on removal, even when docker fails.
+   * `removable` must take no row lock. True when removed; succeeds when the
+   * container is already gone.
+   */
+  removeIf(executionId: string, removable: () => Promise<boolean>): Promise<boolean> {
+    return withExecutionContainerLock(executionId, async () => {
+      if (!(await removable())) return false;
+      try {
+        await this.#ops.removeForExecution(executionId);
+      } finally {
+        forgetEnsure(executionId);
+      }
+      return true;
+    });
+  }
+
+  /**
+   * This deployment's agent containers: labelled `orchestra.execution` and
+   * carrying its `orchestra.owner` (§9.9 Orphans). Takes no lock.
+   */
+  list(): Promise<LabelledContainer[]> {
+    return this.#ops.list();
+  }
+
   /** Creates the bridge network when it does not exist. */
   async ensureNetwork(): Promise<void> {
     const inspect = ["network", "inspect", "--format", "{{.Name}}", this.#network];
