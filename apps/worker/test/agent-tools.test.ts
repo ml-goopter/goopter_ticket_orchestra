@@ -2448,6 +2448,55 @@ describe("propose_spec", () => {
     expect((result as { message: string }).message).toMatch(/orchestra/);
     expect((result as { message: string }).message).toMatch(/locked/i);
   });
+
+  // GOT.90/GOT.100: `dependencies` may only hold Jira issue keys (coordinator
+  // D1). `propose_spec`'s `run()` rejects a prose entry before any write
+  // (`InvalidDependenciesError`, apps/worker/src/agent-tools/tool.ts), and
+  // `invoke.ts`'s `classify()` maps it to the dedicated `INVALID_DEPENDENCIES`
+  // tool error code, the same way `RepositoryLockedError` is wired.
+  describe("GOT.90/GOT.100: dependencies must be Jira keys", () => {
+    it("T1-GOT.90+GOT.100-fix1: returns INVALID_DEPENDENCIES naming the offending entries, and writes no draft revision", async () => {
+      const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+      const before = await snapshot(s);
+
+      const result = await call(s.token, "propose_spec", {
+        ...specContent("bad deps"),
+        dependencies: ["None - self-contained change within the sandbox repository", "JIRA-1"],
+      });
+
+      expect(result).toMatchObject({ isError: true, code: "INVALID_DEPENDENCIES" });
+      expect((result as { message: string }).message).toMatch(
+        /None - self-contained change within the sandbox repository/,
+      );
+      expect((result as { message: string }).message).not.toMatch(/JIRA-1/);
+      expect((result as { message: string }).message).toMatch(
+        /dependencies must hold only Jira issue keys/,
+      );
+      expect((result as { message: string }).message).toMatch(/empty when none/);
+      expect((result as { message: string }).message).toMatch(/risks or a raised issue/);
+
+      const revisions = await db.query.specificationRevisions.findMany({
+        where: (t, { eq }) => eq(t.taskId, s.taskId),
+      });
+      expect(revisions).toHaveLength(0);
+
+      const after = await snapshot(s);
+      expect({ ...after, events: before.events, leaseExpiresAt: 0 }).toEqual({
+        ...before,
+        leaseExpiresAt: 0,
+      });
+    });
+
+    it("accepts an empty dependencies list and valid Jira keys", async () => {
+      const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+      expectOk(
+        await call(s.token, "propose_spec", {
+          ...specContent("good deps"),
+          dependencies: ["JIRA-1", "SPC-42"],
+        }),
+      );
+    });
+  });
 });
 
 // ================================================================= AC3
