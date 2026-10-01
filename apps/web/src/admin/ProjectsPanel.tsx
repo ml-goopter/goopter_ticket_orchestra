@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { AdminApi, CreateProjectInput, PatchProjectInput, Project } from "../api/admin.js";
 import { useLatestRequest } from "../board/useLatestRequest.js";
+import { AdminSheet } from "./AdminSheet.js";
 import { describeApiError } from "./format.js";
 import { validateProjectInput, type FieldErrors } from "./validation.js";
 
@@ -102,6 +103,38 @@ function ProjectFields({ form, onChange, errors, idPrefix }: ProjectFieldsProps)
       </div>
       <div className="field">
         <label>
+          Max review rounds
+          <input
+            type="number"
+            value={form.maxReviewRounds}
+            onChange={(event) => onChange({ ...form, maxReviewRounds: Number(event.target.value) })}
+          />
+        </label>
+        <p className="field__help">Non-negative integer.</p>
+        {errors.maxReviewRounds && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxReviewRounds`}>
+            {errors.maxReviewRounds}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label>
+          Max CI rounds
+          <input
+            type="number"
+            value={form.maxCiRounds}
+            onChange={(event) => onChange({ ...form, maxCiRounds: Number(event.target.value) })}
+          />
+        </label>
+        <p className="field__help">Non-negative integer.</p>
+        {errors.maxCiRounds && (
+          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxCiRounds`}>
+            {errors.maxCiRounds}
+          </span>
+        )}
+      </div>
+      <div className="field">
+        <label>
           Max infra retries
           <input
             type="number"
@@ -134,38 +167,6 @@ function ProjectFields({ form, onChange, errors, idPrefix }: ProjectFieldsProps)
       </div>
       <div className="field">
         <label>
-          Max CI rounds
-          <input
-            type="number"
-            value={form.maxCiRounds}
-            onChange={(event) => onChange({ ...form, maxCiRounds: Number(event.target.value) })}
-          />
-        </label>
-        <p className="field__help">Non-negative integer.</p>
-        {errors.maxCiRounds && (
-          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxCiRounds`}>
-            {errors.maxCiRounds}
-          </span>
-        )}
-      </div>
-      <div className="field">
-        <label>
-          Max review rounds
-          <input
-            type="number"
-            value={form.maxReviewRounds}
-            onChange={(event) => onChange({ ...form, maxReviewRounds: Number(event.target.value) })}
-          />
-        </label>
-        <p className="field__help">Non-negative integer.</p>
-        {errors.maxReviewRounds && (
-          <span className="field__error" role="alert" data-testid={`${idPrefix}-error-maxReviewRounds`}>
-            {errors.maxReviewRounds}
-          </span>
-        )}
-      </div>
-      <div className="field">
-        <label>
           Max budget USD
           <input
             type="number"
@@ -186,19 +187,23 @@ function ProjectFields({ form, onChange, errors, idPrefix }: ProjectFieldsProps)
 
 /**
  * Projects panel (design.md §14 Admin row, §12.5 `/projects`, task
- * contract GOT.29; restyled by U5): list plus a create form and a per-row
- * edit form for every field the api accepts, with client-side validation
- * mirroring `apps/api/src/routes/projects.ts` and the api's 400/409
- * rendered inline.
+ * contract GOT.29; restyled by U5, dense table plus a right-hand sheet by
+ * UR7): list plus a create form and a per-row edit form for every field
+ * the api accepts, with client-side validation mirroring
+ * `apps/api/src/routes/projects.ts` and the api's 400/409 rendered inline.
+ * Create and edit share `AdminSheet.tsx`; the table's own Edit/Delete are
+ * link-style buttons (UR7 mockup).
  */
 export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
   const { begin, isCurrent } = useLatestRequest();
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  const [createOpen, setCreateOpen] = useState(false);
   const [createForm, setCreateForm] = useState<CreateProjectInput>(EMPTY_FORM);
   const [createErrors, setCreateErrors] = useState<FieldErrors>({});
   const [createError, setCreateError] = useState<string | null>(null);
+  const createOpener = useRef<HTMLElement | null>(null);
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<CreateProjectInput | null>(null);
@@ -206,6 +211,7 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
   const [deleteError, setDeleteError] = useState<{ id: string; message: string } | null>(null);
   const [editErrors, setEditErrors] = useState<FieldErrors>({});
   const [editError, setEditError] = useState<string | null>(null);
+  const editOpener = useRef<HTMLElement | null>(null);
 
   const fetchProjects = useCallback(async () => {
     const generation = begin();
@@ -225,6 +231,18 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
     void fetchProjects();
   }, [fetchProjects]);
 
+  function openCreate(event: { currentTarget: HTMLElement }) {
+    createOpener.current = event.currentTarget;
+    setCreateForm(EMPTY_FORM);
+    setCreateErrors({});
+    setCreateError(null);
+    setCreateOpen(true);
+  }
+
+  function closeCreate() {
+    setCreateOpen(false);
+  }
+
   async function handleCreate(event: FormEvent) {
     event.preventDefault();
     const errors = validateProjectInput(createForm);
@@ -233,14 +251,15 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
     if (Object.keys(errors).length > 0) return;
     try {
       await adminApi.createProject(createForm);
-      setCreateForm(EMPTY_FORM);
+      closeCreate();
       await fetchProjects();
     } catch (err) {
       setCreateError(describeApiError(err, "Failed to create the project."));
     }
   }
 
-  function startEdit(project: Project) {
+  function startEdit(project: Project, event: { currentTarget: HTMLElement }) {
+    editOpener.current = event.currentTarget;
     setEditingId(project.id);
     setEditForm(toFormValues(project));
     setEditErrors({});
@@ -292,9 +311,18 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
     }
   }
 
+  const editingProject = editingId ? (projects ?? []).find((project) => project.id === editingId) ?? null : null;
+
   return (
     <section aria-label="Projects">
-      <h2>Projects</h2>
+      <div className="page-header">
+        <h2 className="page-header__title">Projects</h2>
+        <div className="page-header__actions">
+          <button type="button" className="primary" onClick={openCreate}>
+            Create project
+          </button>
+        </div>
+      </div>
 
       <div className="admin-panel__table">
         {loadError && (
@@ -316,16 +344,16 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
                 <th scope="col">Name</th>
                 <th scope="col">Jira JQL</th>
                 <th scope="col" className="num">
-                  Infra retries
-                </th>
-                <th scope="col" className="num">
-                  Protocol retries
+                  Review rounds
                 </th>
                 <th scope="col" className="num">
                   CI rounds
                 </th>
                 <th scope="col" className="num">
-                  Review rounds
+                  Infra retries
+                </th>
+                <th scope="col" className="num">
+                  Protocol retries
                 </th>
                 <th scope="col" className="num">
                   Budget USD
@@ -334,66 +362,42 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
               </tr>
             </thead>
             <tbody>
-              {projects.map((project) =>
-                editingId === project.id && editForm ? (
-                  <tr key={project.id}>
-                    <td colSpan={9}>
-                      <div className="card">
-                        <h3>Edit project</h3>
-                        <form
-                          aria-label={`Edit ${project.key}`}
-                          className="form-grid"
-                          onSubmit={(event) => void handleSaveEdit(event, project)}
-                        >
-                          <ProjectFields form={editForm} onChange={setEditForm} errors={editErrors} idPrefix="edit" />
-                          {editError && (
-                            <p className="alert alert--error form-grid__full" role="alert" data-testid="edit-error">
-                              {editError}
-                            </p>
-                          )}
-                          <div className="form-grid__full admin-form__actions">
-                            <button type="submit" className="primary">
-                              Save
-                            </button>
-                            <button type="button" onClick={cancelEdit}>
-                              Cancel
-                            </button>
-                          </div>
-                        </form>
-                      </div>
-                    </td>
-                  </tr>
-                ) : (
-                  <tr key={project.id}>
-                    <td>{project.key}</td>
-                    <td>{project.name}</td>
-                    <td>
-                      <span className="admin-table__mono" title={project.jiraJql}>
-                        {project.jiraJql}
-                      </span>
-                    </td>
-                    <td className="num">{project.maxInfraRetries}</td>
-                    <td className="num">{project.maxProtocolRetries}</td>
-                    <td className="num">{project.maxCiRounds}</td>
-                    <td className="num">{project.maxReviewRounds}</td>
-                    <td className="num">{project.maxBudgetUsd ?? "—"}</td>
-                    <td>
-                      <button type="button" className="admin-table__action" onClick={() => startEdit(project)}>
-                        Edit
-                      </button>{" "}
-                      <button
-                        type="button"
-                        className="admin-table__action"
-                        aria-label={`Delete ${project.key}`}
-                        disabled={deletingId === project.id}
-                        onClick={() => void handleDelete(project)}
-                      >
-                        Delete
-                      </button>
-                    </td>
-                  </tr>
-                ),
-              )}
+              {projects.map((project) => (
+                <tr key={project.id}>
+                  <td>
+                    <span className="admin-table__mono">{project.key}</span>
+                  </td>
+                  <td>{project.name}</td>
+                  <td>
+                    <span className="admin-table__mono" title={project.jiraJql}>
+                      {project.jiraJql}
+                    </span>
+                  </td>
+                  <td className="num">{project.maxReviewRounds}</td>
+                  <td className="num">{project.maxCiRounds}</td>
+                  <td className="num">{project.maxInfraRetries}</td>
+                  <td className="num">{project.maxProtocolRetries}</td>
+                  <td className="num">{project.maxBudgetUsd ?? "—"}</td>
+                  <td>
+                    <button
+                      type="button"
+                      className="btn btn--link btn--small"
+                      onClick={(event) => startEdit(project, event)}
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn--link btn--small btn--danger"
+                      aria-label={`Delete ${project.key}`}
+                      disabled={deletingId === project.id}
+                      onClick={() => void handleDelete(project)}
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
               {deleteError && (
                 <tr key={`${deleteError.id}-delete-error`}>
                   <td colSpan={9}>
@@ -412,22 +416,59 @@ export function ProjectsPanel({ adminApi }: ProjectsPanelProps) {
         )}
       </div>
 
-      <div className="card">
-        <h3>Create project</h3>
-        <form aria-label="Create project" className="form-grid" onSubmit={(event) => void handleCreate(event)}>
-          <ProjectFields form={createForm} onChange={setCreateForm} errors={createErrors} idPrefix="create" />
-          {createError && (
-            <p className="alert alert--error form-grid__full" role="alert" data-testid="create-error">
-              {createError}
-            </p>
-          )}
-          <div className="form-grid__full admin-form__actions">
-            <button type="submit" className="primary">
-              Create project
-            </button>
-          </div>
-        </form>
-      </div>
+      {createOpen && (
+        <AdminSheet title="Create project" onClose={closeCreate} opener={createOpener.current}>
+          <form aria-label="Create project" className="admin-sheet__form" onSubmit={(event) => void handleCreate(event)}>
+            <div className="side-panel__body admin-sheet__body">
+              <div className="form-grid">
+                <ProjectFields form={createForm} onChange={setCreateForm} errors={createErrors} idPrefix="create" />
+              </div>
+              {createError && (
+                <p className="alert alert--error" role="alert" data-testid="create-error">
+                  {createError}
+                </p>
+              )}
+            </div>
+            <div className="side-panel__footer admin-sheet__footer">
+              <button type="button" onClick={closeCreate}>
+                Cancel
+              </button>
+              <button type="submit" className="primary">
+                Save
+              </button>
+            </div>
+          </form>
+        </AdminSheet>
+      )}
+
+      {editingProject && editForm && (
+        <AdminSheet title="Edit project" subtitle={editingProject.key} onClose={cancelEdit} opener={editOpener.current}>
+          <form
+            aria-label={`Edit ${editingProject.key}`}
+            className="admin-sheet__form"
+            onSubmit={(event) => void handleSaveEdit(event, editingProject)}
+          >
+            <div className="side-panel__body admin-sheet__body">
+              <div className="form-grid">
+                <ProjectFields form={editForm} onChange={setEditForm} errors={editErrors} idPrefix="edit" />
+              </div>
+              {editError && (
+                <p className="alert alert--error" role="alert" data-testid="edit-error">
+                  {editError}
+                </p>
+              )}
+            </div>
+            <div className="side-panel__footer admin-sheet__footer">
+              <button type="button" onClick={cancelEdit}>
+                Cancel
+              </button>
+              <button type="submit" className="primary">
+                Save
+              </button>
+            </div>
+          </form>
+        </AdminSheet>
+      )}
     </section>
   );
 }
