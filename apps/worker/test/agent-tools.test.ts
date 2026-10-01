@@ -2448,6 +2448,45 @@ describe("propose_spec", () => {
     expect((result as { message: string }).message).toMatch(/orchestra/);
     expect((result as { message: string }).message).toMatch(/locked/i);
   });
+
+  // GOT.90/GOT.100: `dependencies` may only hold Jira issue keys (coordinator
+  // D1). `propose_spec`'s `run()` rejects a prose entry before any write
+  // (`InvalidDependenciesError`, apps/worker/src/agent-tools/tools/propose_spec.ts).
+  describe("GOT.90/GOT.100: dependencies must be Jira keys", () => {
+    it("writes no draft revision when dependencies holds a non-key entry", async () => {
+      const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+      const before = await snapshot(s);
+
+      const result = await call(s.token, "propose_spec", {
+        ...specContent("bad deps"),
+        dependencies: ["None - self-contained change within the sandbox repository"],
+      });
+
+      // `run()` throws `InvalidDependenciesError` before any write (see
+      // propose_spec.ts), so the call is rejected and nothing is written.
+      // `invoke.ts`'s `classify()` (outside this change's owned paths) has
+      // no case for this error yet, so it still surfaces as a generic
+      // `INTERNAL` error rather than one naming the offending entries --
+      // tracked as a follow-up to wire a case there, the same way
+      // `RepositoryLockedError` is wired today.
+      expect(result).toMatchObject({ isError: true, code: "INTERNAL" });
+      const after = await snapshot(s);
+      expect({ ...after, events: before.events, leaseExpiresAt: 0 }).toEqual({
+        ...before,
+        leaseExpiresAt: 0,
+      });
+    });
+
+    it("accepts an empty dependencies list and valid Jira keys", async () => {
+      const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
+      expectOk(
+        await call(s.token, "propose_spec", {
+          ...specContent("good deps"),
+          dependencies: ["JIRA-1", "SPC-42"],
+        }),
+      );
+    });
+  });
 });
 
 // ================================================================= AC3

@@ -1,4 +1,6 @@
 import {
+  invalidDependenciesMessage,
+  invalidDependencyEntries,
   RuntimeSchema,
   SpecContentSchema,
   TransitionError,
@@ -300,6 +302,17 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
         `Invalid specification content: ${body.error.issues
           .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
           .join("; ")}`,
+      );
+    }
+    // GOT.90/GOT.100: `dependencies` may only hold Jira issue keys
+    // (coordinator D1), rejected here rather than only surfacing later as
+    // approve's 422 UNKNOWN_DEPENDENCY.
+    const invalidDependencies = invalidDependencyEntries(body.data.content.dependencies);
+    if (invalidDependencies.length > 0) {
+      throw new AppError(
+        422,
+        "INVALID_DEPENDENCIES",
+        invalidDependenciesMessage(invalidDependencies),
       );
     }
     const actor = userActor(request);

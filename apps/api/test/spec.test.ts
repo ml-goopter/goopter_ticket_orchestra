@@ -734,6 +734,41 @@ describe("PUT /api/tasks/:id/spec/draft (P3)", () => {
       expect(await snapshot(id)).toEqual(before);
     },
   );
+
+  // GOT.90/GOT.100: `dependencies` may only hold Jira issue keys (coordinator
+  // D1), caught here rather than later at approve's 422 UNKNOWN_DEPENDENCY.
+  describe("GOT.90/GOT.100: dependencies must be Jira keys", () => {
+    it("returns 422 naming the offending entries and writes nothing", async () => {
+      const { id } = await newTask("SPEC_IN_PROGRESS");
+      const before = await snapshot(id);
+      const prose = "None - self-contained change within the sandbox repository";
+      const res = await put(`/api/tasks/${id}/spec/draft`, {
+        content: content({ dependencies: [prose, "also not a key"] }),
+      });
+      expect(res.statusCode).toBe(422);
+      expect(res.json().error.code).toBe("INVALID_DEPENDENCIES");
+      expect(res.json().error.message).toContain(prose);
+      expect(res.json().error.message).toContain("also not a key");
+      expect(res.json().error.message.toLowerCase()).toContain("jira issue key");
+      expect(await snapshot(id)).toEqual(before);
+    });
+
+    it("accepts an empty dependencies list", async () => {
+      const { id } = await newTask("SPEC_IN_PROGRESS");
+      const res = await put(`/api/tasks/${id}/spec/draft`, {
+        content: content({ dependencies: [] }),
+      });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("accepts valid Jira keys", async () => {
+      const { id } = await newTask("SPEC_IN_PROGRESS");
+      const res = await put(`/api/tasks/${id}/spec/draft`, {
+        content: content({ dependencies: ["JIRA-1", "SPC-42"] }),
+      });
+      expect(res.statusCode).toBe(200);
+    });
+  });
 });
 
 describe("POST /api/tasks/:id/spec/request-review and send-back (P4)", () => {

@@ -27,8 +27,10 @@ ${toolContractFor("spec")}
 Explore and analyze the repository before proposing anything. 
 Ask with \`raise_issue\` whenever you need product or human input rather than guessing.
 Continue to ask questions until you and the human operatior reach a complete shared understanding of what the ticket is, what it will do, and its risks. 
-Call \`propose_spec\` whenever you have a draft ready for the user to review. 
+Call \`propose_spec\` whenever you have a draft ready for the user to review.
 Call \`report_complete\` only once the user confirms the specification is finished, never on your own judgement.
+
+\`dependencies\` holds only Jira issue keys of tasks this one depends on, empty when none. Anything else that could block the work -- a decision, a missing resource, a risk -- goes in \`risks\` or a raised issue (\`raise_issue\`), never in \`dependencies\`.
 
 ## Resuming
 

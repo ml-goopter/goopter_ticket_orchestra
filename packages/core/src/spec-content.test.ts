@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  invalidDependencyEntries,
+  invalidDependenciesMessage,
+  JIRA_KEY_PATTERN,
   SpecContentSchema,
   validateSpecForApproval,
   type SpecContent,
@@ -38,6 +41,62 @@ describe("SpecContentSchema (design.md §4.3)", () => {
       expect(result.data.risks).toBeUndefined();
       expect(result.data.notes).toBeUndefined();
     }
+  });
+
+  // GOT.90/GOT.100: the schema itself stays permissive about `dependencies`
+  // content so a draft already stored with prose still parses (design.md
+  // §4.3; write-time rejection lives in `invalidDependencyEntries` below).
+  it("still parses a document whose dependencies hold prose, not Jira keys", () => {
+    const prose = {
+      ...VALID,
+      dependencies: ["None - self-contained change within the sandbox repository"],
+    };
+    const result = SpecContentSchema.safeParse(prose);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.dependencies).toEqual(prose.dependencies);
+    }
+  });
+});
+
+describe("JIRA_KEY_PATTERN / invalidDependencyEntries (GOT.90/GOT.100, coordinator D1)", () => {
+  it.each(["JIRA-1", "SPC-100", "AB_CD-42"])("accepts the Jira key %s", (key) => {
+    expect(JIRA_KEY_PATTERN.test(key)).toBe(true);
+  });
+
+  it.each([
+    "None - self-contained change within the sandbox repository",
+    "jira-1",
+    "JIRA",
+    "JIRA-",
+    "-1",
+    "1-JIRA",
+    "",
+  ])("rejects the non-key entry %j", (entry) => {
+    expect(JIRA_KEY_PATTERN.test(entry)).toBe(false);
+  });
+
+  it("returns no offending entries for an empty list", () => {
+    expect(invalidDependencyEntries([])).toEqual([]);
+  });
+
+  it("returns no offending entries when every entry is a Jira key", () => {
+    expect(invalidDependencyEntries(["JIRA-1", "SPC-100"])).toEqual([]);
+  });
+
+  it("names every non-key entry, preserving order, and leaves valid keys out", () => {
+    const prose = "None - self-contained change within the sandbox repository";
+    expect(invalidDependencyEntries(["JIRA-1", prose, "SPC-100", "also not a key"])).toEqual([
+      prose,
+      "also not a key",
+    ]);
+  });
+
+  it("invalidDependenciesMessage names the offending entries and states the rule", () => {
+    const message = invalidDependenciesMessage(["not a key"]);
+    expect(message).toContain("not a key");
+    expect(message.toLowerCase()).toContain("jira issue key");
+    expect(message.toLowerCase()).toContain("risks");
   });
 });
 
