@@ -2451,25 +2451,35 @@ describe("propose_spec", () => {
 
   // GOT.90/GOT.100: `dependencies` may only hold Jira issue keys (coordinator
   // D1). `propose_spec`'s `run()` rejects a prose entry before any write
-  // (`InvalidDependenciesError`, apps/worker/src/agent-tools/tools/propose_spec.ts).
+  // (`InvalidDependenciesError`, apps/worker/src/agent-tools/tool.ts), and
+  // `invoke.ts`'s `classify()` maps it to the dedicated `INVALID_DEPENDENCIES`
+  // tool error code, the same way `RepositoryLockedError` is wired.
   describe("GOT.90/GOT.100: dependencies must be Jira keys", () => {
-    it("writes no draft revision when dependencies holds a non-key entry", async () => {
+    it("T1-GOT.90+GOT.100-fix1: returns INVALID_DEPENDENCIES naming the offending entries, and writes no draft revision", async () => {
       const s = await seed({ role: "spec", taskState: "SPEC_IN_PROGRESS" });
       const before = await snapshot(s);
 
       const result = await call(s.token, "propose_spec", {
         ...specContent("bad deps"),
-        dependencies: ["None - self-contained change within the sandbox repository"],
+        dependencies: ["None - self-contained change within the sandbox repository", "JIRA-1"],
       });
 
-      // `run()` throws `InvalidDependenciesError` before any write (see
-      // propose_spec.ts), so the call is rejected and nothing is written.
-      // `invoke.ts`'s `classify()` (outside this change's owned paths) has
-      // no case for this error yet, so it still surfaces as a generic
-      // `INTERNAL` error rather than one naming the offending entries --
-      // tracked as a follow-up to wire a case there, the same way
-      // `RepositoryLockedError` is wired today.
-      expect(result).toMatchObject({ isError: true, code: "INTERNAL" });
+      expect(result).toMatchObject({ isError: true, code: "INVALID_DEPENDENCIES" });
+      expect((result as { message: string }).message).toMatch(
+        /None - self-contained change within the sandbox repository/,
+      );
+      expect((result as { message: string }).message).not.toMatch(/JIRA-1/);
+      expect((result as { message: string }).message).toMatch(
+        /dependencies must hold only Jira issue keys/,
+      );
+      expect((result as { message: string }).message).toMatch(/empty when none/);
+      expect((result as { message: string }).message).toMatch(/risks or a raised issue/);
+
+      const revisions = await db.query.specificationRevisions.findMany({
+        where: (t, { eq }) => eq(t.taskId, s.taskId),
+      });
+      expect(revisions).toHaveLength(0);
+
       const after = await snapshot(s);
       expect({ ...after, events: before.events, leaseExpiresAt: 0 }).toEqual({
         ...before,

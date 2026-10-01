@@ -1,4 +1,4 @@
-import type { AgentToolName, agentTools } from "@orchestra/core";
+import { agentTools, invalidDependenciesMessage, type AgentToolName } from "@orchestra/core";
 import type { Actor, Tx } from "@orchestra/db";
 import type { z } from "zod";
 import type { LiveExecution } from "./registry.js";
@@ -71,5 +71,18 @@ export class ReviewRequiredError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ReviewRequiredError";
+  }
+}
+
+/**
+ * Thrown by `propose_spec` when `input.dependencies` holds an entry that is
+ * not a Jira issue key (GOT.90/GOT.100, coordinator D1). `invoke.ts` maps
+ * this to the `INVALID_DEPENDENCIES` tool error code, naming the offending
+ * entries, instead of the generic `INTERNAL`.
+ */
+export class InvalidDependenciesError extends Error {
+  constructor(readonly invalid: readonly string[]) {
+    super(invalidDependenciesMessage(invalid));
+    this.name = "InvalidDependenciesError";
   }
 }

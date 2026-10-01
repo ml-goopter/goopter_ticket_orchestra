@@ -1,25 +1,6 @@
-import {
-  invalidDependenciesMessage,
-  invalidDependencyEntries,
-} from "@orchestra/core";
+import { invalidDependencyEntries } from "@orchestra/core";
 import { appendEvent, findRepositoryById, upsertDraftSpecificationRevision } from "@orchestra/db";
-import { defineTool, RepositoryLockedError } from "../tool.js";
-
-/**
- * Thrown when `input.dependencies` holds an entry that is not a Jira issue
- * key (GOT.90/GOT.100, coordinator D1). `invoke.ts`'s `classify()` has no
- * case for this error, so today it still reaches the agent as a generic
- * `INTERNAL` tool error rather than one naming the offending entries --
- * `invoke.ts` is outside this change's owned paths. Wiring a case there
- * (mapping this error to a dedicated tool error code, the same way
- * `RepositoryLockedError` and `ReviewRequiredError` are) is a follow-up.
- */
-export class InvalidDependenciesError extends Error {
-  constructor(readonly invalid: readonly string[]) {
-    super(invalidDependenciesMessage(invalid));
-    this.name = "InvalidDependenciesError";
-  }
-}
+import { defineTool, InvalidDependenciesError, RepositoryLockedError } from "../tool.js";
 
 /**
  * design.md §8: upsert the task's single draft revision and write
@@ -35,7 +16,9 @@ export class InvalidDependenciesError extends Error {
  *
  * GOT.90/GOT.100: `dependencies` must hold only Jira issue keys (coordinator
  * D1), checked before any write so an invalid call leaves the draft
- * untouched (see `InvalidDependenciesError` above).
+ * untouched. `invoke.ts` maps `InvalidDependenciesError` (defined in
+ * `../tool.js`, beside `RepositoryLockedError`) to the
+ * `INVALID_DEPENDENCIES` tool error code.
  */
 export const proposeSpec = defineTool({
   name: "propose_spec",
