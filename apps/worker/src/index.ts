@@ -76,6 +76,36 @@ async function main(): Promise<void> {
     host: os.hostname(),
   });
 
+  // GOT.96: install the signal handlers synchronously, before the first
+  // `await` below, so the process has an application-level SIGTERM/SIGINT
+  // listener from its very first tick -- before `registerWorker` below ever
+  // makes the worker's row visible to anything watching for it. `index.ts`
+  // runs under tsx (design.md §15.2 test harness), and tsx's loader treats a
+  // signal arriving while `process.listenerCount(signal)` is 0 as
+  // unhandled: it force-exits the process with `128 + signal` itself,
+  // bypassing the `exit(0)`/`exit(1)` calls below entirely. That raced with
+  // the rest of this function's startup work (registration, pricing, the
+  // tools server, docker, the pollers, the runner, the tick loop) all
+  // running *before* `installSignalHandlers` used to be called at the
+  // bottom of this function, and surfaced as shutdown.test.ts intermittently
+  // observing `{ code: 143, signal: null }` instead of `{ code: 0, signal:
+  // null }`. The real teardown isn't assembled this early, so `stop` here
+  // awaits `ready`, which startup resolves with the real stop function once
+  // every subsystem below exists; by the time that resolves, the entire
+  // startup sequence (and so every resource `stop` touches) is guaranteed to
+  // have completed, whatever point mid-startup the signal actually arrived.
+  let resolveReady!: (stop: () => Promise<void>) => void;
+  const ready = new Promise<() => Promise<void>>((resolve) => {
+    resolveReady = resolve;
+  });
+  installSignalHandlers({
+    logger: bootstrap,
+    stop: async () => {
+      const stop = await ready;
+      await stop();
+    },
+  });
+
   let config;
   try {
     config = loadConfig();
@@ -342,22 +372,22 @@ async function main(): Promise<void> {
     "worker started",
   );
 
-  installSignalHandlers({
-    logger: log,
-    stop: async () => {
-      await loop.stop();
-      // No retry may be handed to a runner that is shutting down.
-      await stopRetryStarter();
-      // Abort live sessions and let their finally blocks revoke tokens
-      // before the tools server and the db go away.
-      await runner.shutdown();
-      await toolsServer.stop();
-      await stopJiraPoller();
-      await stopJiraWriteback();
-      await stopGitHubPoller();
-      await stopHeartbeat();
-      await closeDb(db);
-    },
+  // The real stop function, now that every subsystem it touches exists.
+  // See the `installSignalHandlers` call at the top of this function for why
+  // this is wired through `resolveReady` rather than called directly here.
+  resolveReady(async () => {
+    await loop.stop();
+    // No retry may be handed to a runner that is shutting down.
+    await stopRetryStarter();
+    // Abort live sessions and let their finally blocks revoke tokens
+    // before the tools server and the db go away.
+    await runner.shutdown();
+    await toolsServer.stop();
+    await stopJiraPoller();
+    await stopJiraWriteback();
+    await stopGitHubPoller();
+    await stopHeartbeat();
+    await closeDb(db);
   });
 }
 
