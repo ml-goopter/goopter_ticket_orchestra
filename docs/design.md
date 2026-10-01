@@ -679,7 +679,7 @@ export type AgentEvent =
   | { type: 'tool_call'; name: string; input: unknown }
   | { type: 'tool_result'; name: string; ok: boolean }
   | { type: 'usage'; model: string; input: number; cached: number; output: number; costUsd?: number }
-  | { type: 'turn_done'; finalText: string }
+  | { type: 'turn_done'; finalText: string; backgroundSubagents?: number }
   | { type: 'error'; message: string; retriable: boolean };
 
 export interface AgentAdapter {
@@ -691,6 +691,8 @@ export interface AgentAdapter {
 ```
 
 Cancel is the `AbortSignal`. Status is the event stream. Result is the `turn_done` event plus whatever the agent reported through agent-tools.
+
+`turn_done.backgroundSubagents` is set by the Claude adapter when subagents the agent started in the background are still outstanding at turn end. A turn that ends that way without a terminal call fails as a protocol failure whose end detail names background delegation, and the protocol retry tells the agent to delegate in the foreground only (GOT.101).
 
 ### 7.1 Claude adapter
 

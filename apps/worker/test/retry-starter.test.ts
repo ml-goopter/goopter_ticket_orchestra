@@ -31,6 +31,7 @@ import { LEASE_TTL_MS } from "../src/agent-tools/lease.js";
 import { issueToken, revokeToken } from "../src/agent-tools/tokens.js";
 import type { LogFields, Logger } from "../src/logger.js";
 import {
+  BACKGROUND_DELEGATION_DETAIL,
   PROTOCOL_VIOLATION_DETAIL,
   claimNextRetry,
   createRunner,
@@ -933,6 +934,55 @@ describe("retry start in the runner (C25, C27, AC7, AC8)", () => {
       expect(prompt).toContain("## Approved specification (revision 2)");
     });
   }
+
+  it("a protocol retry after background delegation resumes with the foreground-only nudge (GOT.101)", async () => {
+    const s = await seedRetry({
+      endReason: "protocol_violation",
+      endDetail: BACKGROUND_DELEGATION_DETAIL,
+    });
+    const h = makeRealRunner(s);
+
+    await runRetryStarter(starterOptions(s, h.runner, NOW));
+    await waitFor(async () => (h.adapter.resumes.length > 0 ? true : undefined));
+
+    const prompt = h.adapter.resumes[0]!.prompt;
+    expect(prompt).toContain("## Protocol reminder");
+    expect(prompt).toContain("report_pr_created, report_failed, or a blocking raise_issue");
+    expect(prompt).toContain("## Background delegation");
+    expect(prompt).toContain("foreground Agent calls only");
+    expect(prompt).toContain("Do not message, resume, or wait for any subagent from the earlier execution");
+  });
+
+  it("a protocol retry after background delegation started fresh keeps the foreground-only nudge (GOT.101)", async () => {
+    const s = await seedRetry({
+      endReason: "protocol_violation",
+      endDetail: BACKGROUND_DELEGATION_DETAIL,
+      previousHost: OTHER_HOST,
+    });
+    const h = makeRealRunner(s);
+    h.adapter.canResumeResult = false;
+
+    await runRetryStarter(starterOptions(s, h.runner, NOW));
+    await waitFor(async () => (h.adapter.starts.length > 0 ? true : undefined));
+
+    const prompt = h.adapter.starts[0]!.prompt;
+    expect(prompt).toContain("## Protocol reminder");
+    expect(prompt).toContain("## Background delegation");
+    expect(prompt).toContain("foreground Agent calls only");
+    expect(prompt).toContain("## Approved specification (revision 2)");
+  });
+
+  it("a protocol retry without background delegation carries no delegation nudge (GOT.101)", async () => {
+    const s = await seedRetry({ endReason: "protocol_violation" });
+    const h = makeRealRunner(s);
+
+    await runRetryStarter(starterOptions(s, h.runner, NOW));
+    await waitFor(async () => (h.adapter.resumes.length > 0 ? true : undefined));
+
+    const prompt = h.adapter.resumes[0]!.prompt;
+    expect(prompt).toContain("## Protocol reminder");
+    expect(prompt).not.toContain("## Background delegation");
+  });
 
   it("an infrastructure retry started fresh carries no protocol nudge", async () => {
     const s = await seedRetry();

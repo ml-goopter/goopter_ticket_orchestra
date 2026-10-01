@@ -80,7 +80,18 @@ export type AgentEvent =
       output: number;
       costUsd?: number;
     }
-  | { type: "turn_done"; finalText: string }
+  | {
+      type: "turn_done";
+      finalText: string;
+      /**
+       * Optional extension of §7 (GOT.101): subagents the agent started in
+       * the background that were still running when the turn ended. Absent
+       * when there are none, so a turn without background delegation emits
+       * the §7 shape unchanged. The runner names background delegation in a
+       * protocol violation's end detail when this is set.
+       */
+      backgroundSubagents?: number;
+    }
   | { type: "error"; message: string; retriable: boolean };
 
 export interface AgentAdapter {

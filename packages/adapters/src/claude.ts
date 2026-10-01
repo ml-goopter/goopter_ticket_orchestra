@@ -510,6 +510,8 @@ async function* runQuery(
     toolNames: new Map(),
     model: undefined,
     unbilled: remainingBaseline(run.usageBaseline),
+    backgroundSubagents: new Set(),
+    subagentTasks: new Map(),
   };
 
   try {
@@ -568,6 +570,71 @@ interface StreamContext {
    * "emit as reported"; a model with no entry is emitted unchanged.
    */
   unbilled: RemainingBaseline | undefined;
+  /**
+   * Subagents running in the background and not yet settled, keyed by the
+   * spawning tool_use id, else the SDK task id (GOT.101). Their count at the
+   * `result` goes out on `turn_done` as `backgroundSubagents`. Per stream: a
+   * new query is a new CLI process, so earlier subagents are gone.
+   */
+  backgroundSubagents: Set<string>;
+  /** SDK task id → key in `backgroundSubagents`, for a subagent task. */
+  subagentTasks: Map<string, string>;
+}
+
+/** Built-in tools that spawn a subagent (`Task` is the older name of `Agent`). */
+const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+
+/** `task_updated` statuses after which a task is no longer running. */
+const SETTLED_TASK_STATUSES = new Set(["completed", "failed", "killed"]);
+
+/**
+ * Tracks background subagents from the SDK task messages (GOT.101).
+ * `task_started` registers a subagent task and says whether it runs in the
+ * background, `task_updated` moves it to the background or settles it, and
+ * `task_notification` settles it. Other task types (a background shell
+ * command) are not subagents and are ignored.
+ */
+function trackSubagentTask(message: SDKMessage, context: StreamContext): void {
+  if (message.type !== "system") return;
+  switch (message.subtype) {
+    case "task_started": {
+      const toolName =
+        message.tool_use_id === undefined
+          ? undefined
+          : context.toolNames.get(message.tool_use_id);
+      const subagent =
+        message.task_type === "local_agent" ||
+        message.subagent_type !== undefined ||
+        (toolName !== undefined && SUBAGENT_TOOLS.has(toolName));
+      if (!subagent) return;
+      const key = message.tool_use_id ?? message.task_id;
+      context.subagentTasks.set(message.task_id, key);
+      if (message.is_backgrounded === true) context.backgroundSubagents.add(key);
+      else if (message.is_backgrounded === false) context.backgroundSubagents.delete(key);
+      return;
+    }
+    case "task_updated": {
+      const key = context.subagentTasks.get(message.task_id);
+      if (key === undefined) return;
+      const { status, is_backgrounded } = message.patch;
+      if (status !== undefined && SETTLED_TASK_STATUSES.has(status)) {
+        context.backgroundSubagents.delete(key);
+      } else if (is_backgrounded === true) {
+        context.backgroundSubagents.add(key);
+      }
+      return;
+    }
+    case "task_notification": {
+      const key = context.subagentTasks.get(message.task_id);
+      if (key !== undefined) context.backgroundSubagents.delete(key);
+      if (message.tool_use_id !== undefined) {
+        context.backgroundSubagents.delete(message.tool_use_id);
+      }
+      return;
+    }
+    default:
+      return;
+  }
 }
 
 function* mapMessage(
@@ -580,6 +647,7 @@ function* mapMessage(
         context.model = message.model;
         yield { type: "session", sessionId: message.session_id };
       }
+      trackSubagentTask(message, context);
       return;
     case "assistant":
       for (const block of contentBlocks(message.message)) {
@@ -587,6 +655,9 @@ function* mapMessage(
           yield { type: "text", delta: block.text };
         } else if (isToolUseBlock(block)) {
           context.toolNames.set(block.id, block.name);
+          if (SUBAGENT_TOOLS.has(block.name) && runsInBackground(block.input)) {
+            context.backgroundSubagents.add(block.id);
+          }
           yield { type: "tool_call", name: block.name, input: block.input };
         }
       }
@@ -594,6 +665,13 @@ function* mapMessage(
     case "user":
       for (const block of contentBlocks(message.message)) {
         if (!isToolResultBlock(block)) continue;
+        // An errored result for a backgrounded Agent/Task call means the
+        // delegation never started (denied, invalid input): no task_started
+        // or task_notification follows, so the entry added at the tool_use
+        // (line ~654) must be cleared here or it never settles (GOT.101-B F1).
+        if (block.is_error === true) {
+          context.backgroundSubagents.delete(block.tool_use_id);
+        }
         yield {
           type: "tool_result",
           // The SDK does not repeat the tool name on the result, so it comes
@@ -632,7 +710,19 @@ function* mapResult(
     return;
   }
 
-  yield { type: "turn_done", finalText: message.result };
+  const backgroundSubagents = context.backgroundSubagents.size;
+  yield backgroundSubagents > 0
+    ? { type: "turn_done", finalText: message.result, backgroundSubagents }
+    : { type: "turn_done", finalText: message.result };
+}
+
+/** An Agent or Task input that asks to run in the background (GOT.101). */
+function runsInBackground(input: unknown): boolean {
+  return (
+    typeof input === "object" &&
+    input !== null &&
+    (input as { run_in_background?: unknown }).run_in_background === true
+  );
 }
 
 type UsageEvent = Extract<AgentEvent, { type: "usage" }>;
