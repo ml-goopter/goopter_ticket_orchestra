@@ -457,4 +457,107 @@ describe("auth", () => {
       expect(res.statusCode).toBe(401);
     });
   });
+
+  describe("logout stream closure (AC1, AC3)", () => {
+    it("calls closeSessionStreams with the session ID after successful logout (AC1)", async () => {
+      const app = await withApp();
+      const closeSessionStreamsSpy = vi.spyOn(app.realtime, "closeSessionStreams");
+
+      const user = await seedUser(testDb.db, {
+        email: "stream-user@example.com",
+        password: "correct horse battery",
+      });
+
+      const loginRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "stream-user@example.com", password: "correct horse battery" },
+      });
+      expect(loginRes.statusCode).toBe(200);
+      const cookie = extractCookie(loginRes.headers["set-cookie"]);
+
+      const sessions = await listSessionsForUser(testDb.db, user.id);
+      expect(sessions).toHaveLength(1);
+      const sessionId = sessions[0]!.id;
+
+      closeSessionStreamsSpy.mockClear();
+
+      const logoutRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/logout",
+        headers: { cookie: cookie.raw },
+      });
+      expect(logoutRes.statusCode).toBe(200);
+
+      // Verify closeSessionStreams was called with the session ID
+      expect(closeSessionStreamsSpy).toHaveBeenCalledWith(sessionId);
+
+      // Verify the session is actually deleted
+      const sessionsAfter = await listSessionsForUser(testDb.db, user.id);
+      expect(sessionsAfter).toHaveLength(0);
+    });
+
+    it("does not call closeSessionStreams on failed logout (AC2)", async () => {
+      const app = await withApp();
+      const closeSessionStreamsSpy = vi.spyOn(app.realtime, "closeSessionStreams");
+
+      // Call logout without a session
+      const logoutRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/logout",
+      });
+      expect(logoutRes.statusCode).toBe(401);
+
+      // Verify closeSessionStreams was NOT called
+      expect(closeSessionStreamsSpy).not.toHaveBeenCalled();
+    });
+
+    it("keeps sessions and streams from other users open when one user logs out (AC3)", async () => {
+      const app = await withApp();
+      const user1 = await seedUser(testDb.db, {
+        email: "stream-user-1@example.com",
+        password: "correct horse battery",
+      });
+      const user2 = await seedUser(testDb.db, {
+        email: "stream-user-2@example.com",
+        password: "correct horse battery",
+      });
+
+      const loginRes1 = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "stream-user-1@example.com", password: "correct horse battery" },
+      });
+      const cookie1 = extractCookie(loginRes1.headers["set-cookie"]);
+
+      const loginRes2 = await app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        payload: { email: "stream-user-2@example.com", password: "correct horse battery" },
+      });
+      const cookie2 = extractCookie(loginRes2.headers["set-cookie"]);
+
+      // Both sessions exist
+      const sessions1Before = await listSessionsForUser(testDb.db, user1.id);
+      const sessions2Before = await listSessionsForUser(testDb.db, user2.id);
+      expect(sessions1Before).toHaveLength(1);
+      expect(sessions2Before).toHaveLength(1);
+
+      // Logout user 1
+      const logoutRes = await app.inject({
+        method: "POST",
+        url: "/api/auth/logout",
+        headers: { cookie: cookie1.raw },
+      });
+      expect(logoutRes.statusCode).toBe(200);
+
+      // Verify session 1 is deleted
+      const sessions1After = await listSessionsForUser(testDb.db, user1.id);
+      expect(sessions1After).toHaveLength(0);
+
+      // Verify session 2 still exists
+      const sessions2After = await listSessionsForUser(testDb.db, user2.id);
+      expect(sessions2After).toHaveLength(1);
+    });
+  });
 });
