@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { Link, MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, type SpecApiClient } from "../api/client.js";
-import type { AdminRepository, SpecificationRevision, TaskAggregate } from "../api/types.js";
+import type { AdminRepository, Issue, SpecificationRevision, TaskAggregate } from "../api/types.js";
 import type { EventSourceLike, MessageEventLike } from "../sse/useEventStream.js";
 import { makeFakeClient, makeTaskAggregate, makeTimelineEvent } from "../task/fixtures.js";
 import { SpecBuilderView } from "./SpecBuilderView.js";
@@ -96,6 +96,31 @@ const validSpecContent: SpecContent = {
   risks: [],
   notes: "",
 };
+
+// GOT.91 AC5: an open blocking issue on the spec execution, the only case
+// `WAITING_FOR_USER` disables the composer rather than leaving it live.
+function makeSpecBlockingIssue(overrides: Partial<Issue> = {}): Issue {
+  return {
+    id: "issue-spec-1",
+    taskId: "task-1",
+    executionId: "exec-spec-1",
+    type: "QUESTION",
+    severity: "blocking",
+    blocking: true,
+    title: "What should the error message say?",
+    description: "The spec doesn't say.",
+    question: "What should the error message say?",
+    suggestedOptions: null,
+    recommendedOption: null,
+    status: "OPEN",
+    resolutionKind: null,
+    resolution: null,
+    resolvedBy: null,
+    createdAt: "2026-01-01T03:00:00.000Z",
+    resolvedAt: null,
+    ...overrides,
+  };
+}
 
 function aggregateInProgress(overrides: Partial<TaskAggregate> = {}): TaskAggregate {
   const base = makeTaskAggregate();
@@ -1053,6 +1078,141 @@ describe("SpecBuilderView", () => {
 
     await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
     expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("The task is not in progress.");
+  });
+
+  // GOT.91 AC5: a spec execution only reaches WAITING_FOR_USER behind an
+  // open blocking issue (design.md §9.3), the same case the api refuses
+  // with 409 SPEC_CHAT_UNAVAILABLE.
+  it("disables the chat input and links to the open blocking issue when the spec execution is waiting for the user", async () => {
+    const base = makeTaskAggregate();
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          latestExecutions: { spec: { ...base.executions[0]!, state: "WAITING_FOR_USER" }, implementation: null },
+          issues: [makeSpecBlockingIssue()],
+        }),
+      ),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+    expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("Waiting on an open issue.");
+    const link = screen.getByTestId("chat-disabled-issue-link") as HTMLAnchorElement;
+    expect(link.getAttribute("href")).toBe("/issues/issue-spec-1");
+  });
+
+  // GOT.91 fix1: the worker's plain send_message resume only ever runs a
+  // RUNNING spec session, so WAITING_FOR_USER stays disabled even when the
+  // open issue isn't blocking -- fails against 191aa21, which re-enables it.
+  it("disables the chat input on a WAITING_FOR_USER spec execution whose open issue is not blocking", async () => {
+    const base = makeTaskAggregate();
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          latestExecutions: { spec: { ...base.executions[0]!, state: "WAITING_FOR_USER" }, implementation: null },
+          issues: [makeSpecBlockingIssue({ blocking: false })],
+        }),
+      ),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+    expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("Waiting for your response.");
+    expect(screen.queryByTestId("chat-disabled-issue-link")).toBeNull();
+  });
+
+  it("disables the chat input on a WAITING_FOR_USER spec execution whose blocking issue is resolved", async () => {
+    const base = makeTaskAggregate();
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(
+        aggregateInProgress({
+          latestExecutions: { spec: { ...base.executions[0]!, state: "WAITING_FOR_USER" }, implementation: null },
+          issues: [makeSpecBlockingIssue({ status: "RESOLVED" })],
+        }),
+      ),
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+    expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("Waiting for your response.");
+    expect(screen.queryByTestId("chat-disabled-issue-link")).toBeNull();
+  });
+
+  // GOT.91 fix1 AC1/AC4/AC5: QUEUED/ASSIGNED are live but not yet RUNNING --
+  // the session is still starting up, so the composer stays disabled.
+  it.each(["QUEUED", "ASSIGNED"] as const)(
+    "disables the chat input and shows the reason when the spec execution is %s",
+    async (state) => {
+      const base = makeTaskAggregate();
+      const client = makeFakeClient({
+        getTask: vi.fn().mockResolvedValue(
+          aggregateInProgress({
+            latestExecutions: { spec: { ...base.executions[0]!, state }, implementation: null },
+          }),
+        ),
+      });
+      renderSpecBuilder(client);
+
+      await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+      expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("The spec session is starting up.");
+    },
+  );
+
+  // GOT.91 fix1 AC4: the composer re-enables once an SSE update moves the
+  // spec execution to RUNNING, through the same refetch path the view
+  // already uses for execution.resumed.
+  it("re-enables the chat input once an SSE update moves the spec execution to RUNNING", async () => {
+    const base = makeTaskAggregate();
+    const getTask = vi
+      .fn()
+      .mockResolvedValueOnce(
+        aggregateInProgress({
+          latestExecutions: { spec: { ...base.executions[0]!, state: "ASSIGNED" }, implementation: null },
+        }),
+      )
+      .mockResolvedValueOnce(
+        aggregateInProgress({
+          latestExecutions: { spec: { ...base.executions[0]!, state: "RUNNING" }, implementation: null },
+        }),
+      );
+    const client = makeFakeClient({ getTask });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+    expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("The spec session is starting up.");
+
+    await act(async () => {
+      currentSource().emit(
+        "execution.resumed",
+        makeTimelineEvent({ id: 1, executionId: "exec-spec-2", type: "execution.resumed", payload: {} }),
+        "1",
+      );
+    });
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(false));
+    expect(screen.queryByTestId("chat-disabled-reason")).toBeNull();
+  });
+
+  // GOT.91 AC5: a send that still gets refused (a race with the task/execution
+  // changing between render and submit) shows the api's message rather than
+  // leaving the user's text silently dropped.
+  it("shows the api's message when sending a chat message is refused with a 409", async () => {
+    const postSpecMessage = vi
+      .fn()
+      .mockRejectedValue(new ApiError(409, "SPEC_CHAT_UNAVAILABLE", "The spec chat is unavailable while a blocking issue is open."));
+    const client = makeFakeClient({
+      getTask: vi.fn().mockResolvedValue(aggregateInProgress()),
+      postSpecMessage,
+    });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(false));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "hello agent" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    });
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("SPEC_CHAT_UNAVAILABLE"));
   });
 
   it("posts a chat message when the input is enabled", async () => {

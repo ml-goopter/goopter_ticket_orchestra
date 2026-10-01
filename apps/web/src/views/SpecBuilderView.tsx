@@ -640,6 +640,19 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const taskState = aggregate.task.state;
   const specExecution = aggregate.latestExecutions.spec;
   const hasLiveSpecExecution = isLiveExecutionState(specExecution?.state);
+  // GOT.91 fix1: the worker's plain send_message resume only ever runs a
+  // RUNNING spec session (apps/worker/src/runner/spec.ts ~214-218); every
+  // other live state -- QUEUED/ASSIGNED still starting, or WAITING_FOR_USER
+  // (which only happens behind an open blocking issue, design.md §9.3) --
+  // would otherwise be queued and silently dropped, so the composer stays
+  // disabled through them too.
+  const isSpecExecutionRunning = specExecution?.state === "RUNNING";
+  const openBlockingIssue =
+    specExecution?.state === "WAITING_FOR_USER"
+      ? (aggregate.issues.find(
+          (issue) => issue.executionId === specExecution.id && issue.blocking && issue.status === "OPEN",
+        ) ?? null)
+      : null;
   // `POST /tasks/:id/spec/session` is only legal from NEEDS_SPEC
   // (apps/api/src/routes/spec.ts): resuming a SPEC_IN_PROGRESS task with no
   // live execution (e.g. after a send-back) is the spec role worker's job
@@ -662,9 +675,15 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const chatDisabledReason: string | null =
     taskState !== "SPEC_IN_PROGRESS"
       ? "The task is not in progress."
-      : !hasLiveSpecExecution
-        ? "No live spec execution."
-        : null;
+      : isSpecExecutionRunning
+        ? null
+        : openBlockingIssue
+          ? "Waiting on an open issue."
+          : specExecution?.state === "WAITING_FOR_USER"
+            ? "Waiting for your response."
+            : hasLiveSpecExecution
+              ? "The spec session is starting up."
+              : "No live spec execution.";
 
   const isDirty = formContent !== null && formBaseline !== null && !specContentEquals(formContent, formBaseline);
 
@@ -841,7 +860,17 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
           <div className="spec-builder__composer">
             {chatDisabledReason && (
               <p className="spec-builder__disabled-reason" data-testid="chat-disabled-reason">
-                {chatDisabledReason}
+                {openBlockingIssue ? (
+                  <>
+                    Waiting on{" "}
+                    <Link to={`/issues/${openBlockingIssue.id}`} data-testid="chat-disabled-issue-link">
+                      an open issue
+                    </Link>
+                    .
+                  </>
+                ) : (
+                  chatDisabledReason
+                )}
               </p>
             )}
             <form className="spec-builder__composer-form" onSubmit={(event) => void handleSendMessage(event)}>
