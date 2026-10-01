@@ -52,10 +52,13 @@ import { DEFAULT_TICK_INTERVAL_MS, createTickLoop } from "./tick.js";
  * none of which belong in a container. It talks to Postgres and nothing else
  * in the control plane — there is no api-to-worker RPC.
  *
- * Startup order matters. Config is validated before anything opens a socket,
- * registration happens before the first tick so a phase always has a worker
- * row to attribute work to, and signal handlers go on last so a shutdown
- * always has something coherent to shut down.
+ * Startup order matters. The SIGTERM/SIGINT listener is installed first,
+ * before this function's first `await`, so the process always has an
+ * application-level signal handler (GOT.96); config is validated before
+ * anything opens a socket, registration happens before the first tick so a
+ * phase always has a worker row to attribute work to, and the handler's real
+ * stop function -- the thing that makes a shutdown coherent -- is wired in
+ * last, once every subsystem it touches exists.
  */
 
 /**
@@ -98,8 +101,24 @@ async function main(): Promise<void> {
   const ready = new Promise<() => Promise<void>>((resolve) => {
     resolveReady = resolve;
   });
+  // The handler above has to be given a logger before `workerId` exists, but
+  // its "shutting down"/"shutdown complete" lines should carry `workerId`
+  // once registration below has assigned one -- as they did before GOT.96
+  // moved installation earlier. `shutdownLogger` forwards every call to
+  // whichever logger `currentLogger` points at *when the signal fires*, so
+  // swapping `currentLogger` to `log.child({ workerId })` after registration
+  // (below) is enough; a signal that arrives before that swap still logs
+  // and exits cleanly through `bootstrap`, just without `workerId`.
+  let currentLogger: Logger = bootstrap;
+  const shutdownLogger: Logger = {
+    debug: (fields, msg) => currentLogger.debug(fields, msg),
+    info: (fields, msg) => currentLogger.info(fields, msg),
+    warn: (fields, msg) => currentLogger.warn(fields, msg),
+    error: (fields, msg) => currentLogger.error(fields, msg),
+    child: (fields) => currentLogger.child(fields),
+  };
   installSignalHandlers({
-    logger: bootstrap,
+    logger: shutdownLogger,
     stop: async () => {
       const stop = await ready;
       await stop();
@@ -146,6 +165,8 @@ async function main(): Promise<void> {
   }
 
   const log = logger.child({ workerId });
+  // From here on, a signal's shutdown log lines carry `workerId` too.
+  currentLogger = log;
   log.info({ config: redactConfig(config) }, "worker registered");
 
   // GOT.82, design.md §9.3, §6.3: a spec execution stays `RUNNING` with a

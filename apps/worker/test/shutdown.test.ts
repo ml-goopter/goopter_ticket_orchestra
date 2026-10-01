@@ -117,6 +117,64 @@ describe("worker entry point (design.md §15.2)", () => {
     expect(result).toEqual({ code: 0, signal: null });
   });
 
+  // GOT.96 fix1: the signal handler is installed before `main()`'s first
+  // `await` (so tsx never force-exits before a listener exists), but the
+  // shutdown log lines it emits after registration must still carry the
+  // workerId field the old last-installed handler got from `log.child({
+  // workerId })` -- not the bootstrap logger's fields.
+  it("carries workerId on the shutdown log lines once the worker has registered", async () => {
+    const lines: string[] = [];
+    const onData = (chunk: unknown) => {
+      for (const line of String(chunk).split("\n")) {
+        if (line.trim().length > 0) lines.push(line);
+      }
+    };
+    const child = await startWorker("signal-host-workerid");
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+
+    const row = await waitFor(
+      async () => {
+        if (child.exitCode !== null) {
+          throw new Error(`worker exited early with ${child.exitCode}: ${lines.join("\n")}`);
+        }
+        const rows = await testDb.db.select().from(agentWorkers);
+        return rows.find((r) => r.host === "signal-host-workerid");
+      },
+      { timeoutMs: 20000, what: "the agent_workers row" },
+    );
+
+    const exited = exitOf(child);
+    killWorkerTree(child, "SIGTERM");
+
+    const result = await Promise.race([
+      exited,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`no exit within 10s: ${lines.join("\n")}`)),
+          10000,
+        ),
+      ),
+    ]);
+    expect(result).toEqual({ code: 0, signal: null });
+
+    const records = lines
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((r): r is Record<string, unknown> => r !== undefined);
+
+    const shuttingDown = records.find((r) => r.msg === "shutting down");
+    const shutdownComplete = records.find((r) => r.msg === "shutdown complete");
+
+    expect(shuttingDown?.workerId).toBe(row.id);
+    expect(shutdownComplete?.workerId).toBe(row.id);
+  });
+
   // §9.9 Scheduling, C4: on a host with Docker and the agent image the
   // worker registers `docker` and builds its container stack.
   const agentImage = process.env.ORCHESTRA_TEST_AGENT_IMAGE ?? "orchestra/agent:0.0.1";
