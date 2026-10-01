@@ -28,9 +28,10 @@ type LoadState = "loading" | "loaded" | "not_found" | "error";
 const ISSUE_STREAM_TYPES = ["agent.message.delta", "agent.message", "issue.message", "issue.resolved"] as const;
 
 /**
- * Same string used both for the `window.confirm` prompt and the one-line
- * explanation rendered under "This changes the spec" on a blocking issue
- * (UR5 AC5, spec §19): a single source so the two can never drift apart.
+ * Same string used both for the inline confirmation group (GOT.104) and the
+ * one-line explanation rendered under "This changes the spec" on a blocking
+ * issue (UR5 AC5, spec §19): a single source so the two can never drift
+ * apart.
  */
 const SPEC_REVISION_CONFIRM_TEXT =
   "This creates a draft revision from the approved spec with your decision appended, and reopens the spec builder. Continue?";
@@ -102,6 +103,10 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
   const [chosenOptionId, setChosenOptionId] = useState<string | null>(null);
   const [resolveError, setResolveError] = useState<string | null>(null);
   const [resolving, setResolving] = useState(false);
+  // GOT.104: an inline confirmation group replaces window.confirm (which
+  // freezes headless browser automation), matching SpecBuilderView's
+  // Start spec session confirmation.
+  const [confirmingSpecRevision, setConfirmingSpecRevision] = useState(false);
 
   const [liveReply, setLiveReply] = useState<LiveReply | null>(null);
   const accumulatorRef = useRef(createDeltaAccumulator());
@@ -190,6 +195,10 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
 
   const submitResolve = useCallback(
     async (kind: ResolutionKind) => {
+      // GOT.104 (mirrors SpecBuilderView's GOT.81-fix1 guard): a request is
+      // already in flight, ignore a second click before the `disabled`
+      // attribute re-render lands.
+      if (resolving) return;
       const decision = decisionText.trim();
       if (!decision) return;
       setResolveError(null);
@@ -201,9 +210,12 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
           clarification: clarificationText.trim() || undefined,
           chosenOption: chosenOptionId ?? undefined,
         });
-        if (kind === "spec_revision" && detail) {
-          navigate(`/tasks/${detail.task.id}/spec`);
-          return;
+        if (kind === "spec_revision") {
+          setConfirmingSpecRevision(false);
+          if (detail) {
+            navigate(`/tasks/${detail.task.id}/spec`);
+            return;
+          }
         }
         await loadIssue();
       } catch (err) {
@@ -212,18 +224,25 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
         setResolving(false);
       }
     },
-    [apiClient, id, decisionText, clarificationText, chosenOptionId, detail, navigate, loadIssue],
+    [apiClient, id, decisionText, clarificationText, chosenOptionId, detail, navigate, loadIssue, resolving],
   );
 
   const handleResolveClarification = useCallback(() => {
     void submitResolve("clarification");
   }, [submitResolve]);
 
+  // GOT.104: opens the inline confirmation group instead of window.confirm.
   const handleResolveSpecRevision = useCallback(() => {
-    const confirmed = window.confirm(SPEC_REVISION_CONFIRM_TEXT);
-    if (!confirmed) return;
+    setConfirmingSpecRevision(true);
+  }, []);
+
+  const handleConfirmSpecRevision = useCallback(() => {
     void submitResolve("spec_revision");
   }, [submitResolve]);
+
+  const handleCancelSpecRevision = useCallback(() => {
+    setConfirmingSpecRevision(false);
+  }, []);
 
   if (loadState === "loading" && !detail) {
     return (
@@ -376,14 +395,32 @@ function IssueDetailPanel({ id, client: apiClient, createEventSource }: IssueDet
                 </div>
                 {issue.blocking ? (
                   <div className="issue-detail__resolve-action">
-                    <button
-                      type="button"
-                      disabled={decisionText.trim().length === 0 || resolving}
-                      onClick={handleResolveSpecRevision}
-                    >
-                      This changes the spec
-                    </button>
-                    <p className="issue-detail__resolve-why">{SPEC_REVISION_CONFIRM_TEXT}</p>
+                    {confirmingSpecRevision ? (
+                      <span
+                        role="group"
+                        aria-label="Confirm spec revision"
+                        className="issue-detail__confirm-spec-revision"
+                      >
+                        <span>{SPEC_REVISION_CONFIRM_TEXT}</span>
+                        <button type="button" className="btn" disabled={resolving} onClick={handleConfirmSpecRevision}>
+                          Confirm
+                        </button>
+                        <button type="button" className="btn" disabled={resolving} onClick={handleCancelSpecRevision}>
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          disabled={decisionText.trim().length === 0 || resolving}
+                          onClick={handleResolveSpecRevision}
+                        >
+                          This changes the spec
+                        </button>
+                        <p className="issue-detail__resolve-why">{SPEC_REVISION_CONFIRM_TEXT}</p>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <p>The agent is not paused and will not be resumed.</p>
