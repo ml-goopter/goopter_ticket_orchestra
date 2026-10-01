@@ -89,7 +89,11 @@ export default async function authRoutes(
     if (!request.session) {
       throw AUTH_REQUIRED;
     }
-    await deleteSession(app.db, request.session.id);
+    const sessionId = request.session.id;
+    await deleteSession(app.db, sessionId);
+    // Close all SSE streams opened with this session (GOT.88).
+    // Session delete must commit before the close, so a failed delete closes nothing.
+    app.realtime.closeSessionStreams(sessionId);
     reply.clearCookie(SESSION_COOKIE_NAME, { path: "/" });
     return {};
   });
