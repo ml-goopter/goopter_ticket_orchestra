@@ -591,53 +591,44 @@ describe("POST /api/tasks/:id/spec/session (P1)", () => {
 });
 
 describe("POST /api/tasks/:id/spec/messages (P2)", () => {
-  it.each(["RUNNING", "WAITING_FOR_USER"] as const)(
-    "enqueues send_message on a %s spec execution",
-    async (execState) => {
-      const { id } = await newTask("SPEC_IN_PROGRESS");
-      const execId = await seedExecution(h.db, id, {
-        role: "spec",
-        state: execState,
-      });
-      const res = await post(`/api/tasks/${id}/spec/messages`, {
-        text: "please add a risk",
-      });
-      expect(res.statusCode).toBe(200);
-      const cmds = await commands(id);
-      expect(cmds).toHaveLength(1);
-      expect(cmds[0]).toMatchObject({
-        type: "send_message",
-        execution_id: execId,
-        created_by: fx.userId,
-        payload: { text: "please add a risk" },
-      });
-    },
-  );
+  // GOT.91 fix1: the worker's plain send_message resume only ever runs a
+  // RUNNING spec session (apps/worker/src/runner/spec.ts ~214-218), so the
+  // api now enqueues only then -- not for any other live state.
+  it("enqueues send_message on a RUNNING spec execution", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const execId = await seedExecution(h.db, id, { role: "spec", state: "RUNNING" });
+    const res = await post(`/api/tasks/${id}/spec/messages`, {
+      text: "please add a risk",
+    });
+    expect(res.statusCode).toBe(200);
+    const cmds = await commands(id);
+    expect(cmds).toHaveLength(1);
+    expect(cmds[0]).toMatchObject({
+      type: "send_message",
+      execution_id: execId,
+      created_by: fx.userId,
+      payload: { text: "please add a risk" },
+    });
+  });
 
   // GOT.57 AC1: the user's side of the chat turn is recorded as a
   // `spec.message` execution event, in the same transaction as the
   // `send_message` command, attached to the live spec execution.
-  it.each(["RUNNING", "WAITING_FOR_USER"] as const)(
-    "writes one spec.message event with the text and author, attached to the %s spec execution",
-    async (execState) => {
-      const { id } = await newTask("SPEC_IN_PROGRESS");
-      const execId = await seedExecution(h.db, id, {
-        role: "spec",
-        state: execState,
-      });
-      const res = await post(`/api/tasks/${id}/spec/messages`, {
-        text: "please add a risk",
-      });
-      expect(res.statusCode).toBe(200);
-      expect(await eventRows(id)).toEqual([
-        {
-          type: "spec.message",
-          execution_id: execId,
-          payload: { text: "please add a risk", author_user_id: fx.userId },
-        },
-      ]);
-    },
-  );
+  it("writes one spec.message event with the text and author, attached to the RUNNING spec execution", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const execId = await seedExecution(h.db, id, { role: "spec", state: "RUNNING" });
+    const res = await post(`/api/tasks/${id}/spec/messages`, {
+      text: "please add a risk",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(await eventRows(id)).toEqual([
+      {
+        type: "spec.message",
+        execution_id: execId,
+        payload: { text: "please add a risk", author_user_id: fx.userId },
+      },
+    ]);
+  });
 
   it("returns 409 without a live spec execution and writes nothing", async () => {
     const { id } = await newTask("SPEC_IN_PROGRESS");
@@ -679,6 +670,24 @@ describe("POST /api/tasks/:id/spec/messages (P2)", () => {
     },
   );
 
+  // GOT.91 fix1 AC1/AC5: QUEUED and ASSIGNED are live but not yet RUNNING --
+  // the session is still starting up, so a message would be queued and
+  // silently skipped by the worker. Fails on 191aa21, which enqueues here.
+  it.each(["QUEUED", "ASSIGNED"] as const)(
+    "returns 409 SPEC_CHAT_UNAVAILABLE and writes nothing when the spec execution is %s",
+    async (execState) => {
+      const { id } = await newTask("SPEC_IN_PROGRESS");
+      await seedExecution(h.db, id, { role: "spec", state: execState });
+      const before = await snapshot(id);
+      const res = await post(`/api/tasks/${id}/spec/messages`, { text: "hi" });
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error).toMatchObject({ code: "SPEC_CHAT_UNAVAILABLE", issueId: null });
+      expect(res.json().error.message).toContain("starting up");
+      expect(await snapshot(id)).toEqual(before);
+      expect(await commands(id)).toHaveLength(0);
+    },
+  );
+
   // GOT.91 AC2: a spec execution only reaches WAITING_FOR_USER behind an
   // open blocking issue (design.md §9.3); the worker's plain send_message
   // resume only runs a RUNNING session, so the api refuses here too, and
@@ -694,16 +703,24 @@ describe("POST /api/tasks/:id/spec/messages (P2)", () => {
     expect(await snapshot(id)).toEqual(before);
   });
 
-  it("enqueues send_message on a WAITING_FOR_USER spec execution whose open issue is non-blocking", async () => {
+  // GOT.91 fix1 AC1/AC5: WAITING_FOR_USER never enqueues now, blocking issue
+  // or not -- the worker's plain send_message resume is RUNNING-only. Fails
+  // on 191aa21, which enqueues here (a 200) because the open issue isn't
+  // blocking.
+  it("returns 409 SPEC_CHAT_UNAVAILABLE and writes nothing on a WAITING_FOR_USER spec execution whose open issue is non-blocking", async () => {
     const { id } = await newTask("SPEC_IN_PROGRESS");
     const execId = await seedExecution(h.db, id, { role: "spec", state: "WAITING_FOR_USER" });
     await seedIssue(h.db, { taskId: id, executionId: execId, blocking: false });
+    const before = await snapshot(id);
     const res = await post(`/api/tasks/${id}/spec/messages`, { text: "hi" });
-    expect(res.statusCode).toBe(200);
-    expect(await commands(id)).toHaveLength(1);
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatchObject({ code: "SPEC_CHAT_UNAVAILABLE", issueId: null });
+    expect(res.json().error.message).toContain("waiting");
+    expect(await snapshot(id)).toEqual(before);
+    expect(await commands(id)).toHaveLength(0);
   });
 
-  it("enqueues send_message on a WAITING_FOR_USER spec execution whose blocking issue is resolved", async () => {
+  it("returns 409 SPEC_CHAT_UNAVAILABLE and writes nothing on a WAITING_FOR_USER spec execution whose blocking issue is resolved", async () => {
     const { id } = await newTask("SPEC_IN_PROGRESS");
     const execId = await seedExecution(h.db, id, { role: "spec", state: "WAITING_FOR_USER" });
     await seedIssue(h.db, {
@@ -712,9 +729,12 @@ describe("POST /api/tasks/:id/spec/messages (P2)", () => {
       blocking: true,
       status: "RESOLVED",
     });
+    const before = await snapshot(id);
     const res = await post(`/api/tasks/${id}/spec/messages`, { text: "hi" });
-    expect(res.statusCode).toBe(200);
-    expect(await commands(id)).toHaveLength(1);
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatchObject({ code: "SPEC_CHAT_UNAVAILABLE", issueId: null });
+    expect(await snapshot(id)).toEqual(before);
+    expect(await commands(id)).toHaveLength(0);
   });
 });
 

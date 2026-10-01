@@ -1101,7 +1101,10 @@ describe("SpecBuilderView", () => {
     expect(link.getAttribute("href")).toBe("/issues/issue-spec-1");
   });
 
-  it("keeps the chat input enabled on a WAITING_FOR_USER spec execution whose open issue is not blocking", async () => {
+  // GOT.91 fix1: the worker's plain send_message resume only ever runs a
+  // RUNNING spec session, so WAITING_FOR_USER stays disabled even when the
+  // open issue isn't blocking -- fails against 191aa21, which re-enables it.
+  it("disables the chat input on a WAITING_FOR_USER spec execution whose open issue is not blocking", async () => {
     const base = makeTaskAggregate();
     const client = makeFakeClient({
       getTask: vi.fn().mockResolvedValue(
@@ -1113,11 +1116,12 @@ describe("SpecBuilderView", () => {
     });
     renderSpecBuilder(client);
 
-    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(false));
-    expect(screen.queryByTestId("chat-disabled-reason")).toBeNull();
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+    expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("Waiting for your response.");
+    expect(screen.queryByTestId("chat-disabled-issue-link")).toBeNull();
   });
 
-  it("keeps the chat input enabled on a WAITING_FOR_USER spec execution whose blocking issue is resolved", async () => {
+  it("disables the chat input on a WAITING_FOR_USER spec execution whose blocking issue is resolved", async () => {
     const base = makeTaskAggregate();
     const client = makeFakeClient({
       getTask: vi.fn().mockResolvedValue(
@@ -1128,6 +1132,62 @@ describe("SpecBuilderView", () => {
       ),
     });
     renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+    expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("Waiting for your response.");
+    expect(screen.queryByTestId("chat-disabled-issue-link")).toBeNull();
+  });
+
+  // GOT.91 fix1 AC1/AC4/AC5: QUEUED/ASSIGNED are live but not yet RUNNING --
+  // the session is still starting up, so the composer stays disabled.
+  it.each(["QUEUED", "ASSIGNED"] as const)(
+    "disables the chat input and shows the reason when the spec execution is %s",
+    async (state) => {
+      const base = makeTaskAggregate();
+      const client = makeFakeClient({
+        getTask: vi.fn().mockResolvedValue(
+          aggregateInProgress({
+            latestExecutions: { spec: { ...base.executions[0]!, state }, implementation: null },
+          }),
+        ),
+      });
+      renderSpecBuilder(client);
+
+      await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+      expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("The spec session is starting up.");
+    },
+  );
+
+  // GOT.91 fix1 AC4: the composer re-enables once an SSE update moves the
+  // spec execution to RUNNING, through the same refetch path the view
+  // already uses for execution.resumed.
+  it("re-enables the chat input once an SSE update moves the spec execution to RUNNING", async () => {
+    const base = makeTaskAggregate();
+    const getTask = vi
+      .fn()
+      .mockResolvedValueOnce(
+        aggregateInProgress({
+          latestExecutions: { spec: { ...base.executions[0]!, state: "ASSIGNED" }, implementation: null },
+        }),
+      )
+      .mockResolvedValueOnce(
+        aggregateInProgress({
+          latestExecutions: { spec: { ...base.executions[0]!, state: "RUNNING" }, implementation: null },
+        }),
+      );
+    const client = makeFakeClient({ getTask });
+    renderSpecBuilder(client);
+
+    await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(true));
+    expect(screen.getByTestId("chat-disabled-reason").textContent).toBe("The spec session is starting up.");
+
+    await act(async () => {
+      currentSource().emit(
+        "execution.resumed",
+        makeTimelineEvent({ id: 1, executionId: "exec-spec-2", type: "execution.resumed", payload: {} }),
+        "1",
+      );
+    });
 
     await waitFor(() => expect((screen.getByLabelText("Message") as HTMLInputElement).disabled).toBe(false));
     expect(screen.queryByTestId("chat-disabled-reason")).toBeNull();

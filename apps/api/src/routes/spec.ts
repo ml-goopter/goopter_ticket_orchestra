@@ -71,12 +71,13 @@ const BUSY_SPEC_EXECUTION_STATES = ["QUEUED", "ASSIGNED", "WAITING_FOR_USER"] as
 const SENT_BACK_TEXT = "The specification was sent back for changes.";
 
 /**
- * Thrown inside `POST /tasks/:id/spec/messages`'s transaction (GOT.91,
- * coordinator D2): the task isn't `SPEC_IN_PROGRESS`, or its spec execution
- * is `WAITING_FOR_USER` on an open blocking issue. Caught by the route to
- * shape the 409 body with the blocking issue's id, `null` when there is
- * none, so the UI can link to it instead of the message being enqueued and
- * silently dropped by the worker.
+ * Thrown inside `POST /tasks/:id/spec/messages`'s transaction (GOT.91 fix1,
+ * coordinator D2): the task isn't `SPEC_IN_PROGRESS`, or its live spec
+ * execution isn't `RUNNING` (still `QUEUED`/`ASSIGNED`, or `WAITING_FOR_USER`).
+ * Caught by the route to shape the 409 body with the open blocking issue's
+ * id when `WAITING_FOR_USER` is behind one, `null` otherwise, so the UI can
+ * link to it instead of the message being enqueued and silently dropped by
+ * the worker (apps/worker/src/runner/spec.ts ~214-218).
  */
 class SpecChatUnavailableError extends Error {
   readonly issueId: string | null;
@@ -295,26 +296,34 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
             "The task has no live spec execution to message.",
           );
         }
-        // GOT.91: a spec execution only reaches `WAITING_FOR_USER` behind an
-        // open blocking issue (design.md §9.3). The worker's plain
-        // `send_message` resume only ever runs a `RUNNING` session, so a
-        // message sent here would otherwise be queued and silently skipped.
-        // Refused before the write, with the issue's id so the UI can link
-        // to it instead of dropping the message.
-        const [waitingExecutionId] = await lockTaskExecutionIds(tx, id, "spec", [
-          "WAITING_FOR_USER",
-        ]);
-        if (waitingExecutionId === executionId) {
-          const openIssues = await listOpenIssues(tx, { taskId: id });
-          const blockingIssue = openIssues.find(
-            (issue) => issue.executionId === executionId && issue.blocking,
-          );
-          if (blockingIssue) {
+        // GOT.91 fix1: the worker's plain `send_message` resume only ever
+        // runs a `RUNNING` spec session (apps/worker/src/runner/spec.ts
+        // ~214-218); every other live state -- `QUEUED`/`ASSIGNED` still
+        // starting, or `WAITING_FOR_USER` (which only happens behind an
+        // open blocking issue, design.md §9.3) -- would otherwise be queued
+        // and silently skipped. Refused here before the write, with the
+        // open blocking issue's id when there is one so the UI can link to
+        // it instead of dropping the message.
+        const [runningExecutionId] = await lockTaskExecutionIds(tx, id, "spec", ["RUNNING"]);
+        if (runningExecutionId !== executionId) {
+          const [waitingExecutionId] = await lockTaskExecutionIds(tx, id, "spec", [
+            "WAITING_FOR_USER",
+          ]);
+          if (waitingExecutionId === executionId) {
+            const openIssues = await listOpenIssues(tx, { taskId: id });
+            const blockingIssue = openIssues.find(
+              (issue) => issue.executionId === executionId && issue.blocking,
+            );
             throw new SpecChatUnavailableError(
-              "The spec chat is unavailable while a blocking issue is open.",
-              blockingIssue.id,
+              blockingIssue
+                ? "The spec chat is unavailable while a blocking issue is open."
+                : "The spec chat is unavailable while waiting for your response.",
+              blockingIssue?.id ?? null,
             );
           }
+          throw new SpecChatUnavailableError(
+            "The spec chat is unavailable while the spec session is starting up.",
+          );
         }
         const command = await insertExecutionCommand(tx, {
           taskId: id,

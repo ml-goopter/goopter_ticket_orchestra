@@ -640,10 +640,13 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const taskState = aggregate.task.state;
   const specExecution = aggregate.latestExecutions.spec;
   const hasLiveSpecExecution = isLiveExecutionState(specExecution?.state);
-  // GOT.91: a spec execution only reaches `WAITING_FOR_USER` behind an open
-  // blocking issue (design.md §9.3); `POST /tasks/:id/spec/messages` refuses
-  // with 409 SPEC_CHAT_UNAVAILABLE there, so the composer is disabled too,
-  // pointing at the issue rather than letting a message silently drop.
+  // GOT.91 fix1: the worker's plain send_message resume only ever runs a
+  // RUNNING spec session (apps/worker/src/runner/spec.ts ~214-218); every
+  // other live state -- QUEUED/ASSIGNED still starting, or WAITING_FOR_USER
+  // (which only happens behind an open blocking issue, design.md §9.3) --
+  // would otherwise be queued and silently dropped, so the composer stays
+  // disabled through them too.
+  const isSpecExecutionRunning = specExecution?.state === "RUNNING";
   const openBlockingIssue =
     specExecution?.state === "WAITING_FOR_USER"
       ? (aggregate.issues.find(
@@ -672,11 +675,15 @@ function SpecBuilderPanel({ id, client: apiClient, createEventSource }: SpecBuil
   const chatDisabledReason: string | null =
     taskState !== "SPEC_IN_PROGRESS"
       ? "The task is not in progress."
-      : !hasLiveSpecExecution
-        ? "No live spec execution."
+      : isSpecExecutionRunning
+        ? null
         : openBlockingIssue
           ? "Waiting on an open issue."
-          : null;
+          : specExecution?.state === "WAITING_FOR_USER"
+            ? "Waiting for your response."
+            : hasLiveSpecExecution
+              ? "The spec session is starting up."
+              : "No live spec execution.";
 
   const isDirty = formContent !== null && formBaseline !== null && !specContentEquals(formContent, formBaseline);
 
