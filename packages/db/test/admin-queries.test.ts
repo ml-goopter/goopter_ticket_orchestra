@@ -915,31 +915,39 @@ describe("updateAdminUser (GOT.61)", () => {
     expect(disabledCount).toBe(1);
   });
 
-  it("concurrent disables of two different users succeed without deadlock when at least three are enabled", async () => {
+  it("concurrent disables of two different users succeed without deadlock when at least three are enabled (GOT.89 F1)", async () => {
     const idA = await insertTestUser(h.db, { email: "admu9-a@example.com" });
     const idB = await insertTestUser(h.db, { email: "admu9-b@example.com" });
     const idC = await insertTestUser(h.db, { email: "admu9-c@example.com" });
 
-    let firstDecided!: () => void;
-    const firstDecidedPromise = new Promise<void>((resolve) => (firstDecided = resolve));
-    let releaseFirst!: () => void;
-    const releaseFirstPromise = new Promise<void>((resolve) => (releaseFirst = resolve));
+    // Barrier: hold `FOR SHARE` on all three rows from a separate connection
+    // so neither disable can take its `enabledRows` `FOR UPDATE` lock until
+    // both have started and are blocked behind this barrier (same pattern
+    // as apps/api/test/admin.test.ts's last-enabled-user race), rather than
+    // letting the first finish selecting before the second even starts.
+    let locked!: () => void;
+    const lockedPromise = new Promise<void>((resolve) => (locked = resolve));
+    let release!: () => void;
+    const releasePromise = new Promise<void>((resolve) => (release = resolve));
+    const blocker = h.sql.begin(async (tx) => {
+      await tx`select 1 from users where id in (${idA}, ${idB}, ${idC}) for share`;
+      locked();
+      await releasePromise;
+    });
+    blocker.catch(() => {});
+    await lockedPromise;
 
     let resultA: UpdateAdminUserResult | undefined;
     let errorA: Error | undefined;
     const firstTx = h.db.transaction(async (tx) => {
       try {
         resultA = await updateAdminUser(tx as unknown as Db, idA, { disabled: true }, now);
-        firstDecided();
-        await releaseFirstPromise;
       } catch (e) {
         errorA = e as Error;
         throw e;
       }
     });
     firstTx.catch(() => {});
-    await firstDecidedPromise;
-    expect(resultA?.status).toBe("ok");
 
     let resultB: UpdateAdminUserResult | undefined;
     let errorB: Error | undefined;
@@ -952,16 +960,19 @@ describe("updateAdminUser (GOT.61)", () => {
       }
     });
     secondTx.catch(() => {});
-    await waitFor(async () => resultB !== undefined || (await lockWaiters()) >= 1, 5000);
 
-    releaseFirst();
-    await firstTx;
-    await secondTx;
+    // Both disables are now blocked behind the barrier's `FOR SHARE` locks,
+    // both trying to take `FOR UPDATE` on the same overlapping row set.
+    await waitFor(async () => (await lockWaiters()) >= 2, 5000);
 
-    expect(resultA?.status).toBe("ok");
-    expect(resultB?.status).toBe("ok");
+    release();
+    await blocker;
+    await Promise.allSettled([firstTx, secondTx]);
+
     expect(errorA).toBeUndefined();
     expect(errorB).toBeUndefined();
+    expect(resultA?.status).toBe("ok");
+    expect(resultB?.status).toBe("ok");
 
     const rowA = await getAdminUserById(h.db, idA);
     const rowB = await getAdminUserById(h.db, idB);
@@ -969,5 +980,105 @@ describe("updateAdminUser (GOT.61)", () => {
     expect(rowA?.disabledAt).not.toBeNull();
     expect(rowB?.disabledAt).not.toBeNull();
     expect(rowC?.disabledAt).toBeNull();
+  });
+
+  it("locks enabled rows in ascending id order, not insertion order (GOT.89 F1)", async () => {
+    // Two different, otherwise-equivalent, FOR-UPDATE scans over the same
+    // overlapping `enabledRows` set can never deadlock each other no matter
+    // what order they lock in: each walks the same plan in the same
+    // sequence, so whichever reaches a contested row first simply wins it,
+    // and the loser blocks there holding nothing -- there is no way for two
+    // sessions following one identical order to each hold what the other
+    // one is waiting for. That means the previous test (two real disables
+    // racing behind a barrier) can never fail no matter what order
+    // `enabledRows` locks in, with or without `.orderBy(asc(users.id))`.
+    // What the ordering actually guards against is a *different* caller
+    // locking the same rows in a different sequence (e.g. by id list order
+    // rather than table order); this test exercises that directly, by
+    // checking which rows a single blocked disable has already locked on
+    // its way to a deliberately-contested one.
+    //
+    // `idHigh` sorts last ascending by id but is inserted (and therefore
+    // heap-scanned) first: `.orderBy(asc(users.id))` makes `enabledRows`
+    // lock `idLow` and `idMid` -- both sort before `idHigh` -- before it
+    // ever reaches `idHigh`. A plain sequential scan (no `.orderBy`) walks
+    // insertion order instead, reaches `idHigh` first, and blocks there
+    // having locked neither.
+    const idHigh = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const idLow = "00000000-0000-4000-8000-000000000001";
+    const idMid = "77777777-7777-4777-8777-777777777777";
+    await h.db.insert(schema.users).values([
+      {
+        id: idHigh,
+        email: "admu10-high@example.com",
+        passwordHash: "not-a-real-hash",
+        displayName: "high",
+      },
+      {
+        id: idLow,
+        email: "admu10-low@example.com",
+        passwordHash: "not-a-real-hash",
+        displayName: "low",
+      },
+      {
+        id: idMid,
+        email: "admu10-mid@example.com",
+        passwordHash: "not-a-real-hash",
+        displayName: "mid",
+      },
+    ]);
+
+    // Barrier: hold `FOR SHARE` on `idHigh` only, from a separate
+    // connection, so `enabledRows` blocks there -- after whatever it has
+    // already locked on its way through the scan.
+    let locked!: () => void;
+    const lockedPromise = new Promise<void>((resolve) => (locked = resolve));
+    let release!: () => void;
+    const releasePromise = new Promise<void>((resolve) => (release = resolve));
+    const blocker = h.sql.begin(async (tx) => {
+      await tx`select 1 from users where id = ${idHigh} for share`;
+      locked();
+      await releasePromise;
+    });
+    blocker.catch(() => {});
+    await lockedPromise;
+
+    let settled = false;
+    let result: UpdateAdminUserResult | undefined;
+    const disablePromise = updateAdminUser(h.db, idLow, { disabled: true }, now).then((r) => {
+      settled = true;
+      result = r;
+    });
+    disablePromise.catch(() => {});
+    await waitFor(async () => settled || (await lockWaiters()) >= 1, 5000);
+    expect(settled).toBe(false); // still blocked behind the barrier on idHigh
+
+    /** Whether a fresh connection can take `FOR UPDATE NOWAIT` on `id` right now. */
+    async function lockableNowait(id: string): Promise<boolean> {
+      try {
+        await h.sql.begin(async (tx) => {
+          await tx`select 1 from users where id = ${id} for update nowait`;
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    // With the ordering, the blocked disable has already locked idLow and
+    // idMid on its way to idHigh: neither is available `NOWAIT` from
+    // another connection. Without it, a plain sequential scan would have
+    // blocked on idHigh immediately, having locked neither -- both would
+    // still be free, and these assertions would fail.
+    expect(await lockableNowait(idLow)).toBe(false);
+    expect(await lockableNowait(idMid)).toBe(false);
+
+    release();
+    await blocker;
+    await disablePromise;
+
+    expect(result?.status).toBe("ok");
+    const rowLow = await getAdminUserById(h.db, idLow);
+    expect(rowLow?.disabledAt).toEqual(now);
   });
 });
