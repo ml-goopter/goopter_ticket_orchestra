@@ -27,6 +27,7 @@ import {
   getTaskState,
   hasLiveSpecExecution,
   insertExecutionUsage,
+  listContainerExecutions,
   loadRunnerContext,
   lockExecutionForTool,
   lockIssue,
@@ -53,7 +54,7 @@ import {
   type TicketContext,
 } from "@orchestra/prompts";
 import { redactToken } from "../agent-tools/invoke.js";
-import { DockerError, containerName } from "../containers/index.js";
+import { DockerError, containerName, ensureMark } from "../containers/index.js";
 import { renewExecutionLease } from "../agent-tools/lease.js";
 import { runWithRenewal } from "./lease-loop.js";
 import {
@@ -475,6 +476,14 @@ export interface Runner {
    * execution, or while the execution is live. Never rejects.
    */
   releaseContainer(executionId: string): Promise<void>;
+  /**
+   * §9.9 Removal, once per tick (GOT.99): removes the agent container of
+   * each spec execution this process ensured one for, or found one for on
+   * the daemon after a restart, that has since ended with no live run here. Request-review completes a spec execution in the
+   * database only, between turns, so no run of this runner sees it end.
+   * Never rejects.
+   */
+  releaseEndedSpecContainers(): Promise<void>;
   isLive(executionId: string): boolean;
   /** Aborts every live run and waits up to `timeoutMs` for them to finish. */
   shutdown(timeoutMs?: number): Promise<void>;
@@ -598,6 +607,14 @@ export function createRunner(deps: RunnerDeps): Runner {
   const testCommandFor =
     deps.testCommandFor ?? ((ctx: RunnerContext) => ctx.repository?.testCommand ?? null);
   const live = new Map<string, RunState>();
+  /**
+   * Spec executions whose container this process ensured, or found on the
+   * daemon at its first pass, and has not removed since (GOT.99).
+   * `releaseEndedSpecContainers` watches them.
+   */
+  const specContainers = new Set<string>();
+  /** GOT.99 F1: true once a pass has added the daemon's spec containers. */
+  let adopted = false;
   let closed = false;
 
   const worker = { kind: "worker" as const, id: workerId };
@@ -727,10 +744,96 @@ export function createRunner(deps: RunnerDeps): Runner {
       const current = await getExecutionState(db, executionId);
       if (current !== null && !ENDED_STATES.has(current)) return;
       await containers.manager.remove(executionId);
+      specContainers.delete(executionId);
       log.info({ state: current }, "agent container removed");
     } catch (err) {
       log.warn({ err: errMessage(err) }, "agent container removal failed");
     }
+  }
+
+  /**
+   * GOT.99, §9.9 Removal: one pass over `specContainers`. An execution that
+   * is live here is skipped. For the rest, one unlocked read finds those
+   * that ended (or are gone); each is removed by `removeIf`, which holds the
+   * container lock and re-checks there that no run went live here, no
+   * `ensure` ran since the mark read before that read, and the execution is
+   * still ended. A resume that starts meanwhile ensures after its state move
+   * and waits for that lock, so it finds the container either kept or gone
+   * and recreates it (§9.9 Recreation). No transaction is open and no row is
+   * locked at any point. A failed docker removal is logged and dropped from
+   * the watch, so a broken daemon is not retried every tick: the orphan pass
+   * (§6.6) removes what is left. A failed read keeps it for the next tick.
+   * The first pass of the process first adopts the spec containers already
+   * on the daemon (`adoptSpecContainers`). Never throws.
+   */
+  async function releaseEndedSpecContainers(): Promise<void> {
+    const containers = deps.containers;
+    if (!containers) return;
+    if (!adopted) adopted = await adoptSpecContainers(containers.manager);
+    const ids = [...specContainers].filter((id) => !live.has(id));
+    if (ids.length === 0) return;
+    const marks = new Map(ids.map((id) => [id, ensureMark(id)]));
+    let states: Map<string, ExecutionState>;
+    try {
+      const rows = await listContainerExecutions(db, ids);
+      states = new Map(rows.map((row) => [row.executionId, row.state]));
+    } catch (err) {
+      logger.error({ err: errMessage(err) }, "spec container watch: execution lookup failed");
+      return;
+    }
+    for (const id of ids) {
+      const state = states.get(id) ?? null;
+      if (state !== null && !ENDED_STATES.has(state)) continue;
+      const log = logger.child({ executionId: id });
+      try {
+        const removed = await containers.manager.removeIf(id, async () => {
+          if (live.has(id) || ensureMark(id) !== marks.get(id)) return false;
+          const current = await getExecutionState(db, id);
+          if (current !== null && !ENDED_STATES.has(current)) return false;
+          // Under the lock: a later resume re-adds it only after its ensure.
+          specContainers.delete(id);
+          return true;
+        });
+        if (removed) {
+          log.info({ state: state ?? "gone" }, "agent container removed, spec execution ended");
+        }
+      } catch (err) {
+        log.warn({ err: errMessage(err) }, "agent container removal failed");
+      }
+    }
+  }
+
+  /**
+   * GOT.99 F1: the watch lives in memory, so after a restart the spec
+   * containers still on the daemon are watched again from here. Adds every
+   * spec execution with a container of this deployment's owner (`list`
+   * returns no other). The role comes from the execution row, so a container
+   * of an implementation execution, or one whose label names no known
+   * execution, stays the orphan pass's (§6.6). Adding one live here, or
+   * still running between turns, is harmless: the pass skips a live
+   * execution and keeps one not ended. Unlocked reads only, no container
+   * lock. True when done; false after a docker or database failure, logged,
+   * so the next tick tries again.
+   */
+  async function adoptSpecContainers(manager: RunnerContainers["manager"]): Promise<boolean> {
+    let executionIds: string[];
+    try {
+      executionIds = (await manager.list()).map((c) => c.executionId);
+    } catch (err) {
+      logger.warn({ err: errMessage(err) }, "spec container watch: agent container list failed");
+      return false;
+    }
+    try {
+      for (const row of await listContainerExecutions(db, executionIds)) {
+        if (specContainers.has(row.executionId)) continue;
+        const ctx = await loadRunnerContext(db, row.executionId);
+        if (ctx?.execution.role === "spec") specContainers.add(row.executionId);
+      }
+    } catch (err) {
+      logger.error({ err: errMessage(err) }, "spec container watch: execution lookup failed");
+      return false;
+    }
+    return true;
   }
 
   function track(
@@ -858,6 +961,8 @@ export function createRunner(deps: RunnerDeps): Runner {
         image: agentImageFor(ctx),
         worktreePath,
       });
+      // GOT.99: the api can end a spec execution between turns.
+      if (ctx.execution.role === "spec") specContainers.add(executionId);
     } catch (err) {
       log.warn({ err: errMessage(err) }, "agent container could not be ensured");
       try {
@@ -2528,11 +2633,13 @@ export function createRunner(deps: RunnerDeps): Runner {
         if (!isContainerMode({ ...loaded, repository })) return;
         if (live.has(executionId)) return;
         await containers.manager.remove(executionId);
+        specContainers.delete(executionId);
         log.info({ state: loaded.execution.state }, "agent container removed");
       } catch (err) {
         log.warn({ err: errMessage(err) }, "agent container removal failed");
       }
     },
+    releaseEndedSpecContainers,
     isLive: (executionId) => live.has(executionId),
     async shutdown(timeoutMs = DEFAULT_RUNNER_SHUTDOWN_TIMEOUT_MS) {
       closed = true;

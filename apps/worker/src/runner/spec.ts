@@ -158,9 +158,15 @@ const isIssueMessage = (payload: unknown): boolean =>
 
 export function registerSpecHandlers(
   handlers: CommandHandlers,
-  runner: Pick<Runner, "startSpec" | "resume" | "isLive">,
+  runner: Pick<Runner, "startSpec" | "resume" | "isLive"> &
+    Partial<Pick<Runner, "releaseEndedSpecContainers">>,
   options: SpecHandlerOptions = {},
 ): void {
+  // GOT.99, §9.9 Removal: request-review completes a spec execution with no
+  // command, so every tick checks the spec containers this worker holds.
+  const release = runner.releaseEndedSpecContainers;
+  if (release) handlers.registerTickHook(() => release.call(runner));
+
   handlers.registerCommandHandler("start_spec_session", async (command, ctx) => {
     const log = ctx.logger.child({ commandId: command.id, taskId: command.taskId });
     if (command.executionId !== null) {

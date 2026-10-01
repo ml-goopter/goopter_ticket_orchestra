@@ -6,7 +6,7 @@ import {
   type ExecutionCommandRow,
 } from "@orchestra/db";
 import type { Logger } from "../logger.js";
-import type { Phase } from "../tick.js";
+import type { Phase, TickContext } from "../tick.js";
 
 /**
  * design.md §6.1 command consumer. Each command type has at most one
@@ -45,16 +45,28 @@ export type CommandHandler = (
   ctx: CommandContext,
 ) => Promise<CommandOutcome | void>;
 
+/**
+ * Work the `consume_commands` phase runs on every tick after its commands,
+ * for a state change the api makes with no command (GOT.99: request-review
+ * completing a spec execution between turns).
+ */
+export type TickHook = (ctx: CommandContext) => Promise<void>;
+
 export interface CommandHandlers {
   /** Throws when `type` already has a handler. */
   registerCommandHandler(type: CommandType, handler: CommandHandler): void;
   handlerFor(type: CommandType): CommandHandler | undefined;
   /** Types with a handler, in registration order. */
   types(): CommandType[];
+  /** Adds a hook the phase runs on every tick, after the claimed commands. */
+  registerTickHook(hook: TickHook): void;
+  /** Hooks in registration order. */
+  tickHooks(): TickHook[];
 }
 
 export function createCommandHandlers(): CommandHandlers {
   const handlers = new Map<CommandType, CommandHandler>();
+  const hooks: TickHook[] = [];
   return {
     registerCommandHandler(type, handler) {
       if (handlers.has(type)) {
@@ -64,6 +76,10 @@ export function createCommandHandlers(): CommandHandlers {
     },
     handlerFor: (type) => handlers.get(type),
     types: () => [...handlers.keys()],
+    registerTickHook(hook) {
+      hooks.push(hook);
+    },
+    tickHooks: () => [...hooks],
   };
 }
 
@@ -73,7 +89,8 @@ export function createCommandHandlers(): CommandHandlers {
  * `created_at` order. `completed_at` is set once a handler resolves
  * `handled` or `skipped`; an `unclaimed` command is left for the next claim
  * (`CommandOutcome`). A handler that throws is logged and its command stays
- * claimed and uncompleted; the next command still runs.
+ * claimed and uncompleted; the next command still runs. Then each tick hook
+ * runs in order; one that throws is logged and the next still runs.
  */
 export function createConsumeCommandsPhase(
   handlers: CommandHandlers = createCommandHandlers(),
@@ -87,6 +104,7 @@ export function createConsumeCommandsPhase(
           { phase: "consume_commands", tick: ctx.tick },
           "no command handlers registered, not claiming",
         );
+        await runTickHooks(handlers, ctx);
         return;
       }
 
@@ -139,8 +157,28 @@ export function createConsumeCommandsPhase(
           );
         }
       }
+      await runTickHooks(handlers, ctx);
     },
   };
+}
+
+async function runTickHooks(handlers: CommandHandlers, ctx: TickContext): Promise<void> {
+  for (const hook of handlers.tickHooks()) {
+    try {
+      await hook({
+        db: ctx.db,
+        workerId: ctx.workerId,
+        host: ctx.config.host,
+        now: ctx.now,
+        logger: ctx.logger,
+      });
+    } catch (err) {
+      ctx.logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "command tick hook failed",
+      );
+    }
+  }
 }
 
 /** What the cancel handler needs from the runner. */
