@@ -22,6 +22,38 @@ export const SpecContentSchema = z.object({
 
 export type SpecContent = z.infer<typeof SpecContentSchema>;
 
+/**
+ * A Jira issue key: a project key (`^[A-Z][A-Z0-9_]+$`, the same shape
+ * `apps/api/src/routes/projects.ts`'s `KEY_RE` enforces) followed by `-` and
+ * a number (GOT.90/GOT.100, coordinator decision D1).
+ */
+export const JIRA_KEY_PATTERN = /^[A-Z][A-Z0-9_]+-\d+$/;
+
+/**
+ * `dependencies` entries that are not Jira issue keys, in input order
+ * (GOT.90/GOT.100). Checked only at write time (`propose_spec`, `PUT
+ * /tasks/:id/spec/draft`) -- never by `SpecContentSchema` itself, so a draft
+ * already stored with prose in `dependencies` still parses (design.md §4.3).
+ */
+export function invalidDependencyEntries(
+  dependencies: readonly string[],
+): string[] {
+  return dependencies.filter((entry) => !JIRA_KEY_PATTERN.test(entry));
+}
+
+/**
+ * The message surfaced to both the spec agent (`propose_spec`) and the
+ * `PUT /tasks/:id/spec/draft` route when `dependencies` holds a non-key
+ * entry (GOT.90/GOT.100).
+ */
+export function invalidDependenciesMessage(invalid: readonly string[]): string {
+  return (
+    `dependencies must hold only Jira issue keys of tasks this one depends ` +
+    `on (empty when none; put other blockers in risks or a raised issue): ` +
+    invalid.join(", ")
+  );
+}
+
 export type SpecApprovalResult =
   | { ok: true; content: SpecContent }
   | { ok: false; errors: string[] };

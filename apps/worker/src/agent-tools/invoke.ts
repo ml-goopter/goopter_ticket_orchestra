@@ -11,6 +11,7 @@ import type { Logger } from "../logger.js";
 import { renewExecutionLease } from "./lease.js";
 import type { ExecutionRegistry, LiveExecution } from "./registry.js";
 import {
+  InvalidDependenciesError,
   RepositoryLockedError,
   ReviewRequiredError,
   type ToolContext,
@@ -30,6 +31,7 @@ export type ToolErrorCode =
   | "NOT_FOUND"
   | "REPOSITORY_LOCKED"
   | "REVIEW_REQUIRED"
+  | "INVALID_DEPENDENCIES"
   | "INTERNAL";
 
 export const REDACTED = "[REDACTED]";
@@ -104,6 +106,9 @@ function classify(err: unknown): { code: ToolErrorCode; message: string } {
   }
   if (err instanceof ReviewRequiredError) {
     return { code: "REVIEW_REQUIRED", message: err.message };
+  }
+  if (err instanceof InvalidDependenciesError) {
+    return { code: "INVALID_DEPENDENCIES", message: err.message };
   }
   return { code: "INTERNAL", message: "Internal error. The call had no effect." };
 }
