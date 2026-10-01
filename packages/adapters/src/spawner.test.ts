@@ -23,8 +23,19 @@ async function readAll(stream: AsyncIterable<string | Uint8Array>): Promise<stri
   return text;
 }
 
+// How long waitFor/waitDead poll before giving up. Process creation and
+// reaping both go through the OS scheduler, so under real contention (many
+// processes forking/exiting at once, as in a full `pnpm test` run) these can
+// legitimately take seconds longer than they do on an idle machine. 5s/3s
+// deadlines were observed timing out here with 14-28 copies of this file
+// running in parallel while every assertion still passed once it finished;
+// see the per-test `it(..., TEST_TIMEOUT_MS)` below for the matching vitest
+// test timeout.
+const POLL_BUDGET_MS = 20_000;
+const TEST_TIMEOUT_MS = 65_000;
+
 async function waitFor(file: string): Promise<number> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + POLL_BUDGET_MS;
   for (;;) {
     try {
       const text = (await readFile(file, "utf8")).trim();
@@ -38,7 +49,7 @@ async function waitFor(file: string): Promise<number> {
 }
 
 async function waitDead(pids: number[]): Promise<void> {
-  const deadline = Date.now() + 3_000;
+  const deadline = Date.now() + POLL_BUDGET_MS;
   while (pids.some(alive) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -80,63 +91,76 @@ describe("spawnHostProcess (design.md §9.9 host spawner)", () => {
     expect(exit).toEqual({ code: 4, signal: null });
   });
 
-  it("kill() with no signal SIGKILLs the whole process group, including grandchildren", async () => {
-    const selfPid = join(dir, "self.pid");
-    const childPid = join(dir, "child.pid");
-    const script = join(dir, "run.sh");
-    await writeFile(
-      script,
-      [
-        "#!/bin/sh",
-        `echo $$ > "${selfPid}"`,
-        `sh -c 'echo $$ > "$1"; exec sleep 30' sh "${childPid}" &`,
-        "wait",
-        "",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
-    const child = spawnHostProcess(script, [], { cwd: dir, env: process.env });
-    child.stdout.resume();
-    child.stderr.resume();
-    const pids = [await waitFor(selfPid), await waitFor(childPid)];
-    leftovers.push(...pids);
-    expect(pids.every(alive)).toBe(true);
+  it(
+    "kill() with no signal SIGKILLs the whole process group, including grandchildren",
+    async () => {
+      const selfPid = join(dir, "self.pid");
+      const childPid = join(dir, "child.pid");
+      const script = join(dir, "run.sh");
+      await writeFile(
+        script,
+        [
+          "#!/bin/sh",
+          `echo $$ > "${selfPid}"`,
+          `sh -c 'echo $$ > "$1"; exec sleep 30' sh "${childPid}" &`,
+          "wait",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      const child = spawnHostProcess(script, [], { cwd: dir, env: process.env });
+      child.stdout.resume();
+      child.stderr.resume();
+      const pids = [await waitFor(selfPid), await waitFor(childPid)];
+      leftovers.push(...pids);
+      expect(pids.every(alive)).toBe(true);
 
-    child.kill();
-    expect(await child.exit).toEqual({ code: null, signal: "SIGKILL" });
-    await waitDead(pids);
-    expect(pids.some(alive)).toBe(false);
-  });
+      child.kill();
+      expect(await child.exit).toEqual({ code: null, signal: "SIGKILL" });
+      await waitDead(pids);
+      expect(pids.some(alive)).toBe(false);
+    },
+    // Must exceed waitFor x2 + waitDead's POLL_BUDGET_MS, or vitest cancels
+    // the test before the helpers' own deadlines fire. Matches the headroom
+    // packages/db and apps/worker already grant their process-heavy tests.
+    TEST_TIMEOUT_MS,
+  );
 
-  it("kill(signal) delivers that signal to the whole process group", async () => {
-    const selfPid = join(dir, "self.pid");
-    const childPid = join(dir, "child.pid");
-    const trapped = join(dir, "trapped");
-    const script = join(dir, "run.sh");
-    // The grandchild records the signal it received, proving the group got it.
-    await writeFile(
-      script,
-      [
-        "#!/bin/sh",
-        `echo $$ > "${selfPid}"`,
-        `sh -c 'trap "echo TERM > \\"$2\\"; exit 0" TERM; echo $$ > "$1"; while :; do sleep 0.05; done' sh "${childPid}" "${trapped}" &`,
-        "wait",
-        "",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
-    const child = spawnHostProcess(script, [], { cwd: dir, env: process.env });
-    child.stdout.resume();
-    child.stderr.resume();
-    const pids = [await waitFor(selfPid), await waitFor(childPid)];
-    leftovers.push(...pids);
+  it(
+    "kill(signal) delivers that signal to the whole process group",
+    async () => {
+      const selfPid = join(dir, "self.pid");
+      const childPid = join(dir, "child.pid");
+      const trapped = join(dir, "trapped");
+      const script = join(dir, "run.sh");
+      // The grandchild records the signal it received, proving the group got it.
+      await writeFile(
+        script,
+        [
+          "#!/bin/sh",
+          `echo $$ > "${selfPid}"`,
+          `sh -c 'trap "echo TERM > \\"$2\\"; exit 0" TERM; echo $$ > "$1"; while :; do sleep 0.05; done' sh "${childPid}" "${trapped}" &`,
+          "wait",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      const child = spawnHostProcess(script, [], { cwd: dir, env: process.env });
+      child.stdout.resume();
+      child.stderr.resume();
+      const pids = [await waitFor(selfPid), await waitFor(childPid)];
+      leftovers.push(...pids);
 
-    child.kill("SIGTERM");
-    expect(await child.exit).toEqual({ code: null, signal: "SIGTERM" });
-    await waitDead(pids);
-    expect(pids.some(alive)).toBe(false);
-    expect((await readFile(trapped, "utf8")).trim()).toBe("TERM");
-  });
+      child.kill("SIGTERM");
+      expect(await child.exit).toEqual({ code: null, signal: "SIGTERM" });
+      await waitDead(pids);
+      expect(pids.some(alive)).toBe(false);
+      expect((await readFile(trapped, "utf8")).trim()).toBe("TERM");
+    },
+    // Same waitFor/waitDead budget as the grandchildren test above, so it
+    // needs the same headroom.
+    TEST_TIMEOUT_MS,
+  );
 
   it("rejects exit when the command cannot be started", async () => {
     const child = spawnHostProcess(join(dir, "no-such-binary"), [], {
