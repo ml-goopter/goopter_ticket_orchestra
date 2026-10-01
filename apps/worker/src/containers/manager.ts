@@ -1,18 +1,25 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { spawnHostProcess, type ProcessSpawner } from "@orchestra/adapters";
-import type { ExecutionRole } from "@orchestra/core";
+import { spawnHostProcess, type AgentProcess, type ProcessSpawner } from "@orchestra/adapters";
+import {
+  CLAUDE_AUTH_FILE_PATH,
+  claudeAuthFileContent,
+  type ExecutionRole,
+} from "@orchestra/core";
 import type { Logger } from "../logger.js";
 import { SETUP_OUTPUT_TAIL_BYTES } from "../worktrees/errors.js";
 import {
   DOCKER_TIMEOUT_MS,
   checkDocker,
   createDockerRunner,
+  dockerClientEnv,
   dockerFailure,
   isForwardableEnvName,
   runDocker,
+  spawnFailure,
   type DockerRunner,
 } from "./docker.js";
+import { DOCKER_STDERR_LIMIT, DockerError } from "./errors.js";
 import { forgetEnsure, recordEnsure, withExecutionContainerLock } from "./guard.js";
 import { launchInContainer, createContainerSpawner, type ContainerSpawnerDeps } from "./spawner.js";
 
@@ -286,6 +293,8 @@ export class ContainerManager {
    * missing one is created, and a stopped or paused one is removed and
    * recreated, from this call's inputs: no state lives only in the
    * container, so a resume after a worker restart gets the same mounts.
+   * Either way it then writes the Claude credential file from `input.env`
+   * (see `#writeClaudeAuth`).
    *
    * Runs under the execution's container lock and records a new ensure
    * mark (see `guard.ts`), so a sweeper removal that decided before this
@@ -311,8 +320,78 @@ export class ContainerManager {
     const handle = { name, executionId: input.executionId, taskId: input.taskId, worktreePath, home };
     return withExecutionContainerLock(input.executionId, async () => {
       recordEnsure(input.executionId);
-      return this.#ensureLocked(input, handle, repoPath);
+      const container = await this.#ensureLocked(input, handle, repoPath);
+      await this.#writeClaudeAuth(name, input.env);
+      return container;
     });
+  }
+
+  /**
+   * Writes `CLAUDE_AUTH_FILE_PATH` in the container from `env`'s Claude
+   * credential (design.md §9.9 Auth), on a created and a reused container
+   * alike. No file when `env` has none. The value travels only on the
+   * stdin of `docker exec -i`, never in an argument or a log record. The
+   * file is written next to its final path and renamed, so a reader never
+   * sees it half-written. Any failure is a `DockerError`.
+   */
+  async #writeClaudeAuth(container: string, env: Readonly<Record<string, string>>): Promise<void> {
+    const content = claudeAuthFileContent(env);
+    if (content === null) return;
+    const tmp = `${CLAUDE_AUTH_FILE_PATH}.tmp`;
+    const args = [
+      "exec",
+      "-i",
+      container,
+      "sh",
+      "-c",
+      `umask 077 && cat > ${tmp} && mv -f ${tmp} ${CLAUDE_AUTH_FILE_PATH}`,
+    ];
+    let client: AgentProcess;
+    try {
+      client = this.#spawnClient(this.#binary, args, {
+        cwd: process.cwd(),
+        env: dockerClientEnv(this.#hostEnv ?? process.env),
+      });
+    } catch (err) {
+      throw spawnFailure(args, err);
+    }
+    let stderr = "";
+    client.stdout.resume();
+    client.stderr.on("data", (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString("utf8")).slice(-DOCKER_STDERR_LIMIT);
+    });
+    client.stdin.on("error", () => {});
+    client.stdin.end(content);
+
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        client.kill("SIGKILL");
+        reject(
+          new DockerError({
+            reason: "timeout",
+            args,
+            exitCode: null,
+            stderr: `timed out after ${this.#timeoutMs} ms`,
+          }),
+        );
+      }, this.#timeoutMs);
+    });
+    try {
+      const exit = await Promise.race([
+        client.exit.catch((err: unknown) => {
+          throw spawnFailure(args, err);
+        }),
+        timeout,
+      ]);
+      if (exit.code !== 0) {
+        // Lets stderr already read by the client arrive.
+        await new Promise((resolve) => setImmediate(resolve));
+        throw dockerFailure(args, { exitCode: exit.code, stderr });
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async #ensureLocked(

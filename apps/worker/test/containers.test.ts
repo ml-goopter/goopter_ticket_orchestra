@@ -9,6 +9,7 @@ import type {
   ProcessSpawner,
   ProcessSpawnOptions,
 } from "@orchestra/adapters";
+import { CLAUDE_AUTH_FILE_PATH } from "@orchestra/core";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   AGENT_NETWORK,
@@ -158,6 +159,30 @@ function fakeSpawner(onKill?: (client: FakeClient, signal: string) => void) {
   return { spawn, clients };
 }
 
+/**
+ * Exec clients that read stdin to its end, then call `onInput` (by default
+ * exit 0). Stands in for the `docker exec -i` that writes the Claude
+ * credential file.
+ */
+function stdinSpawner(
+  onInput: (client: FakeClient, input: string) => void = (client) =>
+    client.finish({ code: 0, signal: null }),
+) {
+  const fake = fakeSpawner();
+  const inputs: string[] = [];
+  const spawn: ProcessSpawner = (command, args, options) => {
+    const client = fake.spawn(command, args, options) as FakeClient;
+    let input = "";
+    client.stdin.on("data", (chunk: Buffer) => (input += chunk.toString("utf8")));
+    client.stdin.on("end", () => {
+      inputs.push(input);
+      onInput(client, input);
+    });
+    return client;
+  };
+  return { spawn, clients: fake.clients, inputs };
+}
+
 function manager(
   run: DockerRunner,
   extra: Partial<ConstructorParameters<typeof ContainerManager>[0]> = {},
@@ -171,6 +196,8 @@ function manager(
     run,
     uid: 501,
     gid: 20,
+    // Never the real docker CLI: `ensure` writes the credential file with an exec client.
+    spawnClient: stdinSpawner().spawn,
     ...extra,
   });
 }
@@ -513,12 +540,221 @@ describe("ContainerManager.ensure", () => {
 
   it("runs as the worker's own uid and gid by default", async () => {
     const docker = fakeDocker(freshHost());
-    const m = new ContainerManager({ workspaceRoot: root, image: IMAGE, cpus: 1.5, memory: "512m", owner: OWNER, run: docker.run });
+    const m = new ContainerManager({ workspaceRoot: root, image: IMAGE, cpus: 1.5, memory: "512m", owner: OWNER, run: docker.run, spawnClient: stdinSpawner().spawn });
     await m.ensure(ensureInput());
     const args = docker.calls.find((c) => c.args[0] === "run")!.args;
     expect(args[args.indexOf("--user") + 1]).toBe(`${process.getuid!()}:${process.getgid!()}`);
     expect(args[args.indexOf("--cpus") + 1]).toBe("1.5");
     expect(args[args.indexOf("--memory") + 1]).toBe("512m");
+  });
+});
+
+describe("ContainerManager.ensure writes the Claude credential file (design.md §9.9 Auth)", () => {
+  const SECRET_KEY = "sk-ant-api-SECRETVALUE_key";
+  const NAME = `orchestra-exec-${EXEC}`;
+
+  function recordingLogger() {
+    const lines: string[] = [];
+    const record = (level: string) => (fields: unknown, msg: string) =>
+      void lines.push(`${level} ${msg} ${JSON.stringify(fields)}`);
+    const logger = {
+      debug: record("debug"),
+      info: record("info"),
+      warn: record("warn"),
+      error: record("error"),
+      child: () => logger,
+    };
+    return { logger, lines };
+  }
+
+  function expectWriteExec(client: FakeClient): void {
+    expect(client.command).toBe("docker");
+    expect(client.args.slice(0, 5)).toEqual(["exec", "-i", NAME, "sh", "-c"]);
+    expect(client.args).toHaveLength(6);
+    const script = client.args[5]!;
+    expect(script).toMatch(/^umask 077\s*(;|&&)/);
+    expect(script).toContain(CLAUDE_AUTH_FILE_PATH);
+  }
+
+  function expectNoSecret(
+    docker: ReturnType<typeof fakeDocker>,
+    clients: FakeClient[],
+    lines: string[] = [],
+  ): void {
+    const seen = [
+      ...docker.calls.flatMap((c) => c.args),
+      ...clients.flatMap((c) => [c.command, ...c.args, JSON.stringify(c.options)]),
+      ...lines,
+    ].join("\n");
+    expect(seen).not.toContain("SECRETVALUE");
+  }
+
+  it("writes NAME=value on stdin of docker exec -i after creating the container", async () => {
+    const order: string[] = [];
+    const host = freshHost();
+    const docker = fakeDocker((args) => {
+      order.push(args.slice(0, 2).join(" "));
+      return host(args);
+    });
+    const writer = stdinSpawner((client) => {
+      order.push("write");
+      client.finish({ code: 0, signal: null });
+    });
+    const { logger, lines } = recordingLogger();
+
+    const handle = await manager(docker.run, { spawnClient: writer.spawn, logger }).ensure(
+      ensureInput(),
+    );
+
+    expect(handle.created).toBe(true);
+    expect(writer.clients).toHaveLength(1);
+    expectWriteExec(writer.clients[0]!);
+    expect(writer.inputs).toEqual([`CLAUDE_CODE_OAUTH_TOKEN=${SECRET_CLAUDE}\n`]);
+    expect(order).toEqual([
+      "container inspect",
+      "network inspect",
+      "run -d",
+      "container inspect",
+      "write",
+    ]);
+    expectNoSecret(docker, writer.clients, lines);
+  });
+
+  it("writes the file when a running container is reused (a container from before this change gets it)", async () => {
+    const docker = fakeDocker((args) =>
+      args[0] === "container" && args[1] === "inspect" ? RUNNING : undefined,
+    );
+    const writer = stdinSpawner();
+    const { logger, lines } = recordingLogger();
+
+    const handle = await manager(docker.run, { spawnClient: writer.spawn, logger }).ensure(
+      ensureInput(),
+    );
+
+    expect(handle.created).toBe(false);
+    expect(docker.verbs()).toEqual(["container inspect"]);
+    expect(writer.clients).toHaveLength(1);
+    expectWriteExec(writer.clients[0]!);
+    expect(writer.inputs).toEqual([`CLAUDE_CODE_OAUTH_TOKEN=${SECRET_CLAUDE}\n`]);
+    expectNoSecret(docker, writer.clients, lines);
+  });
+
+  it("writes the file when a concurrent ensure won the name", async () => {
+    let inspects = 0;
+    const docker = fakeDocker(
+      freshHost((args) => {
+        if (args[0] === "container" && args[1] === "inspect") {
+          return ++inspects === 1 ? NOT_FOUND : RUNNING;
+        }
+        if (args[0] === "run") {
+          return { exitCode: 125, stderr: `Conflict. The container name "/${NAME}" is already in use` };
+        }
+        return undefined;
+      }),
+    );
+    const writer = stdinSpawner();
+    const handle = await manager(docker.run, { spawnClient: writer.spawn }).ensure(ensureInput());
+    expect(handle.created).toBe(false);
+    expect(writer.inputs).toEqual([`CLAUDE_CODE_OAUTH_TOKEN=${SECRET_CLAUDE}\n`]);
+  });
+
+  it("writes on every ensure, not only the first", async () => {
+    const docker = fakeDocker((args) =>
+      args[0] === "container" && args[1] === "inspect" ? RUNNING : undefined,
+    );
+    const writer = stdinSpawner();
+    const m = manager(docker.run, { spawnClient: writer.spawn });
+    await m.ensure(ensureInput());
+    await m.ensure(ensureInput());
+    expect(writer.inputs).toHaveLength(2);
+  });
+
+  it("prefers the OAuth token over the API key, and falls back to the API key (AC5)", async () => {
+    const reused = () =>
+      fakeDocker((args) => (args[0] === "container" && args[1] === "inspect" ? RUNNING : undefined));
+
+    const both = stdinSpawner();
+    const d1 = reused();
+    await manager(d1.run, { spawnClient: both.spawn }).ensure(
+      ensureInput({ env: { CLAUDE_CODE_OAUTH_TOKEN: SECRET_CLAUDE, ANTHROPIC_API_KEY: SECRET_KEY } }),
+    );
+    expect(both.inputs).toEqual([`CLAUDE_CODE_OAUTH_TOKEN=${SECRET_CLAUDE}\n`]);
+    expectNoSecret(d1, both.clients);
+
+    const keyOnly = stdinSpawner();
+    const d2 = reused();
+    await manager(d2.run, { spawnClient: keyOnly.spawn }).ensure(
+      ensureInput({ env: { GITHUB_TOKEN: SECRET_GH, ANTHROPIC_API_KEY: SECRET_KEY } }),
+    );
+    expect(keyOnly.inputs).toEqual([`ANTHROPIC_API_KEY=${SECRET_KEY}\n`]);
+    expectNoSecret(d2, keyOnly.clients);
+  });
+
+  it("writes no file when neither Claude credential is configured", async () => {
+    const docker = fakeDocker(freshHost());
+    const writer = stdinSpawner();
+    await manager(docker.run, { spawnClient: writer.spawn }).ensure(
+      ensureInput({ env: { GITHUB_TOKEN: SECRET_GH, OPENAI_API_KEY: "sk-SECRETVALUE_openai" } }),
+    );
+    expect(writer.clients).toEqual([]);
+  });
+
+  it("a write exiting non-zero throws DockerError carrying no secret", async () => {
+    const docker = fakeDocker((args) =>
+      args[0] === "container" && args[1] === "inspect" ? RUNNING : undefined,
+    );
+    const writer = stdinSpawner((client) => {
+      (client.stderr as PassThrough).write(`sh: can't create ${CLAUDE_AUTH_FILE_PATH}.tmp: Permission denied\n`);
+      client.finish({ code: 1, signal: null });
+    });
+    const { logger, lines } = recordingLogger();
+
+    const err = await manager(docker.run, { spawnClient: writer.spawn, logger })
+      .ensure(ensureInput())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(DockerError);
+    expect(err).toMatchObject({ reason: "failed", exitCode: 1 });
+    expect((err as DockerError).message).toMatch(/Permission denied/);
+    expect(JSON.stringify({ ...(err as DockerError), message: (err as DockerError).message })).not.toContain(
+      "SECRETVALUE",
+    );
+    expectNoSecret(docker, writer.clients, lines);
+  });
+
+  it("a write whose exec client fails to start throws DockerError", async () => {
+    const docker = fakeDocker((args) =>
+      args[0] === "container" && args[1] === "inspect" ? RUNNING : undefined,
+    );
+    const failing = stdinSpawner((client) =>
+      client.fail(Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" })),
+    );
+    const err1 = await manager(docker.run, { spawnClient: failing.spawn })
+      .ensure(ensureInput())
+      .catch((e: unknown) => e);
+    expect(err1).toBeInstanceOf(DockerError);
+    expect((err1 as DockerError).reason).toBe("unavailable");
+
+    const throwing: ProcessSpawner = () => {
+      throw new Error("spawn EAGAIN");
+    };
+    const err2 = await manager(docker.run, { spawnClient: throwing })
+      .ensure(ensureInput())
+      .catch((e: unknown) => e);
+    expect(err2).toBeInstanceOf(DockerError);
+  });
+
+  it("a write that does not finish in time throws DockerError reason timeout and kills the client", async () => {
+    const docker = fakeDocker((args) =>
+      args[0] === "container" && args[1] === "inspect" ? RUNNING : undefined,
+    );
+    const hanging = stdinSpawner(() => {});
+    const err = await manager(docker.run, { spawnClient: hanging.spawn, timeoutMs: 50 })
+      .ensure(ensureInput())
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DockerError);
+    expect((err as DockerError).reason).toBe("timeout");
+    expect(hanging.clients[0]!.killed).toEqual(["SIGKILL"]);
   });
 });
 

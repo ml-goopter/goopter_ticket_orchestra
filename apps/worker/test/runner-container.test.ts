@@ -12,7 +12,7 @@ import type {
   ResumeRequest,
   StartRequest,
 } from "@orchestra/adapters";
-import type { Runtime } from "@orchestra/core";
+import { claudeAuthFileContent, type Runtime } from "@orchestra/core";
 import {
   agentWorkers,
   executions,
@@ -876,6 +876,22 @@ describe("environment (§9.9 Environment)", () => {
     expect(h.containers.ensures[0]!.env.OPENAI_API_KEY).toBe("sk-openai-key");
     expect(h.made[0]!.runtime).toBe("codex");
   });
+
+  it.each<[string, Runtime, Partial<typeof CREDENTIALS>, string | null]>([
+    ["both configured: the OAuth token", "claude", {}, "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-token\n"],
+    ["no OAuth token: the API key", "claude", { claudeCodeOauthToken: undefined }, "ANTHROPIC_API_KEY=sk-ant-api-key\n"],
+    ["neither: no file", "claude", { claudeCodeOauthToken: undefined, anthropicApiKey: undefined }, null],
+    ["a Codex execution: still the OAuth token (D5)", "codex", {}, "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-token\n"],
+  ])(
+    "the Claude credential file ensure writes comes from the same credentials as the container env, %s (§9.9 Auth)",
+    async (_label, runtime, credentials, expected) => {
+      const s = await seedClaimed({ runtime });
+      const h = makeRunner({ workerId: s.workerId, runtime, credentials });
+      h.adapter.script = finishTurn;
+      await h.runner.start({ executionId: s.executionId, taskId: s.taskId });
+      expect(claudeAuthFileContent(h.containers.ensures[0]!.env)).toBe(expected);
+    },
+  );
 });
 
 describe("failures (§9.5, §9.9 Scheduling)", () => {

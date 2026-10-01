@@ -964,7 +964,11 @@ Nothing else from the host is mounted: no host home directory, no keychain, no S
 | `OPENAI_API_KEY` | Codex repositories only |
 | `HOME`, `PATH` | the mounted agent home; the image PATH with the review wrapper first |
 
+The Claude credential from this list also reaches the container as a file, described under Auth.
+
 **Auth.** The operator runs `claude setup-token` once on any machine with the subscription login. The resulting long-lived token goes into `CLAUDE_CODE_OAUTH_TOKEN` in the worker environment, which keeps usage on the subscription. `ANTHROPIC_API_KEY` is the fallback and bills per token. Cost stays labelled estimated (OI2).
+
+The Claude CLI strips `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and its other auth variables from the environment of every command its Bash tool runs. The implementation agent launches `orchestra-review` through that tool, so the wrapper and its nested review session would start without a credential. The worker therefore writes the credential to `/run/orchestra/claude-auth` on every container ensure, created or reused, whenever a Claude credential is configured. The file is one line, `CLAUDE_CODE_OAUTH_TOKEN=<value>` or `ANTHROPIC_API_KEY=<value>`, chosen with the same preference as the environment above, mode 0600, in the container's own filesystem rather than a host mount. The value travels only on the stdin of `docker exec -i`, never in an argument or a log line. `orchestra-review` reads the file only when its own environment has neither variable, and adds the credential to its review session's environment. A missing file changes nothing, so host mode keeps the keychain. A malformed file or any other name makes the wrapper exit 3 without echoing the file.
 
 **Network.** Containers join a dedicated bridge network, `orchestra-agents`, with open egress. The agent-tools server keeps its loopback listener for host-mode agents and adds a listener reachable from that network. On Docker Desktop that is `http://host.docker.internal:<WORKER_TOOLS_PORT>/mcp`. On Linux it is the bridge gateway address. The bearer token remains the only authentication. An egress allow-list is OI7.
 

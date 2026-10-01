@@ -6,8 +6,11 @@ import {
   type StartRequest,
 } from "@orchestra/adapters";
 import {
+  CLAUDE_AUTH_ENV_NAMES,
+  CLAUDE_AUTH_FILE_PATH,
   EXECUTION_CONTEXT_PATH,
   ExecutionContextSchema,
+  parseClaudeAuthFile,
   type ExecutionContext,
   type ReviewFindingsDocument,
 } from "@orchestra/core";
@@ -43,6 +46,8 @@ export interface RunDeps {
   createAdapter?: (runtime: "claude") => AgentAdapter;
   createReporter?: (url: string, token: string) => ReviewReporter;
   signal?: AbortSignal;
+  /** The container's Claude credential file. Defaults to `CLAUDE_AUTH_FILE_PATH`. */
+  claudeAuthFile?: string;
 }
 
 interface SessionResult {
@@ -110,7 +115,10 @@ export async function runReview(deps: RunDeps): Promise<number> {
       prompt,
       allowedTools: "review",
       mcp: { url, token },
-      env: sessionEnv(deps.env),
+      env: await withClaudeAuth(
+        sessionEnv(deps.env),
+        deps.claudeAuthFile ?? CLAUDE_AUTH_FILE_PATH,
+      ),
     };
     if (context.review_command !== null) request.testCommand = context.review_command;
 
@@ -183,6 +191,37 @@ function sessionEnv(
     if (value !== undefined && key !== "ORCHESTRA_TOKEN") out[key] = value;
   }
   return out;
+}
+
+/**
+ * Adds the Claude credential from the container's credential file when
+ * `env` has none (design.md §9.9 Auth): the Claude CLI strips auth
+ * variables from commands its Bash tool runs, which is how the agent
+ * launches this wrapper. A credential already in `env` wins and the file
+ * is not read. A missing file changes nothing (host mode uses the
+ * keychain). An unreadable or malformed file fails the run; no error
+ * message carries any of the file's content.
+ */
+async function withClaudeAuth(
+  env: Record<string, string>,
+  file: string,
+): Promise<Record<string, string>> {
+  if (CLAUDE_AUTH_ENV_NAMES.some((name) => env[name])) return env;
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT") return env;
+    throw new ReviewError(`cannot read ${file}: ${code ?? "unknown error"}`);
+  }
+  const auth = parseClaudeAuthFile(raw);
+  if (auth === null) {
+    throw new ReviewError(
+      `${file} is malformed: expected a single NAME=value line naming an allowed Claude credential`,
+    );
+  }
+  return { ...env, [auth.name]: auth.value };
 }
 
 /**
