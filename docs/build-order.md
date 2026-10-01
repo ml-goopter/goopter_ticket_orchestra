@@ -96,6 +96,7 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | fixes | GOT.106 | worker, review-wrapper: orchestra-review gets the Claude credential in containers via /run/orchestra/claude-auth | #101 |
 | fixes | GOT.104 | web: inline confirmation for "This changes the spec" in the issue view, no window.confirm | #102 |
 | fixes | GOT.90, GOT.100 | core, worker, api, prompts: spec dependencies hold Jira keys only; propose_spec INVALID_DEPENDENCIES tool error, PUT draft 422 | #103 |
+| fixes | GOT.96 | worker: shutdown signal listener installed before any await (tsx force-exits 143 with no listener); workerId kept on shutdown lines | #104 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
