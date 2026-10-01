@@ -19,6 +19,7 @@ import {
   seedDependency,
   seedExecution,
   seedFixtures,
+  seedIssue,
   seedSession,
   seedTask,
   sessionCookieHeader,
@@ -657,6 +658,63 @@ describe("POST /api/tasks/:id/spec/messages (P2)", () => {
     expect((await post(`/api/tasks/${id}/spec/messages`, {})).statusCode).toBe(400);
     expect(await commands(id)).toHaveLength(0);
     expect(await eventTypes(id)).toHaveLength(0);
+  });
+
+  // GOT.91 AC1: the worker drops a spec chat message outside
+  // SPEC_IN_PROGRESS (apps/worker/src/runner/spec.ts); the api now refuses
+  // it instead, before any read of the task's executions.
+  it.each(["NEEDS_SPEC", "SPEC_REVIEW", "SPEC_APPROVED"] as const)(
+    "returns 409 SPEC_CHAT_UNAVAILABLE and writes nothing when the task is %s",
+    async (state) => {
+      const { id } = await newTask(state);
+      const before = await snapshot(id);
+      const res = await post(`/api/tasks/${id}/spec/messages`, { text: "hi" });
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error).toMatchObject({
+        code: "SPEC_CHAT_UNAVAILABLE",
+        issueId: null,
+      });
+      expect(res.json().error.message).toContain(state);
+      expect(await snapshot(id)).toEqual(before);
+    },
+  );
+
+  // GOT.91 AC2: a spec execution only reaches WAITING_FOR_USER behind an
+  // open blocking issue (design.md §9.3); the worker's plain send_message
+  // resume only runs a RUNNING session, so the api refuses here too, and
+  // carries the issue's id for the UI to link to.
+  it("returns 409 SPEC_CHAT_UNAVAILABLE with the open blocking issue's id and writes nothing", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const execId = await seedExecution(h.db, id, { role: "spec", state: "WAITING_FOR_USER" });
+    const issueId = await seedIssue(h.db, { taskId: id, executionId: execId, blocking: true });
+    const before = await snapshot(id);
+    const res = await post(`/api/tasks/${id}/spec/messages`, { text: "hi" });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatchObject({ code: "SPEC_CHAT_UNAVAILABLE", issueId });
+    expect(await snapshot(id)).toEqual(before);
+  });
+
+  it("enqueues send_message on a WAITING_FOR_USER spec execution whose open issue is non-blocking", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const execId = await seedExecution(h.db, id, { role: "spec", state: "WAITING_FOR_USER" });
+    await seedIssue(h.db, { taskId: id, executionId: execId, blocking: false });
+    const res = await post(`/api/tasks/${id}/spec/messages`, { text: "hi" });
+    expect(res.statusCode).toBe(200);
+    expect(await commands(id)).toHaveLength(1);
+  });
+
+  it("enqueues send_message on a WAITING_FOR_USER spec execution whose blocking issue is resolved", async () => {
+    const { id } = await newTask("SPEC_IN_PROGRESS");
+    const execId = await seedExecution(h.db, id, { role: "spec", state: "WAITING_FOR_USER" });
+    await seedIssue(h.db, {
+      taskId: id,
+      executionId: execId,
+      blocking: true,
+      status: "RESOLVED",
+    });
+    const res = await post(`/api/tasks/${id}/spec/messages`, { text: "hi" });
+    expect(res.statusCode).toBe(200);
+    expect(await commands(id)).toHaveLength(1);
   });
 });
 

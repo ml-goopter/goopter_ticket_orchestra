@@ -20,6 +20,7 @@ import {
   insertDraftRevision,
   insertExecutionCommand,
   listDependencies,
+  listOpenIssues,
   lockDependencyGraph,
   lockRepositoryById,
   lockTaskExecutionIds,
@@ -68,6 +69,23 @@ const BUSY_SPEC_EXECUTION_STATES = ["QUEUED", "ASSIGNED", "WAITING_FOR_USER"] as
 
 /** The `send_message` text the send-back route enqueues (GOT.37 C45). */
 const SENT_BACK_TEXT = "The specification was sent back for changes.";
+
+/**
+ * Thrown inside `POST /tasks/:id/spec/messages`'s transaction (GOT.91,
+ * coordinator D2): the task isn't `SPEC_IN_PROGRESS`, or its spec execution
+ * is `WAITING_FOR_USER` on an open blocking issue. Caught by the route to
+ * shape the 409 body with the blocking issue's id, `null` when there is
+ * none, so the UI can link to it instead of the message being enqueued and
+ * silently dropped by the worker.
+ */
+class SpecChatUnavailableError extends Error {
+  readonly issueId: string | null;
+  constructor(message: string, issueId: string | null = null) {
+    super(message);
+    this.name = "SpecChatUnavailableError";
+    this.issueId = issueId;
+  }
+}
 
 /** Dependency states that make an approved task `BLOCKED` (§6.2). */
 const FAILED_DEPENDENCY_STATES: ReadonlySet<TaskState> = new Set<TaskState>([
@@ -245,7 +263,7 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
-  app.post("/tasks/:id/spec/messages", async (request) => {
+  app.post("/tasks/:id/spec/messages", async (request, reply) => {
     const id = parseTaskId(request.params);
     const body = MessageBodySchema.safeParse(request.body ?? {});
     if (!body.success) {
@@ -254,7 +272,16 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
     const actor = userActor(request);
     try {
       return await app.db.transaction(async (tx) => {
-        await lockTask(tx, id);
+        const task = await lockTask(tx, id);
+        // GOT.91: the worker only ever resumes a spec chat message while the
+        // task is SPEC_IN_PROGRESS (apps/worker/src/runner/spec.ts); refused
+        // here too, before any execution read or write, so the user sees a
+        // 409 instead of a silently dropped command.
+        if (task.state !== "SPEC_IN_PROGRESS") {
+          throw new SpecChatUnavailableError(
+            `The spec chat is only available while the task is in progress, task is ${task.state}.`,
+          );
+        }
         const [executionId] = await lockTaskExecutionIds(
           tx,
           id,
@@ -267,6 +294,27 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
             "NO_LIVE_SPEC_EXECUTION",
             "The task has no live spec execution to message.",
           );
+        }
+        // GOT.91: a spec execution only reaches `WAITING_FOR_USER` behind an
+        // open blocking issue (design.md §9.3). The worker's plain
+        // `send_message` resume only ever runs a `RUNNING` session, so a
+        // message sent here would otherwise be queued and silently skipped.
+        // Refused before the write, with the issue's id so the UI can link
+        // to it instead of dropping the message.
+        const [waitingExecutionId] = await lockTaskExecutionIds(tx, id, "spec", [
+          "WAITING_FOR_USER",
+        ]);
+        if (waitingExecutionId === executionId) {
+          const openIssues = await listOpenIssues(tx, { taskId: id });
+          const blockingIssue = openIssues.find(
+            (issue) => issue.executionId === executionId && issue.blocking,
+          );
+          if (blockingIssue) {
+            throw new SpecChatUnavailableError(
+              "The spec chat is unavailable while a blocking issue is open.",
+              blockingIssue.id,
+            );
+          }
         }
         const command = await insertExecutionCommand(tx, {
           taskId: id,
@@ -288,6 +336,16 @@ export default async function specRoutes(app: FastifyInstance): Promise<void> {
         return { commandId: command.id, executionId };
       });
     } catch (err) {
+      if (err instanceof SpecChatUnavailableError) {
+        reply.code(409);
+        return {
+          error: {
+            code: "SPEC_CHAT_UNAVAILABLE",
+            message: err.message,
+            issueId: err.issueId,
+          },
+        };
+      }
       rethrowTransitionError(err);
     }
   });
