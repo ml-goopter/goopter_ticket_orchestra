@@ -28,6 +28,7 @@ import {
   hasLiveSpecExecution,
   insertExecutionUsage,
   listContainerExecutions,
+  loadLatestEarlierImplementation,
   loadRunnerContext,
   lockExecutionForTool,
   lockIssue,
@@ -1784,7 +1785,9 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   /**
    * C27: before a fresh retry, push the failed attempt's local branch when
-   * it ran on this host, so the new worktree starts from its commits. Runs
+   * it ran on this host, so the new worktree starts from its commits. A new
+   * execution claimed from READY passes the task's latest earlier
+   * implementation execution here the same way (GOT.95). Runs
    * outside any transaction. A failure is logged and the retry goes on.
    */
   async function pushPreviousBranch(
@@ -1818,7 +1821,9 @@ export function createRunner(deps: RunnerDeps): Runner {
    * `nudge` when the retry is a protocol one (C26, F3). With `reuse` (C32)
    * the session starts in the failed attempt's worktree the retry took
    * over, and nothing is pushed or prepared. Without it, a retry pushes the
-   * failed attempt's branch first when it ran on this host (C27). Every
+   * failed attempt's branch first when it ran on this host (C27), and a
+   * new execution claimed from READY pushes the task's latest earlier
+   * implementation execution's branch on the same terms (GOT.95). Every
    * prepared worktree, a retry's or a new execution's claimed from READY,
    * starts from the task's remote branch, or from the default branch when
    * the remote has none (§9.5, GOT.94). A new execution without `retryOf`
@@ -1866,7 +1871,12 @@ export function createRunner(deps: RunnerDeps): Runner {
       if (reuse) {
         prepared = { worktreePath: reuse.worktreePath, branch: reuse.branch };
       } else {
-        if (retryOf) await pushPreviousBranch(ctx, retryOf, log);
+        // C27, GOT.95: a new execution claimed from READY (a human retry
+        // or a reopen) pushes the task's latest earlier implementation
+        // execution's branch the same way, so its unpushed commits are not
+        // left on the old worktree's detached HEAD.
+        const previous = retryOf ?? (await loadLatestEarlierImplementation(db, ctx.execution.id));
+        if (previous) await pushPreviousBranch(ctx, previous, log);
         prepared = await deps.worktrees.prepareImplementation({
           executionId: ctx.execution.id,
           repository: {
