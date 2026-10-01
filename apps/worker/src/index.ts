@@ -52,10 +52,13 @@ import { DEFAULT_TICK_INTERVAL_MS, createTickLoop } from "./tick.js";
  * none of which belong in a container. It talks to Postgres and nothing else
  * in the control plane — there is no api-to-worker RPC.
  *
- * Startup order matters. Config is validated before anything opens a socket,
- * registration happens before the first tick so a phase always has a worker
- * row to attribute work to, and signal handlers go on last so a shutdown
- * always has something coherent to shut down.
+ * Startup order matters. The SIGTERM/SIGINT listener is installed first,
+ * before this function's first `await`, so the process always has an
+ * application-level signal handler (GOT.96); config is validated before
+ * anything opens a socket, registration happens before the first tick so a
+ * phase always has a worker row to attribute work to, and the handler's real
+ * stop function -- the thing that makes a shutdown coherent -- is wired in
+ * last, once every subsystem it touches exists.
  */
 
 /**
@@ -74,6 +77,52 @@ async function main(): Promise<void> {
   const bootstrap: Logger = createLogger({
     level: "info",
     host: os.hostname(),
+  });
+
+  // GOT.96: install the signal handlers synchronously, before the first
+  // `await` below, so the process has an application-level SIGTERM/SIGINT
+  // listener from its very first tick -- before `registerWorker` below ever
+  // makes the worker's row visible to anything watching for it. `index.ts`
+  // runs under tsx (design.md §15.2 test harness), and tsx's loader treats a
+  // signal arriving while `process.listenerCount(signal)` is 0 as
+  // unhandled: it force-exits the process with `128 + signal` itself,
+  // bypassing the `exit(0)`/`exit(1)` calls below entirely. That raced with
+  // the rest of this function's startup work (registration, pricing, the
+  // tools server, docker, the pollers, the runner, the tick loop) all
+  // running *before* `installSignalHandlers` used to be called at the
+  // bottom of this function, and surfaced as shutdown.test.ts intermittently
+  // observing `{ code: 143, signal: null }` instead of `{ code: 0, signal:
+  // null }`. The real teardown isn't assembled this early, so `stop` here
+  // awaits `ready`, which startup resolves with the real stop function once
+  // every subsystem below exists; by the time that resolves, the entire
+  // startup sequence (and so every resource `stop` touches) is guaranteed to
+  // have completed, whatever point mid-startup the signal actually arrived.
+  let resolveReady!: (stop: () => Promise<void>) => void;
+  const ready = new Promise<() => Promise<void>>((resolve) => {
+    resolveReady = resolve;
+  });
+  // The handler above has to be given a logger before `workerId` exists, but
+  // its "shutting down"/"shutdown complete" lines should carry `workerId`
+  // once registration below has assigned one -- as they did before GOT.96
+  // moved installation earlier. `shutdownLogger` forwards every call to
+  // whichever logger `currentLogger` points at *when the signal fires*, so
+  // swapping `currentLogger` to `log.child({ workerId })` after registration
+  // (below) is enough; a signal that arrives before that swap still logs
+  // and exits cleanly through `bootstrap`, just without `workerId`.
+  let currentLogger: Logger = bootstrap;
+  const shutdownLogger: Logger = {
+    debug: (fields, msg) => currentLogger.debug(fields, msg),
+    info: (fields, msg) => currentLogger.info(fields, msg),
+    warn: (fields, msg) => currentLogger.warn(fields, msg),
+    error: (fields, msg) => currentLogger.error(fields, msg),
+    child: (fields) => currentLogger.child(fields),
+  };
+  installSignalHandlers({
+    logger: shutdownLogger,
+    stop: async () => {
+      const stop = await ready;
+      await stop();
+    },
   });
 
   let config;
@@ -116,6 +165,8 @@ async function main(): Promise<void> {
   }
 
   const log = logger.child({ workerId });
+  // From here on, a signal's shutdown log lines carry `workerId` too.
+  currentLogger = log;
   log.info({ config: redactConfig(config) }, "worker registered");
 
   // GOT.82, design.md §9.3, §6.3: a spec execution stays `RUNNING` with a
@@ -342,22 +393,22 @@ async function main(): Promise<void> {
     "worker started",
   );
 
-  installSignalHandlers({
-    logger: log,
-    stop: async () => {
-      await loop.stop();
-      // No retry may be handed to a runner that is shutting down.
-      await stopRetryStarter();
-      // Abort live sessions and let their finally blocks revoke tokens
-      // before the tools server and the db go away.
-      await runner.shutdown();
-      await toolsServer.stop();
-      await stopJiraPoller();
-      await stopJiraWriteback();
-      await stopGitHubPoller();
-      await stopHeartbeat();
-      await closeDb(db);
-    },
+  // The real stop function, now that every subsystem it touches exists.
+  // See the `installSignalHandlers` call at the top of this function for why
+  // this is wired through `resolveReady` rather than called directly here.
+  resolveReady(async () => {
+    await loop.stop();
+    // No retry may be handed to a runner that is shutting down.
+    await stopRetryStarter();
+    // Abort live sessions and let their finally blocks revoke tokens
+    // before the tools server and the db go away.
+    await runner.shutdown();
+    await toolsServer.stop();
+    await stopJiraPoller();
+    await stopJiraWriteback();
+    await stopGitHubPoller();
+    await stopHeartbeat();
+    await closeDb(db);
   });
 }
 

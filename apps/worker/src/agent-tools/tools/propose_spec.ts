@@ -1,5 +1,6 @@
+import { invalidDependencyEntries } from "@orchestra/core";
 import { appendEvent, findRepositoryById, upsertDraftSpecificationRevision } from "@orchestra/db";
-import { defineTool, RepositoryLockedError } from "../tool.js";
+import { defineTool, InvalidDependenciesError, RepositoryLockedError } from "../tool.js";
 
 /**
  * design.md §8: upsert the task's single draft revision and write
@@ -12,12 +13,22 @@ import { defineTool, RepositoryLockedError } from "../tool.js";
  * different one is refused with `RepositoryLockedError`, mapped by
  * `invoke.ts` to the `REPOSITORY_LOCKED` tool error code rather than
  * `INTERNAL`. An empty `repository` makes no claim either way.
+ *
+ * GOT.90/GOT.100: `dependencies` must hold only Jira issue keys (coordinator
+ * D1), checked before any write so an invalid call leaves the draft
+ * untouched. `invoke.ts` maps `InvalidDependenciesError` (defined in
+ * `../tool.js`, beside `RepositoryLockedError`) to the
+ * `INVALID_DEPENDENCIES` tool error code.
  */
 export const proposeSpec = defineTool({
   name: "propose_spec",
   description:
     "Spec sessions only: save the full specification as the task's draft. Each call replaces the previous draft.",
   async run({ tx, auth, now }, input) {
+    const invalidDependencies = invalidDependencyEntries(input.dependencies);
+    if (invalidDependencies.length > 0) {
+      throw new InvalidDependenciesError(invalidDependencies);
+    }
     if (input.repository !== "" && auth.task.repositoryId !== null) {
       const repository = await findRepositoryById(tx, auth.task.repositoryId);
       if (repository !== null && repository.name !== input.repository) {

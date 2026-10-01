@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { Link, MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IssueApiClient } from "../api/client.js";
@@ -260,8 +260,26 @@ describe("IssueDetailView", () => {
     ).toBeTruthy();
   });
 
-  it("shows the confirm before a spec_revision resolve, sends kind spec_revision, and navigates to the spec builder (AC5)", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+  it("GOT.104: choosing the spec-revision resolution shows an inline confirmation group instead of window.confirm", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm");
+    const client = makeFakeClient();
+    renderIssue(client);
+
+    await waitFor(() => expect(screen.getByTestId("issue-status")).toBeTruthy());
+    fireEvent.change(screen.getByTestId("decision-text"), { target: { value: "Change the approach" } });
+    fireEvent.click(screen.getByRole("button", { name: "This changes the spec" }));
+
+    const group = screen.getByRole("group", { name: "Confirm spec revision" });
+    expect(group.textContent).toContain(
+      "This creates a draft revision from the approved spec with your decision appended, and reopens the spec builder. Continue?",
+    );
+    expect(within(group).getByRole("button", { name: "Confirm" })).toBeTruthy();
+    expect(within(group).getByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(confirmSpy).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+
+  it("GOT.104: Confirm sends the same spec_revision request the old confirmed path sent, and navigates to the spec builder (AC5)", async () => {
     const resolveIssue = vi.fn().mockResolvedValue({
       issueId: "issue-2",
       decisionId: "decision-x",
@@ -276,20 +294,20 @@ describe("IssueDetailView", () => {
     await waitFor(() => expect(screen.getByTestId("issue-status")).toBeTruthy());
     fireEvent.change(screen.getByTestId("decision-text"), { target: { value: "Change the approach" } });
     fireEvent.click(screen.getByRole("button", { name: "This changes the spec" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
 
-    expect(confirmSpy).toHaveBeenCalled();
     await waitFor(() =>
-      expect(resolveIssue).toHaveBeenCalledWith(
-        "issue-2",
-        expect.objectContaining({ kind: "spec_revision", decision: "Change the approach" }),
-      ),
+      expect(resolveIssue).toHaveBeenCalledWith("issue-2", {
+        kind: "spec_revision",
+        decision: "Change the approach",
+        clarification: undefined,
+        chosenOption: "cursor",
+      }),
     );
     await waitFor(() => expect(screen.getByText("Spec builder for task-1")).toBeTruthy());
-    confirmSpy.mockRestore();
   });
 
-  it("does not resolve as spec_revision when the confirm is dismissed", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+  it("GOT.104: Cancel sends no request and returns the view to its prior state", async () => {
     const resolveIssue = vi.fn();
     const client = makeFakeClient({ resolveIssue });
     renderIssue(client);
@@ -297,10 +315,64 @@ describe("IssueDetailView", () => {
     await waitFor(() => expect(screen.getByTestId("issue-status")).toBeTruthy());
     fireEvent.change(screen.getByTestId("decision-text"), { target: { value: "Change the approach" } });
     fireEvent.click(screen.getByRole("button", { name: "This changes the spec" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
-    expect(confirmSpy).toHaveBeenCalled();
     expect(resolveIssue).not.toHaveBeenCalled();
-    confirmSpy.mockRestore();
+    expect(screen.queryByRole("group", { name: "Confirm spec revision" })).toBeNull();
+    expect(screen.getByRole("button", { name: "This changes the spec" })).toBeTruthy();
+    expect((screen.getByTestId("decision-text") as HTMLTextAreaElement).value).toBe("Change the approach");
+  });
+
+  it("GOT.104: double-clicking Confirm sends exactly one spec_revision request, and disables Confirm/Cancel while in flight", async () => {
+    let resolveRequest!: (value: {
+      issueId: string;
+      decisionId: string;
+      kind: string;
+      commandId: string | null;
+      task: { from: string; to: string } | null;
+      revisionId: string | null;
+    }) => void;
+    const requestPromise = new Promise<{
+      issueId: string;
+      decisionId: string;
+      kind: string;
+      commandId: string | null;
+      task: { from: string; to: string } | null;
+      revisionId: string | null;
+    }>((resolve) => {
+      resolveRequest = resolve;
+    });
+    const resolveIssue = vi.fn().mockReturnValue(requestPromise);
+    const client = makeFakeClient({ resolveIssue });
+    renderIssue(client);
+
+    await waitFor(() => expect(screen.getByTestId("issue-status")).toBeTruthy());
+    fireEvent.change(screen.getByTestId("decision-text"), { target: { value: "Change the approach" } });
+    fireEvent.click(screen.getByRole("button", { name: "This changes the spec" }));
+
+    const confirmButton = screen.getByRole("button", { name: "Confirm" }) as HTMLButtonElement;
+    const cancelButton = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+
+    expect(resolveIssue).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(confirmButton.disabled).toBe(true));
+    expect(cancelButton.disabled).toBe(true);
+
+    await act(async () => {
+      resolveRequest({
+        issueId: "issue-2",
+        decisionId: "decision-x",
+        kind: "spec_revision",
+        commandId: null,
+        task: { from: "IMPLEMENTING", to: "SPEC_IN_PROGRESS" },
+        revisionId: "rev-3",
+      });
+      await requestPromise;
+    });
+
+    expect(resolveIssue).toHaveBeenCalledTimes(1);
   });
 
   it("a non-blocking OPEN issue shows only the clarification action with the note (AC6)", async () => {
