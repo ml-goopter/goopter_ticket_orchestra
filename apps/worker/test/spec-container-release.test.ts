@@ -97,15 +97,44 @@ const NOT_FOUND = (name: string): DockerResult => ({
 const OK = (stdout = ""): DockerResult => ({ exitCode: 0, stdout, stderr: "" });
 const RUNNING_STATE = '{"Status":"running","Running":true,"Paused":false,"Restarting":false}\n';
 
+/** The value of `--label <key>=<value>` in `run -d` arguments, or "". */
+const labelOf = (args: string[], key: string): string =>
+  args.flatMap((a, i) => (args[i - 1] === "--label" && a.startsWith(`${key}=`) ? [a.slice(key.length + 1)] : []))[0] ??
+  "";
+
 /**
  * A daemon holding containers by name. `run -d` creates one, `rm` deletes
- * one, `container inspect` reports it running or missing. `gate` blocks
- * the next call whose verb matches until released.
+ * one, `container inspect` reports it running or missing, `ps` lists them
+ * all with their labels (ignoring its filters, so the caller's own owner
+ * check is what keeps another deployment's out). `gate` blocks the next
+ * call whose verb matches until released; `failNext` fails it.
  */
 class FakeDaemon {
   readonly containers = new Map<string, string[]>();
   readonly calls: string[][] = [];
   #gates: Array<{ verb: string; entered: () => void; released: Promise<void> }> = [];
+  #failing = new Set<string>();
+
+  /** The next `verb` call fails as an unreachable daemon would. */
+  failNext(verb: "ps"): void {
+    this.#failing.add(verb);
+  }
+
+  /** A container another process created, labelled for `executionId`. */
+  place(executionId: string, owner: string): string {
+    const name = `orchestra-exec-${executionId}`;
+    this.containers.set(name, [
+      "run",
+      "-d",
+      "--name",
+      name,
+      "--label",
+      `orchestra.execution=${executionId}`,
+      "--label",
+      `orchestra.owner=${owner}`,
+    ]);
+    return name;
+  }
 
   /** Blocks the next `verb` call. Resolves `entered` when it arrives. */
   gate(verb: "rm" | "run" | "container"): { entered: Promise<void>; release: () => void } {
@@ -132,6 +161,21 @@ class FakeDaemon {
       const [g] = this.#gates.splice(i, 1);
       g!.entered();
       await g!.released;
+    }
+    if (this.#failing.delete(args[0]!)) {
+      return { exitCode: 1, stdout: "", stderr: "Cannot connect to the Docker daemon\n" };
+    }
+    if (args[0] === "ps") {
+      const lines = [...this.containers].map(([name, run], i) =>
+        [
+          `id${i}`,
+          name,
+          labelOf(run, "orchestra.execution"),
+          labelOf(run, "orchestra.task"),
+          labelOf(run, "orchestra.owner"),
+        ].join("\t"),
+      );
+      return OK(lines.map((l) => `${l}\n`).join(""));
     }
     if (args[0] === "network") return OK("[]\n");
     if (args[0] === "container" && args[1] === "inspect") {
@@ -199,12 +243,14 @@ interface Seeded {
 }
 
 /** A container-mode SPEC_IN_PROGRESS task and its ASSIGNED spec execution pinned here. */
-async function seedSpec(): Promise<Seeded> {
+async function seedSpec(workerId?: string): Promise<Seeded> {
   const n = ++seq;
-  const [worker] = await db
-    .insert(agentWorkers)
-    .values({ host: HOST, capabilities: ["docker"], maxConcurrent: 4, workspaceRoot: workRoot })
-    .returning({ id: agentWorkers.id });
+  const [worker] = workerId
+    ? [{ id: workerId }]
+    : await db
+        .insert(agentWorkers)
+        .values({ host: HOST, capabilities: ["docker"], maxConcurrent: 4, workspaceRoot: workRoot })
+        .returning({ id: agentWorkers.id });
   const [project] = await db
     .insert(projects)
     .values({ key: `GNN${n}`, name: `got99 ${n}`, jiraJql: `project = GNN${n}` })
@@ -302,8 +348,15 @@ interface Harness {
   tick(): Promise<void>;
 }
 
-function makeHarness(workerId: string): Harness {
-  const daemon = new FakeDaemon();
+interface HarnessOptions {
+  /** A daemon an earlier runner used: the containers outlive the process. */
+  daemon?: FakeDaemon;
+  /** How often a live spec run polls its state. Defaults to 50 ms. */
+  blockingPollMs?: number;
+}
+
+function makeHarness(workerId: string, options: HarnessOptions = {}): Harness {
+  const daemon = options.daemon ?? new FakeDaemon();
   const adapter = new ScriptedAdapter();
   const manager = new ContainerManager({
     workspaceRoot: workRoot,
@@ -337,7 +390,7 @@ function makeHarness(workerId: string): Harness {
     toolsUrl: () => "http://127.0.0.1:4999/mcp",
     quietTimeoutMs: 10_000,
     basePath: "/usr/bin:/bin",
-    timings: { leaseRenewMs: 60_000, blockingPollMs: 50 },
+    timings: { leaseRenewMs: 60_000, blockingPollMs: options.blockingPollMs ?? 50 },
     containers: {
       manager,
       toolsUrl: () => "http://host.docker.internal:4999/mcp",
@@ -621,5 +674,237 @@ describe("spec container removal after request-review (GOT.99, §9.9 Lifecycle)"
     expect(h.daemon.containers.has(`orchestra-exec-${s.executionId}`)).toBe(false);
     await h.tick();
     expect(h.daemon.calls.filter((c) => c[0] === "rm")).toHaveLength(1);
+  });
+});
+
+// ------------------------------------------------- restart (GOT.99 F1)
+
+/** A worker restart: the runner stops, a fresh one starts on the same daemon. */
+async function restart(h: Seeded & Harness, options: HarnessOptions = {}): Promise<Harness> {
+  await h.runner.shutdown(2000);
+  return makeHarness(h.workerId, { ...options, daemon: h.daemon });
+}
+
+/** An ended execution of `role` on `taskId`, written as the api or a run would leave it. */
+async function endedExecution(
+  s: Seeded,
+  role: "spec" | "implementation",
+): Promise<string> {
+  const [row] = await db
+    .insert(executions)
+    .values({
+      taskId: s.taskId,
+      role,
+      attempt: 2,
+      state: "COMPLETED",
+      runtime: "claude",
+      model: "claude-opus-test",
+      workerId: s.workerId,
+      host: HOST,
+      endedAt: NOW,
+    })
+    .returning({ id: executions.id });
+  return row!.id;
+}
+
+const OTHER_OWNER = "ffffffffffffffffffffffffffffffff";
+
+const rms = (d: FakeDaemon) => d.calls.filter((c) => c[0] === "rm");
+
+describe("spec containers that outlive a worker restart (GOT.99 F1, §9.9 Lifecycle)", () => {
+  it("AC1: the fresh runner's first tick removes one the api completed while the worker was down; a send-back recreates it", async () => {
+    const h1 = await specBetweenTurns();
+    await h1.runner.shutdown(2000);
+    await requestReview(h1.taskId);
+
+    const h2 = makeHarness(h1.workerId, { daemon: h1.daemon });
+    await h2.tick();
+    expect(h1.daemon.containers.has(h1.name)).toBe(false);
+    expect(rms(h1.daemon)).toEqual([["rm", "-f", "-v", h1.name]]);
+
+    // The daemon is listed once per process: a later tick calls docker no more.
+    const calls = h1.daemon.calls.length;
+    await h2.tick();
+    expect(h1.daemon.calls).toHaveLength(calls);
+
+    let runningAtTurn: boolean | undefined;
+    h2.adapter.onResume = () => {
+      runningAtTurn = h1.daemon.containers.has(h1.name);
+    };
+    await sendBack(h1.taskId);
+    await h2.tick();
+    await idle(h2.runner, h1.executionId);
+    expect(h2.adapter.resumes).toHaveLength(1);
+    expect(runningAtTurn).toBe(true);
+    const [first, second] = h1.daemon.runs();
+    expect(mounts(second!)).toEqual(mounts(first!));
+  });
+
+  it("AC1: one still RUNNING at the restart is kept, then removed on the tick after the api completes it", async () => {
+    const h1 = await specBetweenTurns();
+    const h2 = await restart(h1);
+
+    await h2.tick();
+    expect(h1.daemon.containers.has(h1.name)).toBe(true);
+    expect(rms(h1.daemon)).toEqual([]);
+
+    await requestReview(h1.taskId);
+    await h2.tick();
+    expect(h1.daemon.containers.has(h1.name)).toBe(false);
+    expect(rms(h1.daemon)).toEqual([["rm", "-f", "-v", h1.name]]);
+  });
+
+  it("AC2: never touches an implementation container, another owner's, or one naming no known execution", async () => {
+    const h1 = await specBetweenTurns();
+    const other = await seedSpec(h1.workerId);
+    const theirs = h1.daemon.place(await endedExecution(other, "spec"), OTHER_OWNER);
+    const implementation = h1.daemon.place(await endedExecution(other, "implementation"), OWNER);
+    const stray = h1.daemon.place("not-a-uuid", OWNER);
+    const unknown = h1.daemon.place("aaaaaaaa-0000-4000-8000-000000000099", OWNER);
+    const h2 = await restart(h1);
+    await requestReview(h1.taskId);
+
+    await h2.tick();
+    await h2.tick();
+    expect(rms(h1.daemon)).toEqual([["rm", "-f", "-v", h1.name]]);
+    for (const name of [theirs, implementation, stray, unknown]) {
+      expect(h1.daemon.containers.has(name)).toBe(true);
+    }
+  });
+
+  it("AC2: one whose execution is live on the fresh runner is left to the run, even once the api completes it", async () => {
+    const h1 = await specBetweenTurns();
+    // The live run never polls its state here, so it stays live through the tick.
+    const h2 = await restart(h1, { blockingPollMs: 60_000 });
+    h2.adapter.resumeScript = async function* (signal) {
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    };
+    const { done } = await h2.runner.resume({
+      executionId: h1.executionId,
+      prompt: "go on",
+      usageKind: "resume",
+      expectedState: "RUNNING",
+    });
+    await waitFor(async () => (h2.adapter.resumes.length > 0 ? true : undefined));
+    await requestReview(h1.taskId);
+
+    await h2.tick();
+    expect(h2.runner.isLive(h1.executionId)).toBe(true);
+    expect(rms(h1.daemon)).toEqual([]);
+    expect(h1.daemon.containers.has(h1.name)).toBe(true);
+
+    // The run's own end removes it, once.
+    await h2.runner.shutdown(2000);
+    await done;
+    await h2.tick();
+    expect(rms(h1.daemon)).toEqual([["rm", "-f", "-v", h1.name]]);
+  });
+
+  it("a failed daemon listing is retried on the next tick", async () => {
+    const h1 = await specBetweenTurns();
+    const h2 = await restart(h1);
+    await requestReview(h1.taskId);
+
+    h1.daemon.failNext("ps");
+    await h2.tick();
+    expect(h1.daemon.containers.has(h1.name)).toBe(true);
+    expect(records.some((r) => r.msg === "spec container watch: agent container list failed")).toBe(true);
+
+    await h2.tick();
+    expect(h1.daemon.containers.has(h1.name)).toBe(false);
+  });
+});
+
+// ------------------------------------------ guards under the lock (F2)
+
+describe("the removal's checks under the container lock (GOT.99 F2)", () => {
+  /** Holds the execution's container lock until `release`. */
+  async function holdContainerLock(executionId: string) {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((resolve) => (locked = resolve));
+    const holder = withExecutionContainerLock(executionId, async () => {
+      locked();
+      await held;
+    });
+    await isLocked;
+    return { release, holder };
+  }
+
+  it("the state re-check alone keeps a container whose execution left its ended state after the unlocked read", async () => {
+    const h = await specBetweenTurns();
+    await requestReview(h.taskId);
+
+    const lock = await holdContainerLock(h.executionId);
+    const tick = h.tick();
+    await sleep(200);
+    // Moved back to RUNNING by another process: nothing live here, no ensure here.
+    await db.$client.unsafe("update executions set state = 'RUNNING', ended_at = null where id = $1", [
+      h.executionId,
+    ]);
+    lock.release();
+    await lock.holder;
+    await tick;
+
+    expect(h.runner.isLive(h.executionId)).toBe(false);
+    expect(rms(h.daemon)).toEqual([]);
+    expect(h.daemon.containers.has(h.name)).toBe(true);
+  });
+
+  it("the live check alone keeps the container of a resume live here whose state move has not committed", async () => {
+    const h = await specBetweenTurns();
+    await requestReview(h.taskId);
+    // Back to SPEC_IN_PROGRESS with no command: the resume below is the only one.
+    await db.transaction((tx) =>
+      transition(tx, { entity: "task", id: h.taskId, trigger: "spec.sent_back", actor: USER }),
+    );
+
+    const lock = await holdContainerLock(h.executionId);
+    const tick = h.tick();
+    await sleep(200);
+
+    // The task row held elsewhere: the resume is live here, its move to
+    // RUNNING waits, and it has not ensured the container yet.
+    let commitTask!: () => void;
+    const taskHeld = new Promise<void>((resolve) => (commitTask = resolve));
+    let taskLocked!: () => void;
+    const isTaskLocked = new Promise<void>((resolve) => (taskLocked = resolve));
+    const taskHolder = db.transaction(async (tx) => {
+      await lockTaskForSpec(tx, h.taskId);
+      taskLocked();
+      await taskHeld;
+    });
+    await isTaskLocked;
+    let runningAtTurn: boolean | undefined;
+    h.adapter.onResume = () => {
+      runningAtTurn = h.daemon.containers.has(h.name);
+    };
+    const resuming = h.runner.resume({
+      executionId: h.executionId,
+      prompt: "sent back",
+      usageKind: "resume",
+      expectedState: "COMPLETED",
+    });
+    expect(h.runner.isLive(h.executionId)).toBe(true);
+    await sleep(200);
+    expect(await executionState(h.executionId)).toBe("COMPLETED");
+
+    lock.release();
+    await lock.holder;
+    await tick;
+    expect(rms(h.daemon)).toEqual([]);
+
+    commitTask();
+    await taskHolder;
+    const { done } = await resuming;
+    await done;
+    expect(h.adapter.resumes).toHaveLength(1);
+    expect(runningAtTurn).toBe(true);
+    expect(rms(h.daemon)).toEqual([]);
+    expect(h.daemon.containers.has(h.name)).toBe(true);
   });
 });

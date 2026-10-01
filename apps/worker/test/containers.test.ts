@@ -869,6 +869,19 @@ describe("dockerExecutionContainers", () => {
     ]);
   });
 
+  it("ContainerManager.list makes the same owner-filtered listing (GOT.99)", async () => {
+    const docker = fakeDocker(() => ({
+      stdout: [
+        `c1\tmine\t${EXEC}\t${TASK}\t${OWNER}`,
+        `c2\ttheirs\t${EXEC}\t${TASK}\tffffffffffffffffffffffffffffffff`,
+      ].join("\n"),
+    }));
+    const listed = await manager(docker.run).list();
+    expect(listed).toEqual([{ id: "c1", name: "mine", executionId: EXEC, taskId: TASK, owner: OWNER }]);
+    expect(docker.calls.map((c) => c.args.slice(0, 2))).toEqual([["ps", "-a"]]);
+    expect(docker.calls[0]!.args).toContain(`label=orchestra.owner=${OWNER}`);
+  });
+
   it("raises DockerError when listing fails", async () => {
     const docker = fakeDocker(() => ({ exitCode: 1, stderr: "Cannot connect to the Docker daemon" }));
     await expect(

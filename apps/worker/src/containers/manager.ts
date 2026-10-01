@@ -508,6 +508,14 @@ export class ContainerManager {
     });
   }
 
+  /**
+   * This deployment's agent containers: labelled `orchestra.execution` and
+   * carrying its `orchestra.owner` (§9.9 Orphans). Takes no lock.
+   */
+  list(): Promise<LabelledContainer[]> {
+    return this.#ops.list();
+  }
+
   /** Creates the bridge network when it does not exist. */
   async ensureNetwork(): Promise<void> {
     const inspect = ["network", "inspect", "--format", "{{.Name}}", this.#network];
