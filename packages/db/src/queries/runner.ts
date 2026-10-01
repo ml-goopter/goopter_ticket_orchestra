@@ -2,9 +2,11 @@ import type { CommandType } from "@orchestra/core";
 import {
   and,
   asc,
+  desc,
   eq,
   inArray,
   isNull,
+  ne,
   not,
   notExists,
   or,
@@ -274,6 +276,35 @@ export async function loadRunnerContext(
     .orderBy(asc(taskDecisions.decidedAt), asc(taskDecisions.id));
 
   return { ...head, revision, decisions };
+}
+
+/**
+ * GOT.95: the task's latest implementation execution other than
+ * `executionId`, highest attempt first, or null when there is none or
+ * `executionId` is gone. A new execution claimed from READY pushes its
+ * branch first when it ran on this host (§9.5, C27). Takes no lock.
+ */
+export async function loadLatestEarlierImplementation(
+  db: DbOrTx,
+  executionId: string,
+): Promise<ExecutionRow | null> {
+  const current = db
+    .select({ taskId: executions.taskId })
+    .from(executions)
+    .where(eq(executions.id, executionId));
+  const [row] = await db
+    .select()
+    .from(executions)
+    .where(
+      and(
+        inArray(executions.taskId, current),
+        eq(executions.role, "implementation"),
+        ne(executions.id, executionId),
+      ),
+    )
+    .orderBy(desc(executions.attempt), desc(executions.createdAt))
+    .limit(1);
+  return row ?? null;
 }
 
 /**
