@@ -158,6 +158,34 @@ describe("BoardView", () => {
     expect(within(screen.getByRole("region", { name: "Ready" })).queryByRole("link", { name: "BBB-2" })).toBeNull();
   });
 
+  it("renders and highlights a card in the Needs Human column with correct classes and badge", async () => {
+    const client = makeClient(() =>
+      Promise.resolve([makeCard({ id: "1", jiraKey: "NHC-1", column: "Needs Human" })]),
+    );
+    renderBoard(client);
+
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(9));
+
+    const needsHumanSection = screen.getByRole("region", { name: "Needs Human" });
+
+    // Verify the column has the correct highlight and non-empty styling
+    expect(needsHumanSection.getAttribute("data-highlighted")).toBe("true");
+    expect(needsHumanSection.className).toContain("kanban__column--highlighted");
+    expect(needsHumanSection.className).not.toContain("board-column--highlighted-empty");
+    expect(needsHumanSection.className).not.toContain("board-column--compact");
+
+    // Verify the header count badge shows "1"
+    expect(within(needsHumanSection).getByText("1").className).toContain("badge");
+
+    // Verify the card link is present
+    const cardLink = within(needsHumanSection).getByRole("link", { name: "NHC-1" });
+    expect(cardLink).toBeTruthy();
+
+    // Verify the card has the correct highlighted class
+    const card = within(needsHumanSection).getByTestId("board-card");
+    expect(card.className).toContain("board-card--highlighted");
+  });
+
   it("shows the topbar with 'Board' and the loaded card count, no extra request (AC1)", async () => {
     const client = makeClient(() =>
       Promise.resolve([makeCard({ id: "1", column: "Ready" }), makeCard({ id: "2", column: "Done" })]),
