@@ -103,6 +103,7 @@ Status as of 2026-09-25, main at `1abbd5f` plus this change.
 | fixes | GOT.91 | api, web: spec chat accepts a message only while the spec execution is RUNNING; 409 SPEC_CHAT_UNAVAILABLE and a disabled composer otherwise | #108 |
 | fixes | GOT.89 | api, db: PATCH /users/:id validates and lowercases the id; a db test that fails without the disable lock order | #109 |
 | fixes | GOT.95 | worker, db: a human retry or reopen pushes the earlier implementation execution's branch first when it ran on this host | #110 |
+| fixes | - | core, web: a task paused on a blocking issue shows in Needs Human, and the Waiting for You column is removed (user decision 2026-10-06) | #111 |
 
 Fixes and process changes: #11 drizzle boundary, #13 hotfix, #16 severity rule, #17 agent-tools lock order and lease, #18 review test command and SSE, #19 per-task approval, #20 login timing, free slots, user patch, #25 per-task event commit order (appendEvent advisory lock).
 
