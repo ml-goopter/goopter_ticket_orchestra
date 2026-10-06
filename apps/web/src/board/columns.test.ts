@@ -28,23 +28,21 @@ describe("BOARD_COLUMN_ORDER", () => {
     expect(BOARD_COLUMN_ORDER).toHaveLength(DASHBOARD_COLUMNS.length);
   });
 
-  it("puts Waiting for You and Needs Human first, in that order", () => {
-    expect(BOARD_COLUMN_ORDER[0]).toBe("Waiting for You");
-    expect(BOARD_COLUMN_ORDER[1]).toBe("Needs Human");
+  it("has nine columns with Needs Human first", () => {
+    expect(BOARD_COLUMN_ORDER).toHaveLength(9);
+    expect(BOARD_COLUMN_ORDER[0]).toBe("Needs Human");
   });
 });
 
 describe("HIGHLIGHTED_COLUMNS", () => {
-  it("contains exactly the first two columns", () => {
-    expect(HIGHLIGHTED_COLUMNS.has("Waiting for You")).toBe(true);
+  it("contains exactly Needs Human", () => {
     expect(HIGHLIGHTED_COLUMNS.has("Needs Human")).toBe(true);
-    expect(HIGHLIGHTED_COLUMNS.size).toBe(2);
+    expect(HIGHLIGHTED_COLUMNS.size).toBe(1);
   });
 });
 
 describe("columnAccent", () => {
-  it("is attention for the two highlighted columns (AC2)", () => {
-    expect(columnAccent("Waiting for You")).toBe("attention");
+  it("is attention for the highlighted column (AC2)", () => {
     expect(columnAccent("Needs Human")).toBe("attention");
   });
 

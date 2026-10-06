@@ -144,7 +144,7 @@ describe("GET /api/tasks (AC1)", () => {
     const byId = new Map(cards.map((c) => [c.id, c]));
 
     expect(byId.get(needsSpecId)?.column).toBe("Needs Spec");
-    expect(byId.get(waitingId)?.column).toBe("Waiting for You");
+    expect(byId.get(waitingId)?.column).toBe("Needs Human");
     expect(byId.get(readyForMergeId)?.column).toBe("Ready for Merge");
     expect(byId.get(doneId)?.column).toBe("Done");
   });
