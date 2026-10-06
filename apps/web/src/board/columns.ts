@@ -2,13 +2,12 @@ import type { DashboardColumn } from "@orchestra/core";
 import type { TaskCard } from "../api/types.js";
 
 /**
- * Board render order (design.md §14: "'Waiting for You' and 'Needs Human'
- * columns are always leftmost and highlighted"). Deliberately not
+ * Board render order (design.md §14: the "Needs Human" column is
+ * always leftmost and highlighted). Deliberately not
  * `DASHBOARD_COLUMNS`'s own declaration order, which groups columns by
  * task-state proximity instead of display position.
  */
 export const BOARD_COLUMN_ORDER: readonly DashboardColumn[] = [
-  "Waiting for You",
   "Needs Human",
   "Needs Spec",
   "Spec In Progress",
@@ -20,9 +19,8 @@ export const BOARD_COLUMN_ORDER: readonly DashboardColumn[] = [
   "Done",
 ];
 
-/** The two leftmost columns that carry the highlighted styling. */
+/** The leftmost column, which carries the highlighted styling. */
 export const HIGHLIGHTED_COLUMNS: ReadonlySet<DashboardColumn> = new Set([
-  "Waiting for You",
   "Needs Human",
 ]);
 
@@ -33,8 +31,8 @@ const PROGRESS_COLUMNS: ReadonlySet<DashboardColumn> = new Set(["Spec In Progres
 const SUCCESS_COLUMNS: ReadonlySet<DashboardColumn> = new Set(["Ready for Merge", "Done"]);
 
 /**
- * Column header dot colour (UR2 AC2): "Waiting for You" / "Needs Human" are
- * `attention` (amber, matching their highlighted tint); the agent-active
+ * Column header dot colour (UR2 AC2): "Needs Human" is
+ * `attention` (amber, matching its highlighted tint); the agent-active
  * columns are `progress` (blue); the two merge-ready columns are `success`
  * (green); everything else (still-in-triage columns) is `neutral` (grey).
  */

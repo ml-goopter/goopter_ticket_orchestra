@@ -31,8 +31,8 @@
  * class beats that in turn), so this doesn't touch components.css itself
  * and doesn't depend on stylesheet import order.
  *   - default (populated, any column): 260px, same as before minus a hair.
- *   - highlighted and empty ("Waiting for You" / "Needs Human" with
- *     nothing in them): narrower, 180px, still a full header+body column.
+ *   - highlighted and empty ("Needs Human" with nothing in
+ *     it): narrower, 180px, still a full header+body column.
  *   - empty and not highlighted: collapses to a 96px compact column
  *     (below).
  * The 12px gap (rather than components.css's 16px) helps fit more columns
@@ -184,7 +184,7 @@
   box-shadow: var(--shadow-raised);
 }
 
-/* Cards in a highlighted column (Waiting for You / Needs Human) get an
+/* Cards in a highlighted column (Needs Human) get an
    accent border matching the column's own highlight colour. */
 .board-card--highlighted {
   border-left: 3px solid var(--color-attention-fg);

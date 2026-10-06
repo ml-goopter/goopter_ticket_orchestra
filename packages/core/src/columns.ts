@@ -10,7 +10,6 @@ export const DASHBOARD_COLUMNS = [
   "Awaiting Spec Approval",
   "Ready",
   "Implementing",
-  "Waiting for You",
   "CI",
   "Ready for Merge",
   "Needs Human",
@@ -57,15 +56,15 @@ function baseColumn(taskState: TaskState): DashboardColumn {
 }
 
 /**
- * "Waiting for You" wins for any task state when an execution on the task
- * is `WAITING_FOR_USER` (§5.1 table); otherwise the state maps directly.
+ * "Needs Human" wins for any task state when an execution on the task is
+ * `WAITING_FOR_USER`; otherwise the state maps directly.
  */
 export function deriveColumn(
   taskState: TaskState,
   hasExecutionWaitingForUser: boolean,
 ): DashboardColumn {
   if (hasExecutionWaitingForUser) {
-    return "Waiting for You";
+    return "Needs Human";
   }
   return baseColumn(taskState);
 }

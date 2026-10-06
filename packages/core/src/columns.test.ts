@@ -25,8 +25,8 @@ describe("deriveColumn: one state maps to each column (§5.1 table)", () => {
     expect(deriveColumn(TaskState.IMPLEMENTING, false)).toBe("Implementing");
   });
 
-  it("IMPLEMENTING with a waiting execution -> Waiting for You", () => {
-    expect(deriveColumn(TaskState.IMPLEMENTING, true)).toBe("Waiting for You");
+  it("IMPLEMENTING with a waiting execution -> Needs Human", () => {
+    expect(deriveColumn(TaskState.IMPLEMENTING, true)).toBe("Needs Human");
   });
 
   it("REVIEWING with no waiting execution -> Implementing", () => {
@@ -55,16 +55,16 @@ describe("deriveColumn: one state maps to each column (§5.1 table)", () => {
   });
 });
 
-describe("deriveColumn: Waiting for You wins for any task state", () => {
-  it("wins even for a state that would otherwise map to Ready", () => {
-    expect(deriveColumn(TaskState.SPEC_APPROVED, true)).toBe("Waiting for You");
+describe("deriveColumn: a waiting execution maps to Needs Human for any task state", () => {
+  it("maps to Needs Human even for a state that would otherwise map to Ready", () => {
+    expect(deriveColumn(TaskState.SPEC_APPROVED, true)).toBe("Needs Human");
   });
 
-  it("wins even for NEEDS_HUMAN", () => {
-    expect(deriveColumn(TaskState.NEEDS_HUMAN, true)).toBe("Waiting for You");
+  it("maps to Needs Human for NEEDS_HUMAN", () => {
+    expect(deriveColumn(TaskState.NEEDS_HUMAN, true)).toBe("Needs Human");
   });
 
-  it("wins even for FAILED, which otherwise maps to Done", () => {
-    expect(deriveColumn(TaskState.FAILED, true)).toBe("Waiting for You");
+  it("maps to Needs Human for FAILED, which otherwise maps to Done", () => {
+    expect(deriveColumn(TaskState.FAILED, true)).toBe("Needs Human");
   });
 });

@@ -528,11 +528,12 @@ Derived dashboard columns:
 | Awaiting Spec Approval | `SPEC_REVIEW` |
 | Ready | `SPEC_APPROVED`, `READY`, `BLOCKED` |
 | Implementing | `IMPLEMENTING`, `REVIEWING` with no execution in `WAITING_FOR_USER` |
-| Waiting for You | any state with an execution in `WAITING_FOR_USER` |
 | CI | `CI_RUNNING` |
 | Ready for Merge | `READY_FOR_MERGE` |
-| Needs Human | `NEEDS_HUMAN` |
+| Needs Human | `NEEDS_HUMAN`, or any state with an execution in `WAITING_FOR_USER` |
 | Done | `DONE`, `CANCELLED` |
+
+A paused execution takes its task to Needs Human whatever the task state (user decision 2026-10-06). There is no separate "Waiting for You" column. The task state does not change, so Retry stays limited to `NEEDS_HUMAN` and a paused task leaves the column when its blocking issue is resolved.
 
 ### 5.2 Execution lifecycle
 
@@ -1148,7 +1149,7 @@ React 19, Vite, one SPA served by nginx. State from the api plus SSE. Views map 
 
 | view | spec | contents |
 | --- | --- | --- |
-| Board | §25 | columns from 5.1, cards show key, summary, runtime, age in column, cost so far. "Waiting for You" and "Needs Human" columns are always leftmost and highlighted. |
+| Board | §25 | columns from 5.1, cards show key, summary, runtime, age in column, cost so far. The "Needs Human" column is always leftmost and highlighted. |
 | Attention panel | §18 | open blocking issues, spec reviews requested, tasks in `NEEDS_HUMAN`, `READY_FOR_MERGE`. Shown on every page as a drawer. |
 | Spec builder | §5 | split pane. Left: chat with the spec agent, streamed. Right: structured form bound to the draft revision, editable by hand, updated live on `spec.proposed`. Footer: Save Draft, Request Review, Approve (with runtime dropdown defaulting to the repo). Approve is disabled until validation passes. |
 | Issue detail | §18, §19 | agent explanation, question, options as radio buttons with the recommendation preselected, thread, free-text box, two submit buttons: Resolve as clarification, This changes the spec. |

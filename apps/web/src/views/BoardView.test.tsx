@@ -88,20 +88,19 @@ function renderBoard(client: BoardApiClient) {
 }
 
 describe("BoardView", () => {
-  it("renders the ten columns in order, highlights the first two, and places cards by the api's column (AC1)", async () => {
+  it("renders the nine columns in order, highlights Needs Human, and places cards by the api's column (AC1)", async () => {
     const client = makeClient(() =>
       Promise.resolve([
         makeCard({ id: "1", jiraKey: "AAA-1", column: "Ready" }),
-        makeCard({ id: "2", jiraKey: "BBB-2", column: "Needs Human" }),
+        makeCard({ id: "2", jiraKey: "BBB-2", column: "Done" }),
       ]),
     );
     renderBoard(client);
 
-    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(10));
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(9));
 
     const headings = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
     expect(headings).toEqual([
-      "Waiting for You",
       "Needs Human",
       "Needs Spec",
       "Spec In Progress",
@@ -113,13 +112,10 @@ describe("BoardView", () => {
       "Done",
     ]);
 
-    const waitingSection = screen.getByRole("region", { name: "Waiting for You" });
     const needsHumanSection = screen.getByRole("region", { name: "Needs Human" });
     const readySection = screen.getByRole("region", { name: "Ready" });
-    expect(waitingSection.getAttribute("data-highlighted")).toBe("true");
     expect(needsHumanSection.getAttribute("data-highlighted")).toBe("true");
     expect(readySection.getAttribute("data-highlighted")).toBe("false");
-    expect(waitingSection.className).toContain("kanban__column--highlighted");
     expect(needsHumanSection.className).toContain("kanban__column--highlighted");
     expect(readySection.className).not.toContain("kanban__column--highlighted");
 
@@ -128,12 +124,12 @@ describe("BoardView", () => {
     // narrow column -- header only, no "No tasks." line -- but its
     // heading and count are still in the DOM with their normal,
     // horizontal (unrotated) text. A populated column ("Ready") and an
-    // empty but highlighted column ("Waiting for You") are never compact.
+    // empty but highlighted column ("Needs Human") are never compact.
     const needsSpecSection = screen.getByRole("region", { name: "Needs Spec" });
     expect(needsSpecSection.className).toContain("board-column--compact");
     expect(within(needsSpecSection).queryByText("No tasks.")).toBeNull();
     expect(readySection.className).not.toContain("board-column--compact");
-    expect(waitingSection.className).not.toContain("board-column--compact");
+    expect(needsHumanSection.className).not.toContain("board-column--compact");
     expect(within(needsSpecSection).getByRole("heading", { level: 2 }).textContent).toBe("Needs Spec");
     expect(within(needsSpecSection).getByText("0").className).toContain("badge");
 
@@ -147,20 +143,47 @@ describe("BoardView", () => {
     );
     expect(within(specApprovalSection).getByText("0").className).toContain("badge");
 
-    // Highlighted-empty modifier (B3): "Waiting for You" has no cards in
+    // Highlighted-empty modifier (B3): "Needs Human" has no cards in
     // this fixture, so it's narrower than a populated column, but never
-    // compact. "Needs Human" has a card, so it doesn't get that modifier
-    // either, despite also being highlighted.
-    expect(waitingSection.className).toContain("board-column--highlighted-empty");
-    expect(needsHumanSection.className).not.toContain("board-column--highlighted-empty");
+    // compact.
+    expect(needsHumanSection.className).toContain("board-column--highlighted-empty");
     expect(readySection.className).not.toContain("board-column--highlighted-empty");
 
     // Column header: name plus a card count badge (AC1).
-    expect(within(needsHumanSection).getByText("1").className).toContain("badge");
     expect(within(readySection).getByText("1").className).toContain("badge");
+    const doneSection = screen.getByRole("region", { name: "Done" });
+    expect(within(doneSection).getByText("1").className).toContain("badge");
 
-    expect(within(needsHumanSection).getByRole("link", { name: "BBB-2" })).toBeTruthy();
+    expect(within(doneSection).getByRole("link", { name: "BBB-2" })).toBeTruthy();
     expect(within(screen.getByRole("region", { name: "Ready" })).queryByRole("link", { name: "BBB-2" })).toBeNull();
+  });
+
+  it("renders and highlights a card in the Needs Human column with correct classes and badge", async () => {
+    const client = makeClient(() =>
+      Promise.resolve([makeCard({ id: "1", jiraKey: "NHC-1", column: "Needs Human" })]),
+    );
+    renderBoard(client);
+
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(9));
+
+    const needsHumanSection = screen.getByRole("region", { name: "Needs Human" });
+
+    // Verify the column has the correct highlight and non-empty styling
+    expect(needsHumanSection.getAttribute("data-highlighted")).toBe("true");
+    expect(needsHumanSection.className).toContain("kanban__column--highlighted");
+    expect(needsHumanSection.className).not.toContain("board-column--highlighted-empty");
+    expect(needsHumanSection.className).not.toContain("board-column--compact");
+
+    // Verify the header count badge shows "1"
+    expect(within(needsHumanSection).getByText("1").className).toContain("badge");
+
+    // Verify the card link is present
+    const cardLink = within(needsHumanSection).getByRole("link", { name: "NHC-1" });
+    expect(cardLink).toBeTruthy();
+
+    // Verify the card has the correct highlighted class
+    const card = within(needsHumanSection).getByTestId("board-card");
+    expect(card.className).toContain("board-card--highlighted");
   });
 
   it("shows the topbar with 'Board' and the loaded card count, no extra request (AC1)", async () => {
@@ -180,18 +203,16 @@ describe("BoardView", () => {
     const client = makeClient(() => Promise.resolve([]));
     renderBoard(client);
 
-    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(10));
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(9));
 
-    const waiting = screen.getByRole("region", { name: "Waiting for You" });
     const needsHuman = screen.getByRole("region", { name: "Needs Human" });
-    expect(within(waiting).getByText("0").className).toContain("badge--attention");
     expect(within(needsHuman).getByText("0").className).toContain("badge--attention");
 
     const ready = screen.getByRole("region", { name: "Ready" });
     expect(within(ready).getByText("0").className).toContain("badge--neutral");
 
     const dot = (name: string) => screen.getByRole("region", { name }).querySelector(".board-column__dot");
-    expect(dot("Waiting for You")?.className).toContain("board-column__dot--attention");
+    expect(dot("Needs Human")?.className).toContain("board-column__dot--attention");
     expect(dot("Spec In Progress")?.className).toContain("board-column__dot--progress");
     expect(dot("Implementing")?.className).toContain("board-column__dot--progress");
     expect(dot("CI")?.className).toContain("board-column__dot--progress");
@@ -315,29 +336,26 @@ describe("BoardView", () => {
     const client = makeClient(() => Promise.resolve([]));
     renderBoard(client);
 
-    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(10));
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(9));
 
-    // Every column is empty. The two highlighted columns stay full height
+    // Every column is empty. The highlighted column stays full height
     // (narrower than a populated column) and show the "No tasks." line;
     // the other eight, empty and not highlighted, collapse to a compact
     // column with no card area at all (B1/B3).
-    expect(screen.getAllByText("No tasks.")).toHaveLength(2);
+    expect(screen.getAllByText("No tasks.")).toHaveLength(1);
     for (const empty of screen.getAllByText("No tasks.")) {
       expect(empty.className).toContain("board-empty");
       expect(empty.tagName).toBe("P");
     }
 
-    const waitingSection = screen.getByRole("region", { name: "Waiting for You" });
     const needsHumanSection = screen.getByRole("region", { name: "Needs Human" });
     const readySection = screen.getByRole("region", { name: "Ready" });
-    expect(waitingSection.className).not.toContain("board-column--compact");
     expect(needsHumanSection.className).not.toContain("board-column--compact");
     expect(readySection.className).toContain("board-column--compact");
     expect(within(readySection).queryByText("No tasks.")).toBeNull();
     expect(within(readySection).getByRole("heading", { level: 2 }).textContent).toBe("Ready");
     expect(within(readySection).getByText("0").className).toContain("badge");
 
-    expect(waitingSection.className).toContain("board-column--highlighted-empty");
     expect(needsHumanSection.className).toContain("board-column--highlighted-empty");
     expect(readySection.className).not.toContain("board-column--highlighted-empty");
   });

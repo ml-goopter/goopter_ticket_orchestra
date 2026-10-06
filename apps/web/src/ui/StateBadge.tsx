@@ -4,8 +4,8 @@ type StatusColor = "attention" | "progress" | "success" | "danger" | "neutral";
 
 /**
  * `TaskState` and `ExecutionState` (@orchestra/core `enums.ts`) to one of
- * the five status colours (design direction: amber for "Waiting for You"
- * and `NEEDS_HUMAN`-like, blue for in-progress, green for done/ready for
+ * the five status colours (design direction: amber for `NEEDS_HUMAN`
+ * and waiting-for-user-like, blue for in-progress, green for done/ready for
  * merge, red for failed, grey for cancelled/queued-like). States not
  * listed here (unknown/future) fall back to neutral.
  */

@@ -815,7 +815,7 @@
 
 /* --------------------------------------------------------------------
  * Kanban: a horizontally scrolling row of fixed-width columns. The
- * "Waiting for You" / "Needs Human" columns take the `--highlighted`
+ * "Needs Human" column takes the `--highlighted`
  * modifier (design.md §14: always leftmost and highlighted).
  * ------------------------------------------------------------------ */
 .kanban {

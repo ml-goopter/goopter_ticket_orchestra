@@ -40,8 +40,8 @@ const ATTENTION_STATES = [
  * Tasks waiting on a person (spec §2.4, design.md §12.2 `?attention=1`).
  *
  * A task appears once. `waiting_for_user` takes precedence over the
- * state-based reasons, matching `deriveColumn`, where "Waiting for You"
- * wins over the state's own column (§5.1). The remaining three reasons are
+ * state-based reasons, matching `deriveColumn`, where a waiting execution
+ * puts the task in "Needs Human" over the state's own column. The remaining three reasons are
  * mutually exclusive because they are distinct task states.
  */
 export async function listAttention(db: DbOrTx): Promise<AttentionRow[]> {
